@@ -1,0 +1,21 @@
+BYTEPLUS for Maya — Installation
+================================
+
+Works on Windows, macOS and Linux.
+
+1. Unzip this folder anywhere you like.
+
+2. Open Autodesk Maya (2025 or newer).
+
+3. Drag the file "install.py" from your file browser
+   INTO the Maya viewport (the big 3D area in the middle).
+
+4. That's it. A confirmation appears and the BYTEPLUS menu
+   shows up in the top menu bar. It will load automatically
+   every time you open Maya from now on.
+
+5. Open  BYTEPLUS > Settings...  and paste your BytePlus
+   API key to start using it.
+
+Keep install.py and byteplus_maya.py together in the same
+folder when you drag. Need help? Use BYTEPLUS > Report a Bug.

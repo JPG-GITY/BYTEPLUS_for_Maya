@@ -1,0 +1,26 @@
+BYTEPLUS for Maya — Developer Mode
+==================================
+
+Developer Mode shows the Diagnostics menu and the full telemetry
+configuration (hidden from normal users). Use it only if you are
+extending the plugin or troubleshooting with support.
+
+HOW TO TURN IT ON / OFF
+-----------------------
+Install the plugin first (drag install.py into Maya). Then, with Maya
+open, EITHER:
+
+  • Drag "byteplus_debug_on.py" into the Maya viewport to ENABLE it, or
+  • Drag "byteplus_debug_off.py" into the Maya viewport to DISABLE it.
+
+(Alternatively, paste the contents of either file into the Script
+Editor — Python tab — and run it.)
+
+After running, the BYTEPLUS menu rebuilds automatically:
+  • ON  → a "Diagnostics" submenu appears; Settings shows telemetry config.
+  • OFF → back to the normal client view.
+
+The choice is remembered across Maya restarts.
+
+Note: this only changes what is shown in the UI. It does not affect
+generation, your API key, or telemetry being sent.

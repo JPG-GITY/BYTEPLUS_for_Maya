@@ -1,0 +1,21 @@
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+
+# BYTEPLUS local prefs / state (may contain plaintext API keys)
+.byteplus_maya.json
+.byteplus_maya_hidden.json
+.byteplus_maya_usage.json
+
+# Build / release artifacts — distribute these via GitHub Releases, not the repo
+*.zip
+
+# Bundled third-party binary: exceeds GitHub's 100 MB file limit.
+# Re-bundle the LGPL ffmpeg build into dist/ when packaging.
+dist/BYTEPLUS/bin/win/ffmpeg.exe
+
+# Editor / OS noise
+.vscode/
+.DS_Store
+Thumbs.db

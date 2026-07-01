@@ -1,0 +1,30 @@
+FFmpeg - license notice (bundled with BYTEPLUS for Maya)
+========================================================
+
+This product bundles "ffmpeg.exe", a build of FFmpeg (https://ffmpeg.org),
+used to transcode Maya playblasts to H.264 MP4 for the Seedance video feature.
+
+LICENSE
+-------
+The bundled FFmpeg build is configured under the GNU Lesser General Public
+License version 2.1 or later (LGPL-2.1-or-later). FFmpeg is free software; you
+can redistribute it and/or modify it under the terms of the LGPL as published
+by the Free Software Foundation.
+
+FFmpeg is distributed WITHOUT ANY WARRANTY; without even the implied warranty
+of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the LGPL for
+details. A full copy of the LGPL-2.1 license text is included alongside this
+file (LICENSE.txt from the FFmpeg build) and is available at:
+    https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+
+BUILD / SOURCE
+--------------
+Bundled build: BtbN FFmpeg-Builds, "win64-lgpl" (static).
+  Builds:  https://github.com/BtbN/FFmpeg-Builds/releases
+The complete corresponding source code for this FFmpeg version is available at:
+  https://github.com/BtbN/FFmpeg-Builds   (build scripts)
+  https://git.ffmpeg.org/ffmpeg.git       (FFmpeg source)
+  https://ffmpeg.org/download.html        (release tarballs)
+
+FFmpeg is a trademark of Fabrice Bellard, originator of the FFmpeg project.
+BYTEPLUS for Maya is not affiliated with or endorsed by the FFmpeg project.
