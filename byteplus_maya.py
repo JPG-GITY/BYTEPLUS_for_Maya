@@ -91,13 +91,23 @@ class CONFIG:
 
     # --- Model IDs ------------------------------------------------------------
     SEEDANCE_MODEL = "dreamina-seedance-2-0-260128"      # video
-    SEEDREAM_MODEL = "seedream-5-0-260128"               # image (Seedream 5.0 Lite, multimodal/supports refs)
+    SEEDREAM_MODEL = "seedream-5-0-260128"               # image (Seedream 5.0 base) -- general Dream/Refine/Texture
+    # Faces to be animated MUST come from Seedream 5.0 *Lite*: Seedance 2.0 only
+    # trusts face images from 5.0 Lite (Trusted Outputs, video-seedance.md 7). The
+    # face-safe Text-to-Image path uses this so its output is animatable.
+    SEEDREAM_FACE_MODEL = "seedream-5-0-lite-260128"     # image (Seedream 5.0 Lite) -- face-safe T2I, animatable
     LLM_MODEL = "seed-1-6-250915"                        # multimodal (auto-prompt)
+    SEED_CHAT_MODEL = "seed-2-0-pro-260328"              # Seed Chat window: agentic multimodal (tool-calling ready)
+    # Seed 3D. NOTE: the documented IDs (Hyper3d-Rodin-Gen2 / Hitem3d-2.0) returned
+    # HTTP 404 on this account -- set the REAL model ID (or 'ep-...' inference
+    # endpoint) from your ModelArk console in Settings > 3D model before using it.
+    THREE_D_MODEL = "Hyper3d-Rodin-Gen2"                 # text->3D + image->3D (UNVERIFIED)
 
     # --- Endpoints (relative to BASE_URL) ------------------------------------
     VIDEO_TASKS = "/contents/generations/tasks"          # POST create / GET poll
     IMAGE_GEN = "/images/generations"                    # POST (sync)
     CHAT_COMPLETIONS = "/chat/completions"               # POST (LLM, multimodal)
+    THREE_D_TASKS = "/contents/generations/tasks"        # POST create / GET poll (same as video)
 
     # --- Output options -------------------------------------------------------
     # Seedream/Seedance stamp an "AI generated" watermark by default; the API
@@ -154,6 +164,11 @@ class CONFIG:
 
     # --- Texture defaults -----------------------------------------------------
     BUMP_DEPTH = 1.0                                     # bump2d depth for normals
+
+    # --- Seed 3D defaults -----------------------------------------------------
+    THREE_D_FORMAT = "usdz"                             # usdz (mayaUsdPlugin) / fbx / obj
+    THREE_D_MATERIAL = "PBR"                            # PBR / Shaded / None
+    COST_3D_USD = 0.40                                  # ~ $0.399 per generated model (grounded)
 
     # --- Networking -----------------------------------------------------------
     POLL_SECONDS = 5
@@ -255,7 +270,9 @@ _PERSISTED = (
     "VIDEO_RESOLUTION", "VIDEO_RATIO", "MAX_IMAGE_REFS",
     "REF_WIDTH", "REF_HEIGHT", "USE_TOS", "TOS_BUCKET",
     "TOS_ENDPOINT", "TOS_REGION", "CALLBACK_URL", "REMEMBER_API_KEY",
-    "SSL_VERIFY", "BASE_URL", "SEEDREAM_MODEL", "SEEDANCE_MODEL", "LLM_MODEL",
+    "SSL_VERIFY", "BASE_URL", "SEEDREAM_MODEL", "SEEDREAM_FACE_MODEL",
+    "SEEDANCE_MODEL", "LLM_MODEL",
+    "SEED_CHAT_MODEL", "THREE_D_MODEL",
     "MOTION_HOST", "R2_ACCOUNT_ID", "R2_BUCKET", "BUMP_DEPTH",
     "SHOW_COST", "COST_CONFIRM_USD", "IMAGE_RATIO",
     "COLOR_MANAGE", "USAGE_VIEW", "INSTALL_ID", "TELEMETRY_PREFIX", "TELEMETRY_BUCKET",
@@ -1431,16 +1448,10 @@ def _msgbox(icon, title, text, buttons=None):
 
 
 def _confirm_cost(usd, what):
-    """If estimate exceeds the threshold, ask before generating. Returns True to
-    proceed. (Cheap jobs like images fall under the threshold and never prompt.)"""
-    if not CONFIG.SHOW_COST or usd <= float(CONFIG.COST_CONFIRM_USD or 0):
-        return True
-    return _msgbox(
-        QtWidgets.QMessageBox.Warning, "BYTEPLUS - estimated cost",
-        "{}\n\nEstimated cost: ≈ ${:.2f}\n\n(Approximate — actual billing is on "
-        "your BytePlus account.) Proceed?".format(what, usd),
-        QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel
-    ) == QtWidgets.QMessageBox.Ok
+    """Cost-confirmation pop-up is disabled by request. The estimate is still shown
+    as a label inside the generation dialogs, but we never block with a dialog.
+    Always returns True so callers proceed."""
+    return True
 
 
 def _usage_title(base: str) -> str:
@@ -2562,19 +2573,55 @@ def _mux_audio_from(video_bytes: bytes, source_path: str) -> bytes:
     return video_bytes
 
 
-def _playblast_movie() -> str:
-    """Playblast the whole range to a movie used as Seedance's video reference.
+def _playblast_is_valid(path: str, expected_seconds: float) -> bool:
+    """True if a captured playblast looks usable: a real, non-empty file whose
+    duration is close to the animation length. Catches empty / truncated captures
+    (e.g. the Windows 'only a few frames' glitch) so the caller can retry. Never
+    raises; on a validation hiccup it returns True (don't block a good capture)."""
+    try:
+        if not (path and os.path.exists(path) and os.path.getsize(path) > 0):
+            return False
+        if expected_seconds and expected_seconds > 0:
+            d = _video_duration(path)
+            if d is not None and d > 0:
+                return d >= max(1.0, expected_seconds * 0.6)   # generous tolerance
+        return True
+    except Exception:
+        return True
+
+
+def _playblast_movie(start=None, end=None) -> str:
+    """Playblast the animation range to a movie used as Seedance's video reference.
     Saved into the project movies/ folder (persisted) and validated non-empty.
-    Tries platform-appropriate formats and trusts playblast's return path."""
+    Tries platform-appropriate formats and trusts playblast's return path.
+
+    The range is captured EXPLICITLY via startTime/endTime (defaulting to
+    _anim_range()) so it always matches the duration the caller computed from the
+    same range. Without this, a collapsed time-slider makes playblast capture only
+    a frame or two while the duration is computed from the full scene range -- the
+    capture then looks 'failed' even though the checkbox was on. Also settles the
+    viewport at the first frame first (fixes the Windows 'only a few frames'
+    glitch) and restores the artist's current frame afterwards."""
+    if start is None or end is None:
+        start, end = _anim_range()
     out_dir = _project_movies_dir()
     base = os.path.join(out_dir, "byteplus_playblast_{}".format(int(time.time() * 1000)))
     panel = _active_model_panel()
     saved = _isolate_polys(panel)                    # polys only -> clean motion ref
+    try:
+        _t0 = cmds.currentTime(q=True)
+    except Exception:
+        _t0 = None
     last_err = None
     try:
+        try:                                         # settle the viewport first
+            cmds.currentTime(start)
+            cmds.refresh(force=True)
+        except Exception:
+            pass
         for fmt, comp, ext in _playblast_formats():
             kwargs = dict(
-                format=fmt, filename=base,
+                format=fmt, filename=base, startTime=start, endTime=end,
                 widthHeight=(CONFIG.REF_WIDTH, CONFIG.REF_HEIGHT), forceOverwrite=True,
                 showOrnaments=False, percent=100, quality=100, viewer=False,
                 # off-screen is unreliable on macOS and hard-crashes some Windows
@@ -2594,6 +2641,11 @@ def _playblast_movie() -> str:
                     return _ensure_seedance_video(cand)   # -> MP4 (H.264) for Seedance
     finally:
         _restore_panel(panel, saved)
+        if _t0 is not None:                          # leave the artist's frame as it was
+            try:
+                cmds.currentTime(_t0)
+            except Exception:
+                pass
     raise RuntimeError(
         "Playblast produced no usable movie (tried {}). Last error: {}. The "
         "image references will still work without it.".format(
@@ -2784,8 +2836,8 @@ class _ActivityHUD(QtWidgets.QDialog):
 
 class _ProgressHandle:
     """Returned by _progress(). Emulates the slice of QProgressDialog the callers
-    use (.close() / .setLabelText()), but renders as ONE row in the shared HUD.
-    Carries a cancel Event shared with its worker(s)."""
+    use (.show() / .hide() / .close() / .setLabelText()), but renders as ONE row
+    in the shared HUD. Carries a cancel Event shared with its worker(s)."""
 
     def __init__(self, title):
         self._title = title
@@ -2805,6 +2857,28 @@ class _ProgressHandle:
                 pass
         try:
             _ActivityHUD.instance()._refresh()
+        except Exception:
+            pass
+
+    def show(self):
+        """Re-show / raise the shared Activity HUD. Callers use this to bring the
+        progress panel back to the front after a modal dialog. Best-effort and a
+        no-op once closed -- must never raise (it runs inside generation flows)."""
+        if self._closed:
+            return
+        try:
+            hud = _ActivityHUD.instance()
+            hud.show()
+            hud.raise_()
+            hud._reposition()
+        except Exception:
+            pass
+
+    def hide(self):
+        """Temporarily hide the shared Activity HUD so a modal dialog isn't stuck
+        behind it (paired with show()). Best-effort -- must never raise."""
+        try:
+            _ActivityHUD.instance().hide()
         except Exception:
             pass
 
@@ -3585,13 +3659,39 @@ def _img_ref_uri(src: str) -> str:
     return _asset_uri(src, _image_mime(src))
 
 
+_SEEDANCE_MAX_ATTEMPTS = 2                            # bounded retry of TRANSIENT fails
+
+
+def _should_retry_failure(msg: str, trusted_input: bool) -> bool:
+    """Whether a Seedance failure is worth retrying:
+    - Bad-input errors (params / format) -> no (they won't change).
+    - Real-face / content blocks -> only when the input IS a FRESH TRUSTED Seedream
+      URL. There a face rejection is a flaky moderation-exemption false negative
+      (the image should be exempt), not a real face, so retrying often succeeds.
+    - Transient / server / network errors -> yes."""
+    # NOTE: do NOT hard-block on "InputImage" -- the FACE error code is
+    # "InputImageSensitiveContentDetected.PrivacyInformation", which must fall
+    # through to the face check below.
+    if any(s in msg for s in ("InvalidParameter", "not valid")):
+        return False
+    # Face / privacy moderation is DETERMINISTIC within a session: if the
+    # trusted-outputs exemption is honored the first submit passes; if it isn't,
+    # every retry fails identically. So fail fast (no wasted 2nd paid attempt) --
+    # a failed submit is never billed. `trusted_input` is kept in the signature
+    # for callers; re-enable retry here only if the block proves flaky per-call.
+    if any(s in msg for s in ("SensitiveContent", "PrivacyInformation",
+                              "real person", "biometric", "ContentModeration")):
+        return False
+    return True
+
+
 def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                        duration: int, first_frame: str | None = None,
                        require_motion_video: bool = False,
                        generate_audio: bool | None = None,
                        extra_movies: list | None = None,
                        fit_motion: bool = False,
-                       status: dict | None = None) -> bytes:
+                       trusted_input: bool = False) -> bytes:
     """Submit a Seedance job and poll until done. Returns the video bytes.
     NETWORK ONLY -- call from a worker.
 
@@ -3658,17 +3758,20 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                              "skipping it -> {}\n".format(e))
     # Tell the artist which motion mode actually ran -- this is the #1 reason
     # the playblast is "sometimes not respected".
-    if movie_url:
-        sys.stderr.write("[BYTEPLUS] MOTION = playblast VIDEO reference attached "
-                         "(faithful to your animation)\n")
+    n_ref_vids = (1 if movie_url else 0) + len(extra_urls)
+    if n_ref_vids:
+        _parts = ((["playblast (Video 1)"] if movie_url else [])
+                  + (["{} gallery clip(s)".format(len(extra_urls))] if extra_urls else []))
+        sys.stderr.write("[BYTEPLUS] MOTION = {} reference video(s) attached as "
+                         "Video 1..{} [{}] -- Seedance will follow them.\n".format(
+                             n_ref_vids, n_ref_vids, " + ".join(_parts)))
     elif movie:
         sys.stderr.write("[BYTEPLUS] MOTION = TEXT ONLY -- playblast captured but "
                          "could NOT be hosted (configure/verify R2/TOS). Motion "
                          "will be approximate.\n")
     else:
-        sys.stderr.write("[BYTEPLUS] MOTION = TEXT ONLY -- no playblast video "
-                         "(checkbox off, no animation, or capture failed). Motion "
-                         "will be approximate.\n")
+        sys.stderr.write("[BYTEPLUS] MOTION = TEXT ONLY (no motion video attached) "
+                         "-- motion is approximate, from the text prompt.\n")
 
     def _content(ff_role):
         c = [{"type": "text", "text": prompt}]
@@ -3753,21 +3856,44 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
             if status in ("failed", "error", "cancelled", "canceled"):
                 raise RuntimeError("Seedance task failed: " + json.dumps(st, indent=2))
 
-    try:
+    def _once(audio):
+        # One full submit+poll. If Seedance moderates the OUTPUT audio, fall back to
+        # a SILENT render (a moderated-audio job otherwise fails entirely). This is
+        # a policy fallback, not a transient retry.
         try:
-            return _run(_audio)
+            return _run(audio)
         except RuntimeError as e:
-            # Audio OUTPUT moderation fails the whole job -> retry once WITHOUT
-            # audio so the video still comes back (audio is a nice-to-have).
-            if _audio and any(s in str(e) for s in
-                              ("OutputAudioSensitiveContentDetected",
-                               "AudioSensitiveContent")):
-                sys.stderr.write("[BYTEPLUS] audio output moderated; retrying with "
-                                 "audio OFF.\n")
-                if status is not None:
-                    status["audio_dropped"] = True
+            if audio and any(s in str(e) for s in
+                             ("OutputAudioSensitiveContentDetected",
+                              "AudioSensitiveContent")):
+                sys.stderr.write("[BYTEPLUS] audio output moderated; producing a "
+                                 "silent clip.\n")
                 return _run(False)
             raise
+
+    try:
+        last = None
+        for _i in range(_SEEDANCE_MAX_ATTEMPTS):     # bounded retry of TRANSIENT fails
+            try:
+                return _once(_audio)
+            except _Cancelled:
+                raise
+            except RuntimeError as e:
+                # Retry transient failures + face rejections on a TRUSTED fresh
+                # Seedream URL (flaky exemption). Never retry a real face or a
+                # bad-input error.
+                if not _should_retry_failure(str(e), trusted_input):
+                    raise
+                last = e
+                if _i < _SEEDANCE_MAX_ATTEMPTS - 1:
+                    sys.stderr.write("[BYTEPLUS] Seedance failure (attempt "
+                                     "{}/{}); retrying...\n".format(
+                                         _i + 1, _SEEDANCE_MAX_ATTEMPTS))
+                    time.sleep(6 * (_i + 1))
+                    continue
+                raise
+        if last:                                     # defensive; loop returns/raises
+            raise last
     finally:
         for _cu in cleanups:                         # remove the hosted video(s)
             try:
@@ -3865,17 +3991,17 @@ def _ordinal(n: int) -> str:
     return names[n - 1] if 1 <= n <= len(names) else "{}th".format(n)
 
 
-def _bind_refs(text: str, img_refs: list, vid_refs: list) -> str:
-    """Deterministic @tag binding: replace each @tag with a model-facing phrase.
-    Image refs are numbered AFTER the main image (reference image 1), so the first
-    tagged image -> 'the second reference image'. Video refs -> 'the reference
-    video clip'. If the text has no @tags (e.g. after ✦ Compose) it's unchanged."""
+def _bind_refs(text: str, img_refs: list, vid_refs: list, vid_offset: int = 1) -> str:
+    """Deterministic @tag binding: replace each @tag with Seedance's numbered label.
+    The main image is Image 1, so tagged images start at Image 2. Video labels start
+    at `vid_offset` (2 when a scene playblast holds Video 1, else 1). If the text has
+    no @tags (e.g. after ✦ Compose) it's returned unchanged."""
     out = text or ""
     subs = []
     for i, r in enumerate(img_refs):
-        subs.append((r["label"], "the {} reference image".format(_ordinal(i + 2))))
-    for r in vid_refs:
-        subs.append((r["label"], "the reference video clip"))
+        subs.append((r["label"], "Image {}".format(i + 2)))
+    for i, r in enumerate(vid_refs):
+        subs.append((r["label"], "Video {}".format(vid_offset + i)))
     # Replace LONGEST labels first so "@img1" doesn't clobber "@img10".
     for label, phrase in sorted(subs, key=lambda t: len(t[0]), reverse=True):
         out = out.replace(label, phrase)
@@ -4091,6 +4217,23 @@ class AnimateDialog(QtWidgets.QDialog):
                 "Use the scene's animation  (none detected — motion from prompt)")
         self.use_anim.toggled.connect(self._sync_mode)
         v.addWidget(self.use_anim)
+        # Clip length. Seedance 2.0 allows 4-15 s (verified). With the playblast ON
+        # the length follows the scene animation (this is disabled); with it OFF the
+        # user picks it here.
+        drow = QtWidgets.QHBoxLayout()
+        drow.addWidget(QtWidgets.QLabel("Clip length (s):"))
+        self.duration = QtWidgets.QComboBox()
+        self.duration.addItems([str(s) for s in range(4, 16)])   # 4..15
+        self.duration.setCurrentText(
+            str(max(4, min(15, int(round(_anim_seconds())) or 5))))
+        self.duration.setToolTip(
+            "Length of the generated clip (Seedance 2.0: 4-15 s). Enabled only when "
+            "the playblast is OFF; with the playblast ON the length matches your "
+            "scene animation.")
+        self.duration.currentIndexChanged.connect(self._update_cost)
+        drow.addWidget(self.duration)
+        drow.addStretch(1)
+        v.addLayout(drow)
         self.cb_audio = QtWidgets.QCheckBox("Generate audio (Seedance)")
         self.cb_audio.setChecked(True)
         self.cb_audio.setToolTip("Let Seedance add a soundtrack / SFX. If the audio "
@@ -4118,8 +4261,10 @@ class AnimateDialog(QtWidgets.QDialog):
         if not CONFIG.SHOW_COST:
             self.cost.setText("")
             return
-        secs = _anim_seconds()
-        dur = max(4, min(15, int(round(secs)) or 4))
+        if self.use_anim.isChecked():
+            dur = max(4, min(15, int(round(_anim_seconds())) or 4))
+        else:
+            dur = int(self.duration.currentText())
         has_video = self.use_anim.isChecked() and _motion_host_ready()
         tok, usd = _est_video_cost(CONFIG.VIDEO_RESOLUTION, CONFIG.VIDEO_RATIO,
                                    dur, has_video)
@@ -4150,6 +4295,9 @@ class AnimateDialog(QtWidgets.QDialog):
                 "and pacing freely. The image defines the LOOK.  ⓘ Guide for details.")
             if not self.prompt.toPlainText().strip():
                 QtCore.QTimer.singleShot(0, self._auto)   # the box is the motion
+        # Clip length is chosen manually only when the playblast is OFF; when it's
+        # ON the length matches the scene animation, so grey it out.
+        self.duration.setEnabled(not self.use_anim.isChecked())
         self._update_cost()
 
     def _uri(self):
@@ -4230,6 +4378,10 @@ class AnimateDialog(QtWidgets.QDialog):
 
     def wants_anim(self):
         return self.use_anim.isChecked()
+
+    def duration_choice(self):
+        """Chosen clip length in seconds (used when the playblast is OFF)."""
+        return int(self.duration.currentText())
 
     def wants_audio(self):
         return self.cb_audio.isChecked()
@@ -4346,11 +4498,12 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
     vid_refs = d.video_refs()
     extra_movies = [r.get("path") for r in vid_refs if r.get("path")]
     motion = d.prompt_text()
-    if not motion and not use_anim:
+    # Only inject a generic motion description when there is genuinely NO motion
+    # source (no scene animation AND no reference video) -- otherwise it would tell
+    # Seedance to invent generic motion and drown out the reference video.
+    if not motion and not use_anim and not extra_movies:
         motion = "subtle cinematic motion, gentle camera move"
-    # Resolve @tags in the text to model-facing phrases ("the second reference
-    # image", ...). No-op if the user pressed ✦ Compose (no @tags left).
-    motion = _bind_refs(motion, img_refs, vid_refs)
+    # (@tags are resolved later, in make_video, where the video numbering is known.)
     # Extra reference IMAGES: prefer each one's trusted platform URL (keeps the
     # face-exemption chain) while fresh, else its local file. 9 total incl. main.
     extra_imgs = []
@@ -4361,24 +4514,31 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
             extra_imgs.append(s)
     extra_imgs = extra_imgs[:8]
     image_sources = [image_src] + extra_imgs
-    # REFERENCE-MEDIA mode (image = look, video = motion). We refer to the
-    # attachments DIRECTLY in the prompt; the Dreamina "Image 1 / Video 1" slot
-    # labels do NOT map to the API roles and break motion. first_frame is a
-    # different mode and can't mix with a video ref. The motion clause is added
-    # in make_video, only when the playblast is actually attached.
+    # The main image is a fresh trusted Seedream URL when it's an http link (see
+    # _on_animate). Lets _seedance_generate retry a flaky face-exemption rejection.
+    trusted_input = isinstance(image_src, str) and image_src.startswith("http")
+    # REFERENCE-MEDIA mode: image = look, video = motion. Seedance's multimodal API
+    # refers to each attachment by a NUMBERED label matching the content order
+    # (Image 1 = the main image, Image 2.. = extras; Video 1 = the playblast, or the
+    # first gallery clip when there's no playblast). See the Seedance r2v docs.
     if extra_imgs:
-        look_tag = ("Use the attached reference images. The FIRST reference image "
-                    "is the main subject — keep its exact appearance, materials, "
-                    "colours and identity; use the other reference images as "
-                    "described in the text. ")
+        look_tag = ("The main subject is Image 1 — keep its exact appearance, "
+                    "materials, colours and identity. Use the other reference "
+                    "images (Image 2, Image 3, …) as described in the text. ")
     else:
-        look_tag = ("Animate the subject from the reference image, keeping its "
-                    "exact appearance, materials, colours and style from the "
-                    "reference image; do not restyle or change its look. ")
+        look_tag = ("Animate the subject from Image 1, keeping its exact "
+                    "appearance, materials, colours and style from Image 1; do "
+                    "not restyle or change its look. ")
     prompt = look_tag + (("Action: " + motion) if motion else "")
 
-    seconds = _anim_seconds()
-    duration = max(4, min(15, int(round(seconds)) or 4))
+    # Playblast ON -> clip length follows the scene animation; OFF -> the user's
+    # choice from the dialog (Seedance 2.0: 4-15 s, verified).
+    if use_anim:
+        seconds = _anim_seconds()
+        duration = max(4, min(15, int(round(seconds)) or 4))
+    else:
+        duration = d.duration_choice()
+        seconds = duration
 
     # Reference videos (the playblast and/or an extra clip) need a public video
     # host (R2/TOS). If there isn't one, alert the user -- they'll be dropped.
@@ -4411,30 +4571,131 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
     try:
         movie = None
         motion_frames = []                           # ONLY for the text fallback
+        capture_failed = False                       # wanted a playblast, couldn't get one
         if use_anim:
             # Prefer the VIDEO reference. Capture it first; only fall back to
             # sampling frames (for a text motion description) when there is no
             # video -- when the video IS attached, the frames aren't used, so we
             # don't waste time/disk sampling them.
             if host:
-                dlg.setLabelText("Capturing motion playblast (video)...")
-                QtWidgets.QApplication.processEvents()
-                try:
-                    movie = _playblast_movie()
-                except Exception as e:
-                    sys.stderr.write("[BYTEPLUS] movie failed: {}\n".format(e))
+                _rng = _anim_range()                 # capture the SAME range as `duration`
+
+                def _try_capture():
+                    # Playblast capture is LOCAL and FREE -> retry a few times so a
+                    # transient Maya/GPU glitch doesn't silently drop us to text.
+                    for _att in range(4):
+                        dlg.setLabelText("Capturing motion playblast (video){}...".format(
+                            "" if _att == 0 else "  retry {}".format(_att)))
+                        QtWidgets.QApplication.processEvents()
+                        try:
+                            cand = _playblast_movie(*_rng)
+                        except Exception as e:
+                            sys.stderr.write("[BYTEPLUS] playblast capture failed "
+                                             "(attempt {}): {}\n".format(_att + 1, e))
+                            continue
+                        if _playblast_is_valid(cand, seconds):
+                            return cand
+                        sys.stderr.write("[BYTEPLUS] playblast looked invalid (attempt "
+                                         "{}); retrying.\n".format(_att + 1))
+                    return None
+
+                movie = _try_capture()
+                # You WANTED faithful motion but the capture kept failing. Don't
+                # silently spend a paid generation on generic motion -- ask.
+                while not movie:
+                    dlg.hide()
+                    choice = _msgbox(
+                        QtWidgets.QMessageBox.Warning,
+                        "BYTEPLUS - motion playblast capture failed",
+                        "The scene's motion playblast could not be captured after "
+                        "several tries, so Seedance would invent GENERIC motion "
+                        "instead of following your animation.\n\n"
+                        "Check that the time-slider range covers your animation and "
+                        "that the active view is a normal 3D viewport, then Retry.\n\n"
+                        "  • Retry  -- capture again\n"
+                        "  • Ignore -- generate with generic motion anyway\n"
+                        "  • Cancel -- stop (nothing generated or charged)",
+                        QtWidgets.QMessageBox.Retry | QtWidgets.QMessageBox.Ignore
+                        | QtWidgets.QMessageBox.Cancel)
+                    if choice == QtWidgets.QMessageBox.Retry:
+                        dlg.show()
+                        movie = _try_capture()
+                        continue
+                    if choice == QtWidgets.QMessageBox.Cancel:
+                        dlg.close()
+                        return
+                    capture_failed = True            # Ignore -> generic on purpose
+                    break
+                dlg.show()
+            else:
+                # Hosting isn't set up, so even a captured playblast can't be sent.
+                # The user already OK'd the 'motion hosting not configured' warning.
+                capture_failed = True
             if not movie:                            # text-only fallback path
+                if capture_failed:
+                    sys.stderr.write("[BYTEPLUS] motion: {} -> generating GENERIC "
+                                     "motion.\n".format(
+                                         "playblast capture failed" if host
+                                         else "motion hosting (R2/TOS) not configured"))
                 dlg.setLabelText("Sampling motion frames...")
                 QtWidgets.QApplication.processEvents()
                 for f in _frame_samples(min(6, CONFIG.MAX_IMAGE_REFS)):
                     motion_frames.append(_playblast_frame(f))
+        elif not extra_movies:
+            sys.stderr.write("[BYTEPLUS] motion: 'Use scene animation' is off (or the "
+                             "scene has no animation) -> motion from the text prompt.\n")
     except Exception:
         dlg.close()
         _error("Could not prepare animation:\n\n" + traceback.format_exc())
         return
 
+    # Prepare the SELECTED motion videos (gallery clips): validate/transcode each to
+    # a Seedance-safe MP4 (like the playblast), then keep only those that fit
+    # Seedance's limit (<=3 reference videos, <=15s total incl. the playblast). WARN
+    # about any that are dropped instead of dropping them silently downstream. Needs
+    # a video host (checked/warned above); without one nothing can be sent.
+    ready_extras = []
+    if extra_movies and host:
+        dlg.setLabelText("Preparing reference video(s)...")
+        QtWidgets.QApplication.processEvents()
+        _vbudget = 15 - (int(duration) if movie else 0)
+        _vslots = 3 - (1 if movie else 0)
+        _dropped = []
+        for mv in extra_movies:
+            try:
+                mv2 = _ensure_seedance_video(mv)
+            except Exception as e:
+                _dropped.append((mv, "not a Seedance-compatible video ({})".format(e)))
+                continue
+            mvdur = _video_duration(mv2) or 0
+            if len(ready_extras) >= _vslots:
+                _dropped.append((mv, "over Seedance's 3-reference-video limit"))
+            elif mvdur > _vbudget + 0.1:
+                _dropped.append((mv, "{:.1f}s won't fit the {:.0f}s left (15s total "
+                                     "with the playblast)".format(mvdur, max(0, _vbudget))))
+            else:
+                ready_extras.append(mv2)
+                _vbudget -= mvdur
+        if _dropped:
+            _lines = "\n".join("  • {} — {}".format(os.path.basename(str(_p)), _why)
+                               for _p, _why in _dropped)
+            dlg.hide()
+            _msgbox(QtWidgets.QMessageBox.Warning,
+                    "BYTEPLUS - some motion videos were not sent",
+                    "These selected reference videos will NOT be sent to Seedance:"
+                    "\n\n" + _lines + "\n\nSeedance allows at most 3 reference videos "
+                    "totalling 15 seconds (including the scene playblast).",
+                    QtWidgets.QMessageBox.Ok)
+            dlg.show()
+
+    if extra_movies:
+        sys.stderr.write("[BYTEPLUS] reference videos: {} selected -> {} will be "
+                         "sent to Seedance{}.\n".format(
+                             len(extra_movies), len(ready_extras),
+                             "" if host else " (motion hosting R2/TOS not configured)"))
+
     dlg.setLabelText("Submitting to Seedance (image + {})...".format(
-        "motion video" if movie else "motion description"))
+        "motion video" if (movie or ready_extras) else "motion description"))
     QtWidgets.QApplication.processEvents()
     def failed(tb):
         dlg.close()
@@ -4463,22 +4724,28 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
     poster = poster_path or (image_src if not str(image_src).startswith("http")
                              else None)
 
-    status = {}                                      # transparency: what actually ran
-
     def make_video(p):                               # re-runnable with a new prompt
-        status.clear()
+        # Resolve @tags now that the video numbering is known (playblast = Video 1,
+        # gallery clips follow). This matches the content order in _seedance_generate.
+        p = _bind_refs(p, img_refs, vid_refs, vid_offset=(2 if movie else 1))
+        n_vid = (1 if movie else 0) + len(ready_extras)
         final = p
-        if movie:
-            # Video attached -> reference it DIRECTLY (the role the API uses). The
-            # wording is fixed/deterministic so the motion stays consistent and
-            # faithful to the playblast across runs.
-            final = ("Strictly follow the motion, movement path, camera work and "
-                     "timing of the reference video; the reference video provides "
-                     "ONLY the motion, not the look -- keep the subject's exact "
-                     "appearance from the reference image.  " + p)
+        if n_vid:
+            # One or more reference videos attached (playblast and/or gallery clips)
+            # -> tell Seedance to FOLLOW their motion, by their numbered labels (the
+            # role the API uses). Content order: playblast is Video 1, extras follow.
+            labels = ["Video {}".format(i + 1) for i in range(n_vid)]
+            if len(labels) == 1:
+                vlist, verb = labels[0], "It provides"
+            else:
+                vlist = ", ".join(labels[:-1]) + " and " + labels[-1]
+                verb = "They provide"
+            final = ("Strictly follow the exact motion, movement path, camera work "
+                     "and timing of {} throughout. {} ONLY the motion and camera, "
+                     "not the look — keep the subject's exact appearance from "
+                     "Image 1.  ".format(vlist, verb) + p)
         elif motion_frames:
-            # No video -> text-only FALLBACK. Describe the motion (non-Video-1, so
-            # we never reference a video that isn't there).
+            # No video at all -> text-only FALLBACK from sampled scene frames.
             try:
                 desc = _describe_scene_motion(motion_frames)
                 if desc:
@@ -4486,31 +4753,16 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
             except Exception as e:
                 sys.stderr.write("[BYTEPLUS] scene-motion describe skipped: "
                                  "{}\n".format(e))
-        # image(s) -> reference_image (look); video(s) -> reference_video (motion +
-        # any extra clip). The prompt refers to them directly. No first_frame
-        # (can't mix with a video ref). require_motion_video makes a failed
-        # playblast upload FAIL LOUDLY instead of silently degrading.
+        # No first_frame (can't mix with a video ref). require_motion_video makes a
+        # failed playblast upload FAIL LOUDLY instead of silently degrading.
         return _seedance_generate(final, image_sources, movie, duration,
                                   require_motion_video=bool(movie),
-                                  generate_audio=audio, extra_movies=extra_movies,
-                                  fit_motion=True, status=status)
-
-    def done(vb):
-        dlg.close()
-        # Transparency: surface what actually ran, so a silent clip or approximate
-        # motion is never a mystery (these used to be Script-Editor-only).
-        warns = []
-        if status.get("audio_dropped"):
-            warns.append("audio dropped (Seedance moderated it) — clip is silent")
-        if use_anim and not movie:
-            warns.append("motion approximate — playblast wasn't captured")
-        if warns:
-            cmds.inViewMessage(amg="⚠ <hl>" + "  ·  ".join(warns) + "</hl>",
-                               pos="midCenter", fade=True, fadeStayTime=5000)
-        _add_video_result(vb, poster, make_video, prompt=prompt)
+                                  generate_audio=audio, extra_movies=ready_extras,
+                                  fit_motion=True, trusted_input=trusted_input)
 
     worker = _Worker(lambda: make_video(prompt), parent=_main_window())
-    worker.done.connect(done)
+    worker.done.connect(lambda vb: (dlg.close(),
+                        _add_video_result(vb, poster, make_video, prompt=prompt)))
     worker.failed.connect(failed)
     worker.start()
     animate_with_seedance._w = worker  # keep ref alive
@@ -4634,17 +4886,19 @@ def _image_size():
 
 
 def _seedream(prompt: str, ref_uris: list[str] | None = None, size: str = "2K",
-              return_url: bool = False):
+              return_url: bool = False, model: str | None = None):
     """One synchronous Seedream image generation. `ref_uris` are reference-image
     URLs/data-URIs (already passed through _asset_uri).
 
     Returns image bytes by default. With return_url=True returns (bytes, url)
     where `url` is the original Seedream platform URL -- needed to keep the
     biometric trust chain intact when feeding the image to Seedance."""
+    m = model or CONFIG.SEEDREAM_MODEL
+
     def _call(fmt):
         def _post(sz):
             body = {
-                "model": CONFIG.SEEDREAM_MODEL,
+                "model": m,
                 "prompt": prompt,
                 "size": sz,
                 "response_format": fmt,
@@ -4682,7 +4936,7 @@ def _seedream(prompt: str, ref_uris: list[str] | None = None, size: str = "2K",
     else:
         resp = _call("b64_json")
 
-    _track("images", resp, CONFIG.SEEDREAM_MODEL)
+    _track("images", resp, m)
     item = resp["data"][0]
     url = item.get("url")
     data = base64.b64decode(item["b64_json"]) if item.get("b64_json") \
@@ -4786,7 +5040,7 @@ class DreamDialog(QtWidgets.QDialog):
         parts = [p for p in parts if p]
         return (".  " + ", ".join(parts) + ".") if parts else ""
 
-    def __init__(self, snapshot_path, parent=None):
+    def __init__(self, snapshot_path, parent=None, initial_prompt=None):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Dream with Seedream 5.0")
         self.setMinimumSize(580, 640)
@@ -4879,6 +5133,8 @@ class DreamDialog(QtWidgets.QDialog):
             "Use '✨ Auto' to draft it from the viewport.")
         v.addWidget(self.prompt, 1)
         _add_dictate_button(ph, self.prompt)     # prompt now exists -> safe
+        if initial_prompt:                       # e.g. handed over from Seed Chat
+            self.prompt.setPlainText(initial_prompt)
 
         # --- camera controls (optional, appended to the prompt) --------------
         cam = QtWidgets.QHBoxLayout()
@@ -5204,8 +5460,11 @@ class DreamGallery(QtWidgets.QDialog):
         self.view.clear()
         self._load_existing()
 
-    def _add(self, data, path, url, select=True, prompt=None):
-        item = {"bytes": data, "path": path, "url": url, "prompt": prompt}
+    def _add(self, data, path, url, select=True, prompt=None, t2i=None):
+        # t2i: True = trusted Text-to-Image output (a face in it is animatable);
+        # False = refine/edit/import/viewport-guided (image-to-image -> a face needs
+        # KYC HIGH, Seedance rejects it); None = unknown (loaded from disk).
+        item = {"bytes": data, "path": path, "url": url, "prompt": prompt, "t2i": t2i}
         _write_url_sidecar(path, url)            # persist the trusted URL (if any)
         _write_prompt_sidecar(path, prompt)      # persist the prompt used (if any)
         self._items.append(item)
@@ -5298,7 +5557,8 @@ class DreamGallery(QtWidgets.QDialog):
 
         def done(res):
             prog.close()
-            self._add(res["bytes"], res["path"], res["url"], prompt=res.get("prompt"))
+            self._add(res["bytes"], res["path"], res["url"],
+                      prompt=res.get("prompt"), t2i=res.get("t2i"))
 
         def fail(tb):
             prog.close()
@@ -5351,7 +5611,7 @@ class DreamGallery(QtWidgets.QDialog):
         def _ok(res):
             try:
                 self._add(res["bytes"], res["path"], res["url"],
-                          prompt=res.get("prompt"))
+                          prompt=res.get("prompt"), t2i=res.get("t2i"))
             finally:
                 _tick()
 
@@ -5398,8 +5658,11 @@ class DreamGallery(QtWidgets.QDialog):
             out = _unique_path(img_dir, "byteplus_dream")
             with open(out, "wb") as f:
                 f.write(data)
+            # t2i=False: Refine is an image-to-image edit -> the result is NOT a
+            # trusted Text-to-Image output, so a face in it can't be animated
+            # (Seedance needs KYC HIGH for image-to-image faces).
             return {"bytes": data, "path": out, "url": url,
-                    "prompt": "Refine: " + comment}
+                    "prompt": "Refine: " + comment, "t2i": False}
 
         self._run(fn, label="Refining image with Seedream 5.0...")
 
@@ -5453,7 +5716,40 @@ class DreamGallery(QtWidgets.QDialog):
         # 403. Once stale, fall back to the local file. The local path is also
         # handed over as the Video Gallery poster.
         url = self._current.get("url")
-        ref = url if (url and _url_is_fresh(url)) else self._current.get("path")
+        fresh = bool(url and _url_is_fresh(url))
+        ref = url if fresh else self._current.get("path")
+        # Diagnostic: a FACE only survives Seedance moderation when we send a FRESH
+        # trusted Seedream platform URL. If this logs 'LOCAL FILE', the image wasn't
+        # made with Dream > Text-to-Image, or is >24h old, or was imported -->
+        # regenerate it (Dream > Text-to-Image) and animate within ~24h.
+        t2i = self._current.get("t2i")
+        sys.stderr.write("[BYTEPLUS] Animate source = {} (fresh trusted URL: {}, "
+                         "T2I origin: {}).\n".format(
+                             "platform URL" if fresh else "LOCAL FILE (re-uploaded)",
+                             fresh, t2i))
+        # Proactive face-trust warning. A face survives Seedance moderation ONLY as a
+        # FRESH, trusted Text-to-Image Seedream output. Refined/edited/imported
+        # (image-to-image) faces need KYC HIGH; a stale/re-uploaded URL loses trust.
+        warn = None
+        if t2i is False:
+            warn = ("This image was refined / edited / imported (image-to-image), so "
+                    "it is NOT a trusted Text-to-Image output.\n\nIf it contains a "
+                    "HUMAN FACE, Seedance will REJECT it unless your BytePlus account "
+                    "has KYC HIGH.\n\nTo animate a face, regenerate it with  "
+                    "Dream ▸ Text-to-Image  (put your change in the prompt).\n\n"
+                    "Objects and scenes without faces animate fine.\n\nContinue anyway?")
+        elif not fresh:
+            warn = ("This image has no fresh trusted Seedream link — it wasn't made "
+                    "with Dream ▸ Text-to-Image, or it's over ~24h old, or it was "
+                    "imported.\n\nIf it contains a HUMAN FACE, Seedance will REJECT "
+                    "it. To animate a face: regenerate it with  Dream ▸ Text-to-Image"
+                    "  and animate within ~24h.\n\nObjects and scenes without faces "
+                    "animate fine.\n\nContinue anyway?")
+        if warn and _msgbox(
+                QtWidgets.QMessageBox.Warning, "BYTEPLUS - face may be rejected", warn,
+                QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel
+                ) != QtWidgets.QMessageBox.Ok:
+            return
         vg = getattr(_video_gallery, "_inst", None)
         video_items = list(vg._items) if vg is not None else []
         animate_with_seedance(ref or url, poster_path=self._current.get("path"),
@@ -5483,17 +5779,20 @@ class DreamGallery(QtWidgets.QDialog):
             except OSError as e:
                 _error("Could not import {}:\n{}".format(p, e))
                 continue
-            self._add(data, dst, None, select=True)   # url=None -> uses the file
+            self._add(data, dst, None, select=True, t2i=False)  # imported -> not T2I-trusted
 
 
-def dream_with_seedream():
+def dream_with_seedream(initial_prompt=None):
     """Snapshot the viewport, collect intent via DreamDialog, then open the
-    persistent Dream Gallery (generate / regenerate / save / animate)."""
+    persistent Dream Gallery (generate / regenerate / save / animate).
+
+    `initial_prompt` pre-fills the prompt box (used by Seed Chat's 'Send to
+    Dream'); the menu still calls this with no arguments."""
     import shutil
     if not _scene_ok_to_proceed():
         return
     snap = _viewport_snapshot()
-    d = DreamDialog(snap)
+    d = DreamDialog(snap, initial_prompt=initial_prompt)
     if not d.exec():
         return
     prompt = d.prompt_text()
@@ -5518,15 +5817,21 @@ def dream_with_seedream():
             ref_uris = [_asset_uri(ref_path, "image/png")]
             if extra:
                 ref_uris.append(_asset_uri(extra, _image_mime(extra)))
-        # return_url=True keeps the platform URL for trust-preserving Animate
+        # return_url=True keeps the platform URL for trust-preserving Animate.
+        # Text-to-Image (face-safe) uses Seedream 5.0 Lite so the AI face is a
+        # TRUSTED input for Seedance (base 5.0 faces are rejected -- see CONFIG).
         data, url = _seedream(directive + prompt, ref_uris, size=_image_size(),
-                              return_url=True)
+                              return_url=True,
+                              model=(CONFIG.SEEDREAM_FACE_MODEL if text_only else None))
         if _cancel_requested():                  # cancelled during the call ->
             raise _Cancelled()                   # discard, don't write an orphan file
         out = _unique_path(img_dir, scene + "_dream")
         with open(out, "wb") as f:
             f.write(data)
-        return {"bytes": data, "path": out, "url": url, "prompt": prompt}
+        # t2i=text_only: a face-safe Text-to-Image output is a TRUSTED, animatable
+        # Seedance input; a viewport-guided (image-to-image) output is not.
+        return {"bytes": data, "path": out, "url": url, "prompt": prompt,
+                "t2i": text_only}
 
     gallery = _dream_gallery(regen, img_dir, n_variations)
     gallery.show()
@@ -5839,12 +6144,22 @@ class SettingsDialog(QtWidgets.QDialog):
         self.seedream_model = QtWidgets.QLineEdit(CONFIG.SEEDREAM_MODEL)
         self.seedream_model.setPlaceholderText("e.g. seedream model ID or ep-xxxx")
         form.addRow("Seedream (image) model", self.seedream_model)
+        self.seedream_face_model = QtWidgets.QLineEdit(CONFIG.SEEDREAM_FACE_MODEL)
+        self.seedream_face_model.setPlaceholderText(
+            "Seedream 5.0 Lite -- required so AI faces (Text-to-Image) are animatable")
+        form.addRow("Seedream face model (T2I)", self.seedream_face_model)
         self.seedance_model = QtWidgets.QLineEdit(CONFIG.SEEDANCE_MODEL)
         self.seedance_model.setPlaceholderText("e.g. seedance model ID or ep-xxxx")
         form.addRow("Seedance (video) model", self.seedance_model)
         self.llm_model = QtWidgets.QLineEdit(CONFIG.LLM_MODEL)
         self.llm_model.setPlaceholderText("multimodal LLM for auto-prompt")
         form.addRow("LLM model (auto-prompt)", self.llm_model)
+        self.seed_chat_model = QtWidgets.QLineEdit(CONFIG.SEED_CHAT_MODEL)
+        self.seed_chat_model.setPlaceholderText("Seed 2.0 model for the Seed Chat window")
+        form.addRow("Seed Chat model", self.seed_chat_model)
+        self.three_d_model = QtWidgets.QLineEdit(CONFIG.THREE_D_MODEL)
+        self.three_d_model.setPlaceholderText("3D model ID / ep-... from your ModelArk console")
+        form.addRow("3D model (Seed 3D)", self.three_d_model)
         mhint = QtWidgets.QLabel(
             "Copy the exact model ID (or inference endpoint 'ep-...') from your "
             "BytePlus ModelArk console. Test one with byteplus_maya.diagnose("
@@ -6062,8 +6377,11 @@ class SettingsDialog(QtWidgets.QDialog):
         CONFIG.REMEMBER_API_KEY = self.remember.isChecked()
         CONFIG.BASE_URL = self.base_url.text().strip().rstrip("/")
         CONFIG.SEEDREAM_MODEL = self.seedream_model.text().strip()
+        CONFIG.SEEDREAM_FACE_MODEL = self.seedream_face_model.text().strip()
         CONFIG.SEEDANCE_MODEL = self.seedance_model.text().strip()
         CONFIG.LLM_MODEL = self.llm_model.text().strip()
+        CONFIG.SEED_CHAT_MODEL = self.seed_chat_model.text().strip()
+        CONFIG.THREE_D_MODEL = self.three_d_model.text().strip()
         CONFIG.VIDEO_RESOLUTION = self.resolution.currentText()
         CONFIG.VIDEO_RATIO = self.ratio.currentText()
         CONFIG.IMAGE_RATIO = self.image_ratio.currentText()
@@ -6535,6 +6853,1188 @@ def report_bug():
 
 
 # =============================================================================
+# Seed Chat -- multimodal assistant (BytePlus Seed 2.0) inside Maya
+# -----------------------------------------------------------------------------
+# A multi-turn chat window: creative + technical help for the artist, prompt
+# writing/repair for Seedream/Seedance, image description, and a grounded
+# "Model Genius" knowledge base about the BytePlus ModelArk platform. It reuses
+# the existing transport (_request), the QThread worker (_Worker), the viewport
+# grab (_viewport_snapshot) and the image encoders (_data_uri/_image_mime).
+# The _chat() helper is deliberately generic so the future in-Maya assistant
+# (tool-calling agent) can build on it.
+# =============================================================================
+
+def _chat(messages, model=None, system=None):
+    """Low-level multi-turn chat call against ModelArk /chat/completions.
+
+    `messages` is a list of {"role", "content"} dicts where content is either a
+    plain string or a list of multimodal parts ({"type":"text",...} /
+    {"type":"image_url","image_url":{"url":...}}). If `system` is given it is
+    prepended as a system message. Returns the assistant reply text.
+
+    NETWORK ONLY -- blocking; call from a _Worker, never the Maya UI thread. This
+    is the single shared chat wrapper the Seed Chat window and (later) the in-Maya
+    assistant both build on."""
+    model = model or CONFIG.SEED_CHAT_MODEL
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": system})
+    msgs.extend(messages)
+    body = {"model": model, "messages": msgs}
+    resp = _request("POST", CONFIG.BASE_URL + CONFIG.CHAT_COMPLETIONS, body)
+    _track("llm", resp, model)
+    return (resp["choices"][0]["message"]["content"] or "").strip()
+
+
+# Distilled "Model Genius" system prompt. Grounded in the bundled
+# byteplus-models-genius skill references -- keep every fact here CORRECT and
+# never let the model invent model IDs, params, endpoints, prices or limits.
+_SEED_CHAT_SYSTEM = (
+    "You are Seed Chat, an assistant embedded in the 'BYTEPLUS for Maya' plugin, "
+    "powered by BytePlus Seed 2.0. You help a 3D artist working in Autodesk Maya. "
+    "You can: (1) answer technical questions about the BytePlus ModelArk platform "
+    "and its models (act as 'Model Genius'); (2) write and repair image/video "
+    "prompts; (3) describe or critique images the user attaches; (4) give creative "
+    "and technical direction for their Maya renders.\n\n"
+    "GROUNDED FACTS (BytePlus ModelArk, region ap-southeast-1, base URL "
+    "https://ark.ap-southeast.bytepluses.com/api/v3):\n"
+    "- IMAGE = Seedream (flagship 'seedream-5-0-260128', plus -lite, "
+    "'seedream-4-5-251128', 'seedream-4-0-250828'). Sync endpoint "
+    "/images/generations. Up to 14 reference images; prompts in ENGLISH under 600 "
+    "words; sizes 2K/3K/4K or exact WxH pixels; watermark defaults TRUE.\n"
+    "- VIDEO = Seedance 2.0 ('dreamina-seedance-2-0-260128' base, plus -fast and "
+    "-mini-260615). Async /contents/generations/tasks. 480p/720p/1080p/4k (1080p & "
+    "4k = base model only), 4-15 s, 24 fps, up to 9 reference images. Prompt "
+    "formula: Subject + Action details + Scene/Environment + Lighting & Color + "
+    "Camera movement + Visual style + Quality; quantify motion (speed/inertia). "
+    "Watermark defaults FALSE.\n"
+    "- 3D = Hyper3d-Rodin-Gen2 (text->3D and image->3D) and Hitem3d-2.0 "
+    "(image->3D only). Async, same tasks endpoint; outputs glb/obj/fbx/usdz with "
+    "optional PBR materials.\n"
+    "- LLM / agent = Seed 2.0 (this chat): 256K context, multimodal understanding, "
+    "native tool calling.\n"
+    "- COMPLIANCE: real human faces are NEVER allowed as references. AI-generated "
+    "people are only allowed via the Seedream text-to-image 'Trusted Output' path "
+    "on the same account.\n\n"
+    "The plugin's BYTEPLUS menu already offers: Render with Seedance, Dream with "
+    "Seedream, Dream/Video galleries, Generate Texture, and Settings. When the user "
+    "wants an image, offer to hand an optimized prompt to 'Dream'.\n\n"
+    "STYLE: be concise and practical. Reply in the user's language (they may write "
+    "Spanish), BUT any prompt you produce for Seedream/Seedance must be in ENGLISH. "
+    "If you are unsure of an exact ID, parameter, price or limit, say so rather "
+    "than guessing. Never fabricate.")
+
+
+class _ChatInput(QtWidgets.QPlainTextEdit):
+    """Multi-line input that sends on Enter (Shift+Enter inserts a newline)."""
+
+    def __init__(self, on_send, parent=None):
+        super().__init__(parent)
+        self._on_send = on_send
+        self.setPlaceholderText(
+            "Ask anything, or type an idea and hit '✨ Prompt Doctor'. "
+            "Enter = send, Shift+Enter = new line.")
+
+    def keyPressEvent(self, e):
+        if e.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter) and \
+                not (e.modifiers() & QtCore.Qt.ShiftModifier):
+            self._on_send()
+            return
+        super().keyPressEvent(e)
+
+
+class SeedChatDialog(QtWidgets.QDialog):
+    """Multi-turn multimodal chat with BytePlus Seed 2.0 (CONFIG.SEED_CHAT_MODEL).
+    Persistent singleton so the conversation survives closing the window."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent or _main_window())
+        self.setWindowTitle("BYTEPLUS - Seed Chat")
+        self.setMinimumSize(560, 680)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self._history = []            # API messages (no system); grows per turn
+        self._attachments = []        # local image paths for the NEXT user turn
+        self._last_assistant = ""     # last reply text, for "Send to Dream"
+        self._busy = False            # a chat request is in flight
+        self._workers = []            # keep QThread refs alive
+
+        v = QtWidgets.QVBoxLayout(self)
+
+        # -- target selector (drives Prompt Doctor) --------------------------
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(QtWidgets.QLabel("Mode:"))
+        self.target = QtWidgets.QComboBox()
+        self.target.addItems(["\U0001F4AC Chat",
+                              "\U0001F5BC Image prompt (Seedream)",
+                              "\U0001F3AC Video prompt (Seedance)"])
+        self.target.setToolTip("Chat = free conversation / Model Genius. The image "
+                               "and video modes tune the '✨ Prompt Doctor' button.")
+        top.addWidget(self.target)
+        top.addStretch(1)
+        b_clear = QtWidgets.QPushButton("Clear chat")
+        b_clear.clicked.connect(self._clear_chat)
+        top.addWidget(b_clear)
+        v.addLayout(top)
+
+        # -- conversation view -----------------------------------------------
+        self.view = QtWidgets.QTextBrowser()
+        self.view.setOpenExternalLinks(True)
+        self.view.setStyleSheet("QTextBrowser{background:#1d1d1d;color:#dddddd;}")
+        v.addWidget(self.view, 1)
+        self._say("assistant",
+                  "Hi \U0001F44B I'm Seed Chat (Seed 2.0). Ask me about BytePlus "
+                  "models, attach an image to describe it, or type an idea and hit "
+                  "✨ Prompt Doctor to turn it into an optimized prompt.")
+
+        # -- attachments row -------------------------------------------------
+        att = QtWidgets.QHBoxLayout()
+        b_img = QtWidgets.QPushButton("\U0001F4CE Image")
+        b_img.setToolTip("Attach reference image(s) for the next message")
+        b_img.clicked.connect(self._attach_image)
+        b_vp = QtWidgets.QPushButton("\U0001F5BC Viewport")
+        b_vp.setToolTip("Attach a grab of the current Maya viewport")
+        b_vp.clicked.connect(self._attach_viewport)
+        self.att_label = QtWidgets.QLabel("no attachments")
+        self.att_label.setStyleSheet("color:#888;")
+        b_att_clear = QtWidgets.QPushButton("✕")
+        b_att_clear.setFixedWidth(28)
+        b_att_clear.setToolTip("Clear attachments")
+        b_att_clear.clicked.connect(self._clear_attachments)
+        att.addWidget(b_img); att.addWidget(b_vp)
+        att.addWidget(self.att_label, 1); att.addWidget(b_att_clear)
+        v.addLayout(att)
+
+        # -- input -----------------------------------------------------------
+        self.input = _ChatInput(self._send)
+        self.input.setFixedHeight(90)
+        v.addWidget(self.input)
+
+        # -- action buttons --------------------------------------------------
+        actions = QtWidgets.QHBoxLayout()
+        self.b_doctor = QtWidgets.QPushButton("✨ Prompt Doctor")
+        self.b_doctor.setToolTip("Rewrite your text into an optimized ENGLISH "
+                                 "prompt for the selected target")
+        self.b_doctor.clicked.connect(self._prompt_doctor)
+        self.b_describe = QtWidgets.QPushButton("\U0001F50E Describe image")
+        self.b_describe.setToolTip("Describe the attached image + suggest a prompt")
+        self.b_describe.clicked.connect(self._describe_image)
+        self.b_dream = QtWidgets.QPushButton("→ Dream")
+        self.b_dream.setToolTip("Open 'Dream with Seedream' with the last reply "
+                                "as the prompt")
+        self.b_dream.setEnabled(False)
+        self.b_dream.clicked.connect(self._send_to_dream)
+        self.b_seed3d = QtWidgets.QPushButton("→ Seed 3D")
+        self.b_seed3d.setToolTip("Open 'Seed 3D' with the last reply as the prompt")
+        self.b_seed3d.setEnabled(False)
+        self.b_seed3d.clicked.connect(self._send_to_seed3d)
+        _add_dictate_button(actions, self.input)
+        actions.addWidget(self.b_doctor); actions.addWidget(self.b_describe)
+        actions.addStretch(1)
+        actions.addWidget(self.b_dream); actions.addWidget(self.b_seed3d)
+        v.addLayout(actions)
+
+        # -- send row --------------------------------------------------------
+        srow = QtWidgets.QHBoxLayout()
+        self.status = QtWidgets.QLabel("")
+        self.status.setStyleSheet("color:#2E8BE6;")
+        srow.addWidget(self.status, 1)
+        self.b_send = QtWidgets.QPushButton("Send")
+        self.b_send.setDefault(True)
+        self.b_send.clicked.connect(lambda: self._send())
+        srow.addWidget(self.b_send)
+        v.addLayout(srow)
+
+    # -- transcript ----------------------------------------------------------
+    @staticmethod
+    def _esc(t):
+        return (t.replace("&", "&amp;").replace("<", "&lt;")
+                 .replace(">", "&gt;").replace("\n", "<br>"))
+
+    def _say(self, role, text):
+        who, col = ("You", "#8ac6ff") if role == "user" else ("Seed", "#7ee081")
+        self.view.append(
+            "<p style='margin:6px 0'><b style='color:{}'>{}:</b> {}</p>".format(
+                col, who, self._esc(text)))
+        sb = self.view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    # -- attachments ---------------------------------------------------------
+    def _attach_image(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Attach reference image(s)", "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp)")
+        self._attachments.extend(paths)
+        self._refresh_attachments()
+
+    def _attach_viewport(self):
+        try:
+            self._attachments.append(_viewport_snapshot())
+        except Exception as e:
+            _error("Could not grab the viewport:\n{}".format(e))
+            return
+        self._refresh_attachments()
+
+    def _clear_attachments(self):
+        self._attachments = []
+        self._refresh_attachments()
+
+    def _refresh_attachments(self):
+        n = len(self._attachments)
+        self.att_label.setText("no attachments" if not n else
+                               "{} image{} attached".format(n, "s" if n > 1 else ""))
+        self.att_label.setStyleSheet("color:#888;" if not n else "color:#7ee081;")
+
+    # -- sending -------------------------------------------------------------
+    def _set_busy(self, busy):
+        self._busy = busy
+        for w in (self.b_send, self.b_doctor, self.b_describe, self.input,
+                  self.target):
+            w.setEnabled(not busy)
+        self.status.setText("Seed is typing…" if busy else "")
+
+    def _build_user_content(self, text):
+        if not self._attachments:
+            return text
+        parts = [{"type": "text", "text": text}]
+        for p in self._attachments:
+            try:
+                uri = _data_uri(p, _image_mime(p))
+            except Exception:
+                continue
+            parts.append({"type": "image_url", "image_url": {"url": uri}})
+        return parts
+
+    def _send(self, prefix=""):
+        if self._busy:
+            return
+        text = self.input.toPlainText().strip()
+        if prefix:
+            text = (prefix + text) if text else prefix
+        if not text and not self._attachments:
+            return
+        n_att = len(self._attachments)
+        content = self._build_user_content(text)
+        shown = text if not n_att else "{}  [\U0001F4CE {} image{}]".format(
+            text, n_att, "s" if n_att > 1 else "")
+        self._say("user", shown or "[image]")
+        self._history.append({"role": "user", "content": content})
+        self.input.clear()
+        self._clear_attachments()
+        hist = list(self._history)
+        self._set_busy(True)
+        w = _Worker(lambda: _chat(hist, system=_SEED_CHAT_SYSTEM), parent=self)
+        w.done.connect(self._on_reply)
+        w.failed.connect(self._on_fail)
+        self._workers.append(w)
+        w.start()
+
+    def _on_reply(self, reply):
+        self._set_busy(False)
+        reply = reply or "(empty reply)"
+        self._history.append({"role": "assistant", "content": reply})
+        self._last_assistant = reply
+        self.b_dream.setEnabled(True)
+        self.b_seed3d.setEnabled(True)
+        self._say("assistant", reply)
+
+    def _on_fail(self, tb):
+        self._set_busy(False)
+        _error(tb)
+
+    # -- quick actions -------------------------------------------------------
+    def _prompt_doctor(self):
+        if not self.input.toPlainText().strip():
+            _error("Type your idea in the box first, then hit Prompt Doctor.")
+            return
+        if "Video" in self.target.currentText():
+            prefix = ("Act as Prompt Doctor. Rewrite the following idea into ONE "
+                      "optimized ENGLISH prompt for the Seedance video model, using "
+                      "the formula Subject + Action details + Scene + Lighting & "
+                      "Color + Camera movement + Visual style + Quality, quantifying "
+                      "the motion. Output ONLY the prompt.\n\n")
+        else:
+            prefix = ("Act as Prompt Doctor. Rewrite the following idea into ONE "
+                      "optimized ENGLISH prompt for the Seedream image model: state "
+                      "subject, composition, lighting, lens and style, under 150 "
+                      "words, in simple direct language. Output ONLY the prompt.\n\n")
+        self._send(prefix=prefix)
+
+    def _describe_image(self):
+        if not self._attachments:
+            _error("Attach an image first (\U0001F4CE Image or \U0001F5BC Viewport).")
+            return
+        self._send(prefix=("Describe this image in detail (subject, composition, "
+                           "lighting, style), then suggest ONE optimized ENGLISH "
+                           "prompt to recreate or improve it.\n\n"))
+
+    def _send_to_dream(self):
+        prompt = (self._last_assistant or "").strip()
+        if not prompt:
+            return
+        try:
+            dream_with_seedream(initial_prompt=prompt)
+        except Exception:
+            _error(traceback.format_exc())
+
+    def _send_to_seed3d(self):
+        prompt = (self._last_assistant or "").strip()
+        if not prompt:
+            return
+        try:
+            open_seed_3d(initial_prompt=prompt)
+        except Exception:
+            _error(traceback.format_exc())
+
+    def _clear_chat(self):
+        self._history = []
+        self._last_assistant = ""
+        self.b_dream.setEnabled(False)
+        self.b_seed3d.setEnabled(False)
+        self.view.clear()
+        self._say("assistant", "Chat cleared. What would you like to do?")
+
+
+def _seed_chat_window():
+    """Return the single Seed Chat window, rebuilding it if the underlying C++
+    object was destroyed (robust singleton, same pattern as the Dream gallery)."""
+    w = getattr(_seed_chat_window, "_inst", None)
+    if w is not None:
+        try:
+            w.objectName()                   # touch the C++ obj; raises if destroyed
+        except Exception:
+            w = None
+    if w is None:
+        w = SeedChatDialog()
+        _seed_chat_window._inst = w
+    return w
+
+
+def open_seed_chat():
+    """Open the Seed Chat window (BYTEPLUS menu entry)."""
+    w = _seed_chat_window()
+    w.show()
+    w.raise_()
+
+
+# =============================================================================
+# Seed 3D -- text-to-3D asset generation (BytePlus 3D) imported into the scene
+# -----------------------------------------------------------------------------
+# Clones the async task pattern used for Seedance video (create -> poll -> download
+# via CONFIG.THREE_D_TASKS, the same /contents/generations/tasks endpoint), then
+# imports the downloaded mesh into the current Maya scene on the MAIN thread. v1 is
+# Text->3D (CONFIG.THREE_D_MODEL). Image->3D + asset breakdown is a later phase.
+#
+# The 3D model ID must be set from your ModelArk console in Settings > 3D model --
+# the documented IDs 404'd on this account until the model is activated there.
+# =============================================================================
+
+# fmt key -> (maya plugin to load, cmds.file import "type"). Missing = not natively
+# importable by Maya (glb/gltf/stl) -- we still download it but can't import.
+_3D_IMPORT = {
+    "usdz": ("mayaUsdPlugin", "USD Import"),
+    "usd":  ("mayaUsdPlugin", "USD Import"),
+    "fbx":  ("fbxmaya", "FBX"),
+    "obj":  ("objExport", "OBJ"),
+}
+
+
+def _scene_models_dir() -> str:
+    """data/byteplus3d/<scene>/ -- generated 3D assets, grouped per Maya scene."""
+    return _project_subdir("data", "data",
+                           os.path.join("byteplus3d", _scene_tag()))
+
+
+def _find_model_url(obj):
+    """Recursively dig a 3D-model file URL out of an arbitrary task result. Robust
+    to whichever key/nesting the 3D API uses (file_url / model_url / url ...)."""
+    exts = (".glb", ".gltf", ".obj", ".fbx", ".stl", ".usdz", ".usd", ".zip")
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s.startswith("http") and (any(e in s.lower() for e in exts)
+                                     or "model" in s.lower()):
+            return s
+        return None
+    if isinstance(obj, dict):
+        for k in ("file_url", "fileUrl", "model_url", "modelUrl", "url"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+        for v in obj.values():
+            f = _find_model_url(v)
+            if f:
+                return f
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            f = _find_model_url(v)
+            if f:
+                return f
+    return None
+
+
+def _extract_3d_archive(out: str, fmt: str) -> str:
+    """A 3D file_url is usually a ZIP / usdz holding the model layer PLUS a
+    textures/ folder. Maya resolves the material's RELATIVE texture paths only when
+    those files exist ON DISK next to the model layer -- importing the .usdz
+    directly leaves the textures inside the archive (unresolved -> grey shader). So
+    extract next to the saved file and import the real model layer. Falls back to
+    `out` if it isn't an archive or extraction fails."""
+    import zipfile
+    try:
+        if not zipfile.is_zipfile(out):
+            return out
+        extract_dir = os.path.splitext(out)[0] + "_files"
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(out) as z:
+            z.extractall(extract_dir)
+        pref = {
+            "usdz": (".usdc", ".usda", ".usd"),
+            "usd":  (".usdc", ".usda", ".usd"),
+            "fbx":  (".fbx",),
+            "obj":  (".obj",),
+        }.get(fmt.lower(), (".usdc", ".usda", ".usd", ".fbx", ".obj", ".glb", ".gltf"))
+        cands = []
+        for root, _dirs, files in os.walk(extract_dir):
+            for f in files:
+                if f.lower().endswith(pref):
+                    cands.append(os.path.join(root, f))
+        if cands:
+            cands.sort(key=lambda p: (p.count(os.sep), len(p)))   # shallowest first
+            sys.stderr.write("[BYTEPLUS] 3D archive extracted -> importing {}\n"
+                             .format(cands[0]))
+            return cands[0]
+    except Exception as e:
+        sys.stderr.write("[BYTEPLUS] 3D archive extract failed ({}); importing the "
+                         "downloaded file as-is.\n".format(e))
+    return out
+
+
+def _seed3d_generate(prompt, fmt="usdz", material="PBR", mesh_mode="Quad",
+                     quality="", hd=False, images=None) -> bytes:
+    """Submit a text->3D or image->3D job and poll until done; return the model-file
+    bytes. NETWORK ONLY -- call from a _Worker, never the Maya UI thread.
+
+    `images` (0-5 local paths or http URLs) switches on Image->3D: each is attached
+    as an image_url part (local files -> base64, http URLs pass through). Output
+    params are appended to the text as `--flags` (the API's loose-validation form)."""
+    text = prompt.strip()
+    text += " --material {} --mesh_mode {} --fileformat {}".format(
+        material, mesh_mode, fmt)
+    if quality:
+        text += " --subdivisionlevel {}".format(quality)
+    if hd:
+        text += " --addons HighPack --hd_texture true"
+
+    content = [{"type": "text", "text": text}]
+    for src in (images or [])[:5]:                # Image->3D accepts 1-5 images
+        uri = src if (isinstance(src, str) and src.startswith("http")) \
+            else _data_uri(src, _image_mime(src))
+        content.append({"type": "image_url", "image_url": {"url": uri}})
+    body = {"model": CONFIG.THREE_D_MODEL, "content": content}
+    if CONFIG.CALLBACK_URL:
+        body["callback_url"] = CONFIG.CALLBACK_URL
+
+    sys.stderr.write("[BYTEPLUS] Seed 3D request -> model={} fmt={} material={} "
+                     "mesh={} hd={} images={}\n".format(
+                         CONFIG.THREE_D_MODEL, fmt, material, mesh_mode, hd,
+                         len(images or [])))
+    created = _request("POST", CONFIG.BASE_URL + CONFIG.THREE_D_TASKS, body)
+    tid = created.get("id") or created.get("task_id")
+    if not tid:
+        raise RuntimeError("No task id in 3D response: " + json.dumps(created))
+
+    url = "{}{}/{}".format(CONFIG.BASE_URL, CONFIG.THREE_D_TASKS, tid)
+    while True:                                       # 3D generation is async
+        time.sleep(CONFIG.POLL_SECONDS)
+        if _cancel_requested():                       # user hit the HUD's ✕
+            try:
+                _request("DELETE", url)               # abort -> frees compute
+                sys.stderr.write("[BYTEPLUS] Seed 3D task {} cancelled.\n".format(tid))
+            except Exception as ce:
+                sys.stderr.write("[BYTEPLUS] 3D cancel: could not abort {} -> "
+                                 "{}\n".format(tid, ce))
+            raise _Cancelled()
+        st = _request("GET", url)
+        status = (st.get("status") or st.get("state") or "").lower()
+        if status in ("succeeded", "success", "done", "completed"):
+            model_url = _find_model_url(st)
+            if not model_url:
+                raise RuntimeError("3D task succeeded but no model URL found. Raw "
+                                   "response:\n" + json.dumps(st, indent=2))
+            _track("models", st, CONFIG.THREE_D_MODEL)
+            sys.stderr.write("[BYTEPLUS] Seed 3D done -> {}\n".format(model_url))
+            return _get_bytes(model_url)
+        if status in ("failed", "error", "cancelled", "canceled", "expired"):
+            raise RuntimeError("3D task failed: " + json.dumps(st, indent=2))
+
+
+def _save_and_import_3d(data: bytes, fmt: str, prompt: str):
+    """MAIN THREAD: write the downloaded model under the current project, import it
+    into the scene, then frame it. Wrapped in ONE undo chunk so the whole import is
+    a single Ctrl+Z."""
+    ext = "." + fmt.lower().lstrip(".")
+    out = _unique_path(_scene_models_dir(), _scene_tag() + "_seed3d", ext=ext)
+    with open(out, "wb") as f:
+        f.write(data)
+    try:                                              # prompt sidecar for reference
+        with open(os.path.splitext(out)[0] + ".txt", "w", encoding="utf-8") as f:
+            f.write(prompt.strip() + "\n")
+    except Exception:
+        pass
+
+    plugin, ftype = _3D_IMPORT.get(fmt.lower(), (None, None))
+    if not ftype:
+        _msgbox(QtWidgets.QMessageBox.Information, "BYTEPLUS - 3D downloaded",
+                "The 3D asset was saved to:\n\n{}\n\nMaya can't import '{}' "
+                "natively, so it wasn't added to the scene. Use USD, FBX or OBJ "
+                "for automatic import.".format(out, fmt),
+                QtWidgets.QMessageBox.Ok)
+        return
+
+    if plugin:
+        try:
+            if not cmds.pluginInfo(plugin, q=True, loaded=True):
+                cmds.loadPlugin(plugin, quiet=True)
+        except Exception as e:
+            _error("Could not load the '{}' plugin needed to import {}:\n{}\n\n"
+                   "The asset is saved at:\n{}".format(plugin, fmt, e, out))
+            return
+
+    # usdz/zip -> extract so the material's relative texture paths resolve on disk.
+    import_path = _extract_3d_archive(out, fmt)
+    ns = _safe_name(_scene_tag() + "_seed3d")
+    cmds.undoInfo(openChunk=True)
+    try:
+        new = cmds.file(import_path.replace(os.sep, "/"), i=True, type=ftype,
+                        ignoreVersion=True, mergeNamespacesOnClash=False,
+                        namespace=ns, returnNewNodes=True,
+                        preserveReferences=True) or []
+    except Exception:
+        _error("The 3D asset downloaded OK and is saved at:\n{}\n\nbut Maya could "
+               "not import it as {}:\n\n{}".format(out, fmt, traceback.format_exc()))
+        return
+    finally:
+        cmds.undoInfo(closeChunk=True)
+
+    try:
+        xforms = cmds.ls(new, type="transform") or new
+        if xforms:
+            cmds.select(xforms, replace=True)
+            cmds.viewFit()
+    except Exception:
+        pass
+    cmds.inViewMessage(amg="BYTEPLUS: 3D asset imported ({} node{}).".format(
+        len(new), "s" if len(new) != 1 else ""), pos="midCenter", fade=True)
+
+
+_ENHANCE_3D_SYSTEM = (
+    "You improve prompts for a text-to-3D asset generator (Hyper3D). Rewrite the "
+    "user's idea into ONE concise ENGLISH prompt describing a SINGLE 3D object: its "
+    "form, key shapes, materials/surface and style, with a useful level of detail. "
+    "Keep it under 60 words. Do NOT mention camera, lighting or scene/background -- "
+    "it's a standalone asset, not a photo. Preserve the user's subject and intent. "
+    "Output ONLY the improved prompt, no preamble or quotes.")
+
+
+def _enhance_3d_prompt(text: str) -> str:
+    """Improve the wording of a text-to-3D prompt with Seed 2.0. TEXT-ONLY, network
+    only -- call from a _Worker."""
+    return _chat([{"role": "user", "content": "Improve this 3D asset prompt:\n" + text}],
+                 system=_ENHANCE_3D_SYSTEM)
+
+
+class Seed3DDialog(QtWidgets.QDialog):
+    """Collects a Text->3D or Image->3D request (prompt/image + output params)."""
+
+    def __init__(self, parent=None, initial_prompt=None):
+        super().__init__(parent or _main_window())
+        self.setWindowTitle("BYTEPLUS - Seed 3D")
+        self.setMinimumSize(560, 560)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self._images = []                     # local paths / http URLs for Image->3D
+        self._enh_worker = None
+        v = QtWidgets.QVBoxLayout(self)
+
+        # -- mode ------------------------------------------------------------
+        mrow = QtWidgets.QHBoxLayout()
+        mrow.addWidget(QtWidgets.QLabel("Mode:"))
+        self.mode_text = QtWidgets.QRadioButton("Text → 3D")
+        self.mode_text.setChecked(True)
+        self.mode_image = QtWidgets.QRadioButton("Image → 3D")
+        self.mode_text.toggled.connect(self._sync_mode)
+        mrow.addWidget(self.mode_text); mrow.addWidget(self.mode_image)
+        mrow.addStretch(1)
+        v.addLayout(mrow)
+
+        # -- image source (Image->3D only) -----------------------------------
+        self.img_row = QtWidgets.QWidget()
+        ih = QtWidgets.QHBoxLayout(self.img_row)
+        ih.setContentsMargins(0, 0, 0, 0)
+        self.thumb = QtWidgets.QLabel("(no image)")
+        self.thumb.setFixedSize(160, 120)
+        self.thumb.setAlignment(QtCore.Qt.AlignCenter)
+        self.thumb.setStyleSheet("background:#1d1d1d; color:#888;")
+        ih.addWidget(self.thumb)
+        ibtns = QtWidgets.QVBoxLayout()
+        b_browse = QtWidgets.QPushButton("Browse…")
+        b_browse.clicked.connect(self._browse_image)
+        b_gallery = QtWidgets.QPushButton("From gallery")
+        b_gallery.clicked.connect(self._from_gallery)
+        b_clr = QtWidgets.QPushButton("Clear")
+        b_clr.clicked.connect(self._clear_images)
+        for b in (b_browse, b_gallery, b_clr):
+            ibtns.addWidget(b)
+        ibtns.addStretch(1)
+        ih.addLayout(ibtns); ih.addStretch(1)
+        v.addWidget(self.img_row)
+
+        lrow = QtWidgets.QHBoxLayout()
+        self.lbl = QtWidgets.QLabel("<b>Describe the 3D asset to generate</b>")
+        lrow.addWidget(self.lbl); lrow.addStretch(1)
+        self.b_enhance = QtWidgets.QPushButton("✦ Enhance")
+        self.b_enhance.setToolTip("Improve the wording of your 3D prompt with Seed 2.0 "
+                                  "(keeps your subject and intent)")
+        self.b_enhance.clicked.connect(self._enhance)
+        lrow.addWidget(self.b_enhance)
+        v.addLayout(lrow)
+        self.prompt = QtWidgets.QPlainTextEdit()
+        self.prompt.setPlaceholderText(
+            "e.g. a stylized wooden treasure chest with iron bands, game-ready")
+        if initial_prompt:
+            self.prompt.setPlainText(initial_prompt)
+        v.addWidget(self.prompt, 1)
+
+        form = QtWidgets.QFormLayout()
+        self.material = QtWidgets.QComboBox()
+        self.material.addItems(["PBR", "Shaded", "None"])
+        self.material.setCurrentText(CONFIG.THREE_D_MATERIAL)
+        self.material.setToolTip("PBR = base-color+metallic+normal+roughness maps; "
+                                 "Shaded = base color with baked light; None = white mesh")
+        form.addRow("Material", self.material)
+        self.mesh = QtWidgets.QComboBox()
+        self.mesh.addItems(["Quad", "Raw"])
+        self.mesh.setToolTip("Quad = clean quad topology; Raw = triangle mesh")
+        form.addRow("Mesh", self.mesh)
+        self.fmt = QtWidgets.QComboBox()
+        self.fmt.addItems(["usdz", "fbx", "obj"])
+        self.fmt.setCurrentText(CONFIG.THREE_D_FORMAT)
+        self.fmt.setToolTip("File format to request and import (Maya imports USD via "
+                            "mayaUsdPlugin, FBX via fbxmaya, OBJ built-in)")
+        form.addRow("Import format", self.fmt)
+        self.quality = QtWidgets.QComboBox()
+        self.quality.addItems(["(default)", "high", "medium", "low"])
+        self.quality.setToolTip("Polygon-detail preset (subdivision level)")
+        form.addRow("Detail", self.quality)
+        self.hd = QtWidgets.QCheckBox("4K textures (HighPack)")
+        form.addRow("", self.hd)
+        v.addLayout(form)
+
+        hint = QtWidgets.QLabel(
+            "If generation fails with 'NotFound', set your real 3D model ID in "
+            "BYTEPLUS > Settings > 3D model (the shipped default is a placeholder).")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#888;")
+        v.addWidget(hint)
+
+        if CONFIG.SHOW_COST:
+            cost = QtWidgets.QLabel(_fmt_cost(0, CONFIG.COST_3D_USD) + "  (per model)")
+            cost.setStyleSheet("color:#2E8BE6; font-weight:bold;")
+            v.addWidget(cost)
+
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.button(QtWidgets.QDialogButtonBox.Ok).setText("Generate")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        self._sync_mode()                     # hide the image row in Text mode
+
+    def prompt_text(self):
+        return self.prompt.toPlainText().strip()
+
+    def _enhance(self):
+        text = self.prompt.toPlainText().strip()
+        if not text:
+            cmds.inViewMessage(amg="Type a prompt first, then <hl>✦ Enhance</hl>.",
+                               pos="midCenter", fade=True)
+            return
+        self.b_enhance.setEnabled(False)
+        self.b_enhance.setText("Enhancing…")
+        self._enh_worker = _Worker(lambda: _enhance_3d_prompt(text), parent=self)
+
+        def done(t):
+            if t:
+                self.prompt.setPlainText(t)          # Ctrl+Z restores the original
+            self.b_enhance.setEnabled(True)
+            self.b_enhance.setText("✦ Enhance")
+
+        def fail(tb):                                # NB: no _msgbox from a modal dialog
+            self.b_enhance.setEnabled(True)
+            self.b_enhance.setText("✦ Enhance")
+            cmds.inViewMessage(amg="Enhance failed (see Script Editor).",
+                               pos="midCenter", fade=True)
+            sys.stderr.write("[BYTEPLUS] 3D enhance failed:\n" + tb + "\n")
+
+        self._enh_worker.done.connect(done)
+        self._enh_worker.failed.connect(fail)
+        self._enh_worker.start()
+
+    def _sync_mode(self, *_):
+        img = self.mode_image.isChecked()
+        self.img_row.setVisible(img)
+        if img:
+            self.lbl.setText("<b>Optional guidance</b>  (the image drives the shape)")
+            self.prompt.setPlaceholderText(
+                "Optional: extra guidance, e.g. 'clean topology, symmetrical, game-ready'")
+        else:
+            self.lbl.setText("<b>Describe the 3D asset to generate</b>")
+            self.prompt.setPlaceholderText(
+                "e.g. a stylized wooden treasure chest with iron bands, game-ready")
+
+    def _browse_image(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Choose reference image(s) for Image → 3D", "",
+            "Images (*.png *.jpg *.jpeg *.webp)")
+        if paths:
+            self._images = paths[:5]
+            self._refresh_img()
+
+    def _from_gallery(self):
+        # Open the generated-images folder in a standard file dialog. Robust: works
+        # whether or not the gallery window is open, and -- unlike _msgbox / a custom
+        # modal picker -- a QFileDialog is safe to open from inside this modal dialog
+        # (re-showing an always-on-top modal via _msgbox freezes Maya).
+        try:
+            start = _scene_images_dir()
+        except Exception:
+            start = ""
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Pick generated image(s) for Image → 3D", start,
+            "Images (*.png *.jpg *.jpeg *.webp)")
+        if paths:
+            self._images = paths[:5]
+            self._refresh_img()
+
+    def _clear_images(self):
+        self._images = []
+        self._refresh_img()
+
+    def _refresh_img(self, data=None):
+        if self._images and self._images[0]:
+            pm = QtGui.QPixmap()
+            if data:
+                pm.loadFromData(data)
+            elif not str(self._images[0]).startswith("http"):
+                pm = QtGui.QPixmap(self._images[0])
+            if not pm.isNull():
+                self.thumb.setPixmap(pm.scaled(
+                    160, 120, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+            else:
+                self.thumb.setText("image set")
+            self.thumb.setToolTip("{} image(s)".format(len(self._images)))
+        else:
+            self.thumb.clear()
+            self.thumb.setText("(no image)")
+
+    def params(self):
+        q = self.quality.currentText()
+        return {
+            "mode": "image" if self.mode_image.isChecked() else "text",
+            "images": list(self._images),
+            "material": self.material.currentText(),
+            "mesh_mode": self.mesh.currentText(),
+            "fmt": self.fmt.currentText(),
+            "quality": "" if q.startswith("(") else q,
+            "hd": self.hd.isChecked(),
+        }
+
+
+def open_seed_3d(initial_prompt=None):
+    """Open Seed 3D (Text->3D or Image->3D): collect intent, then generate +
+    import async. `initial_prompt` pre-fills the prompt (used by Seed Chat)."""
+    if not _scene_ok_to_proceed():
+        return
+    d = Seed3DDialog(initial_prompt=initial_prompt)
+    if not d.exec():
+        return
+    p = d.params()
+    prompt = d.prompt_text()
+    images = p.get("images") or []
+    if p["mode"] == "image":
+        if not images:
+            _error("Image → 3D needs at least one image. Use  Browse…  or  "
+                   "From gallery.")
+            return
+    elif not prompt:
+        return
+    fmt = p["fmt"]
+
+    dlg = _progress("Generating 3D asset (this can take a minute)...")
+    worker = _Worker(
+        lambda: _seed3d_generate(prompt, fmt=fmt, material=p["material"],
+                                 mesh_mode=p["mesh_mode"], quality=p["quality"],
+                                 hd=p["hd"], images=images),
+        parent=_main_window())
+    worker.done.connect(lambda data: (dlg.close(),
+                                      _save_and_import_3d(data, fmt, prompt or "image-to-3d")))
+    worker.failed.connect(lambda tb: (dlg.close(), _error(tb)))
+    worker.start()
+    open_seed_3d._w = worker                          # keep the QThread referenced
+
+
+# =============================================================================
+# Seed Assistant -- in-Maya automation agent (BytePlus Seed 2.0 + tool calling)
+# -----------------------------------------------------------------------------
+# A chat window where Seed 2.0 can INSPECT and MODIFY the Maya scene through two
+# tools: get_scene_info (read-only, auto-runs) and run_maya_python (executes
+# Python -- the user REVIEWS/EDITS/APPROVES every block, and it runs inside one
+# undo chunk). The tool-calling loop alternates a background API call (_Worker)
+# with main-thread tool execution until the model returns a final answer.
+# Reuses _chat's transport idea via _chat_with_tools; see also [Seed Chat].
+# =============================================================================
+
+def _chat_with_tools(messages, tools, system=None, model=None):
+    """One tool-enabled chat round. Returns the raw assistant message dict (which
+    may carry `tool_calls`). NETWORK ONLY -- call from a _Worker."""
+    model = model or CONFIG.SEED_CHAT_MODEL
+    msgs = ([{"role": "system", "content": system}] if system else []) + messages
+    body = {"model": model, "messages": msgs, "tools": tools, "tool_choice": "auto"}
+    resp = _request("POST", CONFIG.BASE_URL + CONFIG.CHAT_COMPLETIONS, body)
+    _track("llm", resp, model)
+    return resp["choices"][0]["message"]
+
+
+_AGENT_TOOLS = [
+    {"type": "function", "function": {
+        "name": "get_scene_info",
+        "description": "Return a JSON snapshot of the current Maya scene: current "
+                       "selection, object counts by type, frame range, current "
+                       "frame, renderer, up-axis, linear unit and scene file name. "
+                       "Read-only and runs automatically. Call it to understand the "
+                       "scene before acting.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "run_maya_python",
+        "description": "Execute Python code inside Maya (maya.cmds is available as "
+                       "`cmds`, maya.mel as `mel`). Use for ALL scene changes and "
+                       "for any query get_scene_info does not cover. The user "
+                       "reviews, may edit, and approves the code before it runs, "
+                       "and it runs inside a single undo step. print() any values "
+                       "you need returned to you.",
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "Python code to run in Maya."}},
+            "required": ["code"]}}},
+]
+
+_AGENT_SYSTEM = (
+    "You are Seed Assistant, an automation agent embedded in Autodesk Maya (this "
+    "is Maya 2027), powered by BytePlus Seed 2.0. You help the artist inspect and "
+    "modify their Maya scene through two tools:\n"
+    "- get_scene_info(): read-only JSON snapshot (selection, counts, frame range, "
+    "renderer, units). Runs automatically. Call it to understand scene state first.\n"
+    "- run_maya_python(code): executes Python in Maya (maya.cmds as `cmds`, maya.mel "
+    "as `mel`). The USER reviews/edits/approves every block before it runs, inside a "
+    "single undo step.\n\n"
+    "Guidelines:\n"
+    "- Inspect first (get_scene_info) when the task depends on scene state.\n"
+    "- Write minimal, focused, correct maya.cmds code; prefer cmds over mel. print() "
+    "any value you need to read back (the printed output is returned to you).\n"
+    "- Do ONE coherent step per run_maya_python call so the user can review it; "
+    "you'll see the result and can continue.\n"
+    "- Never assume node names -- query them; handle empty selections gracefully.\n"
+    "- If the user SKIPS a code block, don't silently retry it; ask what they'd "
+    "prefer.\n"
+    "- Clearly state anything destructive (deleting nodes, file operations) BEFORE "
+    "proposing the code.\n"
+    "- Briefly say what you're about to do before proposing code, and give a short "
+    "summary when done. Reply in the user's language (they may write Spanish).")
+
+
+def _tool_scene_info():
+    """MAIN THREAD: a compact, read-only snapshot of the scene as a JSON string."""
+    info = {}
+    try:
+        sel = cmds.ls(selection=True) or []
+        info["selection"] = sel[:50]
+        info["selected_count"] = len(sel)
+        info["current_frame"] = cmds.currentTime(q=True)
+        try:
+            info["frame_range"] = [cmds.playbackOptions(q=True, min=True),
+                                   cmds.playbackOptions(q=True, max=True)]
+        except Exception:
+            pass
+        info["scene"] = cmds.file(q=True, sceneName=True) or "(unsaved)"
+        try:
+            info["up_axis"] = cmds.upAxis(q=True, axis=True)
+        except Exception:
+            pass
+        try:
+            info["linear_unit"] = cmds.currentUnit(q=True, linear=True)
+        except Exception:
+            pass
+        try:
+            info["renderer"] = cmds.getAttr("defaultRenderGlobals.currentRenderer")
+        except Exception:
+            pass
+        counts = {}
+        for label, kw in (("mesh", {"type": "mesh"}), ("camera", {"type": "camera"}),
+                          ("joint", {"type": "joint"}),
+                          ("nurbsCurve", {"type": "nurbsCurve"}),
+                          ("light", {"lights": True})):
+            try:
+                counts[label] = len(cmds.ls(**kw) or [])
+            except Exception:
+                pass
+        info["counts"] = counts
+        info["total_transforms"] = len(cmds.ls(type="transform") or [])
+    except Exception as e:
+        info["error"] = str(e)
+    return json.dumps(info)
+
+
+class _CodeApprovalDialog(QtWidgets.QDialog):
+    """Shows the Python the assistant wants to run. The user can edit it, then Run
+    or Skip, and optionally trust the rest of the session (auto-run)."""
+
+    def __init__(self, code, parent=None):
+        super().__init__(parent or _main_window())
+        self.setWindowTitle("BYTEPLUS - Seed Assistant wants to run code")
+        self.setMinimumSize(660, 470)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(QtWidgets.QLabel(
+            "<b>The assistant proposes running this Python in Maya.</b><br>"
+            "Review or edit it, then Run or Skip. It runs inside a single undo step "
+            "(Ctrl+Z reverts it)."))
+        self.edit = QtWidgets.QPlainTextEdit()
+        self.edit.setPlainText(code)
+        mono = QtGui.QFont("Consolas"); mono.setStyleHint(QtGui.QFont.Monospace)
+        self.edit.setFont(mono)
+        v.addWidget(self.edit, 1)
+        self.trust = QtWidgets.QCheckBox(
+            "Don't ask again this session -- auto-run the assistant's code")
+        v.addWidget(self.trust)
+        bb = QtWidgets.QDialogButtonBox()
+        bb.addButton("Run", QtWidgets.QDialogButtonBox.AcceptRole)
+        bb.addButton("Skip", QtWidgets.QDialogButtonBox.RejectRole)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def result_code(self):
+        return self.edit.toPlainText()
+
+    def trust_session(self):
+        return self.trust.isChecked()
+
+
+class SeedAssistantDialog(QtWidgets.QDialog):
+    """In-Maya automation agent: multi-turn chat with Seed 2.0 that can inspect and
+    (with per-block approval) modify the scene via tool calls. Singleton."""
+
+    _MAX_ROUNDS = 8                       # tool-call rounds per user turn (runaway guard)
+
+    def __init__(self, parent=None):
+        super().__init__(parent or _main_window())
+        self.setWindowTitle("BYTEPLUS - Seed Assistant")
+        self.setMinimumSize(600, 700)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self._history = []
+        self._busy = False
+        self._trust_session = False
+        self._workers = []
+
+        v = QtWidgets.QVBoxLayout(self)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(QtWidgets.QLabel(
+            "<b>Seed Assistant</b> — automates Maya. It runs code only after you approve it."))
+        top.addStretch(1)
+        b_clear = QtWidgets.QPushButton("Clear")
+        b_clear.clicked.connect(self._clear_chat)
+        top.addWidget(b_clear)
+        v.addLayout(top)
+
+        self.view = QtWidgets.QTextBrowser()
+        self.view.setStyleSheet("QTextBrowser{background:#1d1d1d;color:#dddddd;}")
+        v.addWidget(self.view, 1)
+        self._say("assistant",
+                  "Hi \U0001F44B I can inspect and modify your Maya scene. Tell me "
+                  "what to do (e.g. \"select all lights\", \"rename selected to "
+                  "prop_### \", \"lay out these on a grid\"). I'll propose code and "
+                  "you approve it before it runs.")
+
+        self.input = _ChatInput(self._send)
+        self.input.setFixedHeight(84)
+        v.addWidget(self.input)
+
+        srow = QtWidgets.QHBoxLayout()
+        self.status = QtWidgets.QLabel("")
+        self.status.setStyleSheet("color:#2E8BE6;")
+        srow.addWidget(self.status, 1)
+        self.b_send = QtWidgets.QPushButton("Send")
+        self.b_send.setDefault(True)
+        self.b_send.clicked.connect(lambda: self._send())
+        srow.addWidget(self.b_send)
+        v.addLayout(srow)
+
+    # -- transcript ----------------------------------------------------------
+    @staticmethod
+    def _esc(t):
+        return (t.replace("&", "&amp;").replace("<", "&lt;")
+                 .replace(">", "&gt;").replace("\n", "<br>"))
+
+    def _say(self, role, text):
+        esc = self._esc(text)
+        if role == "code":
+            html = ("<pre style='background:#111;color:#cfe6ff;padding:6px;"
+                    "border-left:3px solid #2E8BE6;white-space:pre-wrap'>{}</pre>"
+                    .format(esc))
+        else:
+            who, col = {"user": ("You", "#8ac6ff"),
+                        "assistant": ("Seed", "#7ee081"),
+                        "tool": ("tool", "#c8a24a")}.get(role, ("Seed", "#7ee081"))
+            html = ("<p style='margin:6px 0'><b style='color:{}'>{}:</b> {}</p>"
+                    .format(col, who, esc))
+        self.view.append(html)
+        sb = self.view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    # -- tools (MAIN THREAD) -------------------------------------------------
+    def _exec_tool(self, name, args):
+        if name == "get_scene_info":
+            return _tool_scene_info()
+        if name == "run_maya_python":
+            return self._run_python(args.get("code", "") if isinstance(args, dict) else "")
+        return "Unknown tool: {}".format(name)
+
+    def _run_python(self, code):
+        if not (code or "").strip():
+            return "No code was provided."
+        if not self._trust_session:
+            d = _CodeApprovalDialog(code, self)
+            if not d.exec():
+                self._say("tool", "⏭ You skipped this code.")
+                return ("The user SKIPPED running this code. Do not retry it; ask "
+                        "them what they'd prefer instead.")
+            code = d.result_code()
+            if d.trust_session():
+                self._trust_session = True
+                self._say("tool", "Auto-run enabled for this session.")
+        self._say("code", code)
+        import io as _io
+        import contextlib as _ctx
+        buf = _io.StringIO()
+        g = {"cmds": cmds, "mel": mel}
+        cmds.undoInfo(openChunk=True)
+        try:
+            with _ctx.redirect_stdout(buf), _ctx.redirect_stderr(buf):
+                exec(code, g)                        # noqa: S102 -- user-approved
+            out = buf.getvalue().strip()
+            res = "Ran OK." + ("\nOutput:\n" + out if out else " (no printed output)")
+        except Exception:
+            res = "ERROR while running the code:\n" + traceback.format_exc()
+            out = buf.getvalue().strip()
+            if out:
+                res += "\nOutput before the error:\n" + out
+        finally:
+            cmds.undoInfo(closeChunk=True)
+        self._say("tool", res[:1800])
+        return res
+
+    # -- agent loop ----------------------------------------------------------
+    def _set_busy(self, busy):
+        self._busy = busy
+        for w in (self.b_send, self.input):
+            w.setEnabled(not busy)
+        self.status.setText("Seed is working…" if busy else "")
+
+    def _send(self):
+        if self._busy:
+            return
+        text = self.input.toPlainText().strip()
+        if not text:
+            return
+        self._say("user", text)
+        self._history.append({"role": "user", "content": text})
+        self.input.clear()
+        self._agent_step(self._MAX_ROUNDS)
+
+    def _agent_step(self, rounds_left):
+        hist = list(self._history)
+        self._set_busy(True)
+        w = _Worker(lambda: _chat_with_tools(hist, _AGENT_TOOLS,
+                                             system=_AGENT_SYSTEM), parent=self)
+        w.done.connect(lambda msg: self._on_agent_msg(msg, rounds_left))
+        w.failed.connect(self._on_fail)
+        self._workers.append(w)
+        w.start()
+
+    def _on_agent_msg(self, msg, rounds_left):
+        content = msg.get("content") if isinstance(msg, dict) else None
+        tool_calls = (msg.get("tool_calls") if isinstance(msg, dict) else None) or []
+        am = {"role": "assistant", "content": content}
+        if tool_calls:
+            am["tool_calls"] = tool_calls
+        self._history.append(am)
+        if content:
+            self._say("assistant", content)
+        if not tool_calls:
+            self._set_busy(False)               # final answer
+            return
+        if rounds_left <= 0:
+            self._say("assistant", "(Stopped: reached the tool-call limit for this "
+                                   "turn. Ask me to continue if needed.)")
+            self._set_busy(False)
+            return
+        for tc in tool_calls:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            name = fn.get("name", "")
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            if name != "run_maya_python":
+                self._say("tool", "→ {}()".format(name))
+            try:
+                result = self._exec_tool(name, args)
+            except Exception:
+                result = "Tool crashed:\n" + traceback.format_exc()
+            self._history.append({"role": "tool", "tool_call_id": tc.get("id"),
+                                  "content": result})
+        self._agent_step(rounds_left - 1)
+
+    def _on_fail(self, tb):
+        self._set_busy(False)
+        _error(tb)
+
+    def _clear_chat(self):
+        if self._busy:
+            return
+        self._history = []
+        self.view.clear()
+        self._say("assistant", "Cleared. What should I do in the scene?")
+
+
+def _seed_assistant_window():
+    """Robust singleton for the Seed Assistant window (rebuilds if destroyed)."""
+    w = getattr(_seed_assistant_window, "_inst", None)
+    if w is not None:
+        try:
+            w.objectName()
+        except Exception:
+            w = None
+    if w is None:
+        w = SeedAssistantDialog()
+        _seed_assistant_window._inst = w
+    return w
+
+
+def open_seed_assistant():
+    """Open the Seed Assistant window (BYTEPLUS menu entry)."""
+    w = _seed_assistant_window()
+    w.show()
+    w.raise_()
+
+
+# =============================================================================
 # Menu construction
 # =============================================================================
 def _safe(fn):
@@ -6574,6 +8074,21 @@ def install():
                   image="playblast.png",
                   annotation="Browse / regenerate / open generated videos",
                   command=_safe(open_video_gallery))
+    cmds.menuItem(divider=True, parent=CONFIG.MENU_NAME)
+    cmds.menuItem(label="Seed Chat", parent=CONFIG.MENU_NAME,
+                  image="commandButton.png",
+                  annotation="Chat with Seed 2.0: prompt help, describe images, "
+                             "ask Model Genius",
+                  command=_safe(open_seed_chat))
+    cmds.menuItem(label="Seed 3D", parent=CONFIG.MENU_NAME,
+                  image="polyCube.png",
+                  annotation="Generate a 3D asset from text or an image and import it",
+                  command=_safe(open_seed_3d))
+    cmds.menuItem(label="Seed Assistant", parent=CONFIG.MENU_NAME,
+                  image="commandButton.png",
+                  annotation="Agent that inspects/automates your Maya scene "
+                             "(runs code only after you approve it)",
+                  command=_safe(open_seed_assistant))
     cmds.menuItem(divider=True, parent=CONFIG.MENU_NAME)
     cmds.menuItem(label="Generate Texture", parent=CONFIG.MENU_NAME,
                   image="out_file.png",
