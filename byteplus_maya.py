@@ -91,11 +91,19 @@ class CONFIG:
 
     # --- Model IDs ------------------------------------------------------------
     SEEDANCE_MODEL = "dreamina-seedance-2-0-260128"      # video
-    SEEDREAM_MODEL = "seedream-5-0-260128"               # image (Seedream 5.0 base) -- general Dream/Refine/Texture
-    # Faces to be animated MUST come from Seedream 5.0 *Lite*: Seedance 2.0 only
-    # trusts face images from 5.0 Lite (Trusted Outputs, video-seedance.md 7). The
-    # face-safe Text-to-Image path uses this so its output is animatable.
-    SEEDREAM_FACE_MODEL = "seedream-5-0-lite-260128"     # image (Seedream 5.0 Lite) -- face-safe T2I, animatable
+    # Seedream 5.0 Pro (dola-seedream-5-0-pro-260628): best quality + precise editing +
+    # animatable faces (Seedance-trusted, probe-verified 2026-07-09). MAX output area
+    # 4,194,304 px (2048x2048), up to 10 refs -> _seedream clamps/caps for Pro
+    # automatically. Lite keeps up to 4K & 14 refs for the large Seed Character sheets.
+    SEEDREAM_PRO_MODEL = "dola-seedream-5-0-pro-260628"
+    SEEDREAM_LITE_MODEL = "seedream-5-0-lite-260128"     # Lite -- up to 4K & 14 refs
+    SEEDREAM_MODEL = "dola-seedream-5-0-pro-260628"      # general default = Pro (Dream/I2I/Layout/Refine/Texture)
+    # Text-to-Image faces are animatable from Pro (probe-verified) or Lite; real human
+    # faces are never allowed. Pro faces = best quality + Seedance-trusted.
+    SEEDREAM_FACE_MODEL = "dola-seedream-5-0-pro-260628" # face-safe T2I (Text to Image) = Pro
+    # Output format for Pro & Lite (both support it). 'jpeg' = smaller/faster (lighter
+    # on memory & download -> avoids timeouts/crashes); 'png' = lossless but heavy.
+    SEEDREAM_OUTPUT_FORMAT = "jpeg"
     LLM_MODEL = "seed-1-6-250915"                        # multimodal (auto-prompt)
     SEED_CHAT_MODEL = "seed-2-0-pro-260328"              # Seed Chat window: agentic multimodal (tool-calling ready)
     # Seed 3D. NOTE: the documented IDs (Hyper3d-Rodin-Gen2 / Hitem3d-2.0) returned
@@ -122,6 +130,11 @@ class CONFIG:
     VIDEO_RESOLUTION = "1080p"
     VIDEO_RATIO = "16:9"
     VIDEO_FPS = 24                                        # Seedance base rate
+    # How many Seedance videos may generate at once. BytePlus caps concurrent video
+    # tasks per account: individual = 3 (non-4k) / 1 (4k); enterprise-verified = 10 / 1.
+    # Extra jobs beyond the account's real limit are rejected by the API, so 3 is the
+    # safe default; raise to 10 only if the account is enterprise-verified.
+    SEEDANCE_MAX_CONCURRENT = 3
     MAX_IMAGE_REFS = 9                                    # Seedance hard cap
 
     # --- Cost estimate (APPROXIMATE; BytePlus billing is the source of truth) --
@@ -129,7 +142,7 @@ class CONFIG:
     # Update these if BytePlus changes prices.
     SHOW_COST = True
     COST_CONFIRM_USD = 1.50                               # confirm if est > this
-    COST_IMAGE_USD = 0.035                                # per Seedream image
+    COST_IMAGE_USD = 0.045                                # per Seedream 5.0 Pro output (Lite/base = 0.035; +$0.003/input ref)
     COST_VIDEO_RATES = {                                  # USD / 1M tokens: (no input video, with video)
         "480p": (7.0, 4.3), "720p": (7.0, 4.3),
         "1080p": (7.7, 4.7), "4k": (4.0, 2.4),
@@ -172,7 +185,7 @@ class CONFIG:
 
     # --- Networking -----------------------------------------------------------
     POLL_SECONDS = 5
-    HTTP_TIMEOUT = 120
+    HTTP_TIMEOUT = 600                                   # 10 min: Seedream 5.0 Pro (standard, high-quality) can be slow on detailed images
     # Maya's bundled Python on macOS often ships without a CA bundle, so HTTPS
     # fails with CERTIFICATE_VERIFY_FAILED. We try `certifi` first; if it's not
     # installed and this is False, verification is skipped as a last resort.
@@ -205,6 +218,22 @@ class CONFIG:
     R2_BUCKET = ""
     R2_PRESIGN_TTL = 3600
 
+    # --- Trusted Asset Library (Seedance 2.0 "digital characters", Advanced Rights) --
+    # AK/SK-signed control-plane API (Volcengine HMAC-SHA256 signature, service "ark").
+    # Upload an AI character ONCE -> a permanent asset://<id> that Seedance trusts
+    # forever (vs the 24h Seedream URL), with consistent identity across videos.
+    # Host/region/version verified from the official BytePlus demo (bp-demo).
+    ASSET_API_HOST = "ark.ap-southeast-1.byteplusapi.com"
+    ASSET_REGION = "ap-southeast-1"
+    ASSET_SERVICE = "ark"
+    ASSET_API_VERSION = "2024-01-01"
+    ASSET_PROJECT = "default"                            # assets live in a Project; inference must match
+    # AK/SK for the Assets API (IAM Access Key). NOT the Bearer API key. Falls back to
+    # TOS_AK/TOS_SK (same BytePlus account credentials) when blank.
+    ASSET_AK = ""
+    ASSET_SK = ""
+    ASSET_STORE_PATH = os.path.join(os.path.expanduser("~"), ".byteplus_maya_assets.json")
+
     # --- Webhook (optional; polling stays the default fallback) ---------------
     # A desktop plugin cannot receive an inbound POST directly. Only set this if
     # you run a public relay/tunnel. When set, it is passed as `callback_url`;
@@ -212,7 +241,7 @@ class CONFIG:
     CALLBACK_URL = ""
 
     # --- App / preview --------------------------------------------------------
-    VERSION = "1.07 (Technology Preview)"
+    VERSION = "1.09 (Technology Preview)"
     BUG_EMAIL = "john.giancarlo@bytedance.com"          # temporary bug reports
 
     # --- Color management (Arnold/OCIO) ---------------------------------------
@@ -271,9 +300,11 @@ _PERSISTED = (
     "REF_WIDTH", "REF_HEIGHT", "USE_TOS", "TOS_BUCKET",
     "TOS_ENDPOINT", "TOS_REGION", "CALLBACK_URL", "REMEMBER_API_KEY",
     "SSL_VERIFY", "BASE_URL", "SEEDREAM_MODEL", "SEEDREAM_FACE_MODEL",
-    "SEEDANCE_MODEL", "LLM_MODEL",
+    "SEEDREAM_PRO_MODEL", "SEEDREAM_LITE_MODEL", "SEEDREAM_OUTPUT_FORMAT",
+    "SEEDANCE_MODEL", "SEEDANCE_MAX_CONCURRENT", "LLM_MODEL",
     "SEED_CHAT_MODEL", "THREE_D_MODEL",
     "MOTION_HOST", "R2_ACCOUNT_ID", "R2_BUCKET", "BUMP_DEPTH",
+    "ASSET_API_HOST", "ASSET_REGION", "ASSET_SERVICE", "ASSET_API_VERSION", "ASSET_PROJECT",
     "SHOW_COST", "COST_CONFIRM_USD", "IMAGE_RATIO",
     "COLOR_MANAGE", "USAGE_VIEW", "INSTALL_ID", "TELEMETRY_PREFIX", "TELEMETRY_BUCKET",
     "TELEMETRY_BACKEND", "POSTHOG_HOST", "POSTHOG_API_KEY", "CUSTOMER_ID",
@@ -297,6 +328,8 @@ def _load_prefs():
             CONFIG.TOS_SK = data.get("TOS_SK", CONFIG.TOS_SK)
             CONFIG.R2_ACCESS_KEY = data.get("R2_ACCESS_KEY", CONFIG.R2_ACCESS_KEY)
             CONFIG.R2_SECRET_KEY = data.get("R2_SECRET_KEY", CONFIG.R2_SECRET_KEY)
+            CONFIG.ASSET_AK = data.get("ASSET_AK", CONFIG.ASSET_AK)
+            CONFIG.ASSET_SK = data.get("ASSET_SK", CONFIG.ASSET_SK)
     except (OSError, ValueError):
         pass
 
@@ -305,7 +338,8 @@ def _save_prefs():
     data = {k: getattr(CONFIG, k) for k in _PERSISTED}
     # Only write secrets when the user explicitly asked to remember them.
     if CONFIG.REMEMBER_API_KEY:
-        for k in ("API_KEY", "TOS_AK", "TOS_SK", "R2_ACCESS_KEY", "R2_SECRET_KEY"):
+        for k in ("API_KEY", "TOS_AK", "TOS_SK", "R2_ACCESS_KEY", "R2_SECRET_KEY",
+                  "ASSET_AK", "ASSET_SK"):
             if getattr(CONFIG, k):
                 data[k] = getattr(CONFIG, k)
     try:
@@ -662,11 +696,12 @@ def _caption_viewport(image_uri: str) -> str:
 
 
 _MOTION_SYSTEM = (
-    "You are a film cinematographer. Given a still image, propose ONE short, "
-    "natural way to animate it into a 4-6 second video clip: a camera move plus "
-    "any subtle subject motion that fits the scene. One concise sentence in "
-    "imperative style (e.g. 'Slow dolly-in as the robot turns its head, leaves "
-    "drifting'). Output ONLY that sentence.")
+    "You are a film cinematographer. Given a still image, propose ONE short, natural "
+    "way to animate it into a 4-6 second clip: state the CAMERA move EXPLICITLY -- "
+    "NAME it and its direction (e.g. 'slow dolly-in', 'track left', 'tilt up', "
+    "'orbit right') -- plus subtle subject motion that fits. One concise imperative "
+    "sentence (e.g. 'Slow dolly-in as the robot turns its head, leaves drifting'). "
+    "Output ONLY that sentence.")
 
 
 def _caption_motion(image_uri: str) -> str:
@@ -688,11 +723,14 @@ def _caption_motion(image_uri: str) -> str:
 
 
 _SCENE_MOTION_SYSTEM = (
-    "You are a cinematographer. The images are SEQUENTIAL frames of a 3D "
-    "animation (in order). Describe, in ONE concise sentence, the subject's "
-    "motion and the camera movement across them (e.g. 'the horse gallops "
-    "forward then rears up; camera tracks alongside, low angle'). Output ONLY "
-    "that sentence.")
+    "You are a cinematographer. The images are SEQUENTIAL frames of a 3D animation "
+    "(in order). In ONE concise sentence, describe (1) the subjects' motion and (2) "
+    "the CAMERA movement EXPLICITLY and prominently -- NAME the move and its "
+    "direction so the render reproduces it (e.g. 'camera tracks left', 'slow "
+    "push-in / dolly-in', 'tilts up', 'orbits right', 'cranes down'). Example: 'the "
+    "horses gallop to the right; camera tracks left alongside them, low angle, "
+    "steady'. If the framing barely changes across the frames, say 'static locked-off "
+    "camera'. Output ONLY that sentence.")
 
 
 def _describe_scene_motion(frame_paths: list) -> str:
@@ -759,6 +797,34 @@ def _enhance_scene(user_text: str) -> str:
         "messages": [
             {"role": "system", "content": _ENHANCE_SCENE_SYSTEM},
             {"role": "user", "content": "Improve this scene description:\n" + user_text},
+        ],
+    }
+    resp = _request("POST", CONFIG.BASE_URL + CONFIG.CHAT_COMPLETIONS, body)
+    _track("llm", resp, CONFIG.LLM_MODEL)
+    return (resp["choices"][0]["message"]["content"] or "").strip()
+
+
+_ENHANCE_LOOK_SYSTEM = (
+    "You improve the WORDING of a LOOK description for an image whose COMPOSITION is "
+    "already locked by a separate layout reference (a Maya viewport). Enrich ONLY the "
+    "visual look: subject appearance and identity, clothing, materials, surfaces, "
+    "colours, style, lighting, mood, and the environment/scene. Preserve the user's "
+    "intent. You MUST NOT add, change or describe the POSE, gesture, body or limb "
+    "positions, the NUMBER or placement of subjects or objects, the camera angle, "
+    "framing, shot type, or spatial arrangement — those are fixed by the layout "
+    "reference and must stay untouched. Be concise (well under 120 words). Output "
+    "ONLY the improved look description — no preamble, no quotes.")
+
+
+def _enhance_look(user_text: str) -> str:
+    """Improve ONLY the LOOK wording (appearance/materials/style/lighting/scene) for
+    Layout->Still, WITHOUT touching pose/positions/count/camera -- those are locked
+    by the viewport layout. TEXT-ONLY. NETWORK-only."""
+    body = {
+        "model": CONFIG.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": _ENHANCE_LOOK_SYSTEM},
+            {"role": "user", "content": "Improve this look description:\n" + user_text},
         ],
     }
     resp = _request("POST", CONFIG.BASE_URL + CONFIG.CHAT_COMPLETIONS, body)
@@ -1262,15 +1328,257 @@ def _motion_host_selftest(kind: str):
 
 
 # =============================================================================
+# Trusted Asset Library (Seedance 2.0 "digital characters") -- AK/SK-signed OpenAPI
+# =============================================================================
+# BytePlus 'ark' control-plane API, signed with the Volcengine HMAC-SHA256 scheme
+# (hand-rolled -- same hmac/hashlib primitives as the R2 SigV4 above; host +
+# algorithm verified from the official BytePlus demo). Upload an AI character image
+# ONCE -> a permanent asset://<id> that Seedance trusts forever (no 24h expiry),
+# with consistent identity across videos. NEEDS Advanced Creation Rights + AK/SK.
+
+def _asset_credentials():
+    """(ak, sk) for the Assets API: Settings ASSET_AK/SK first, then TOS_AK/SK (same
+    BytePlus account keys), then env. NOT the Bearer API key."""
+    ak = ((CONFIG.ASSET_AK or "").strip() or (CONFIG.TOS_AK or "").strip()
+          or os.environ.get(CONFIG.TOS_AK_ENV, "").strip())
+    sk = ((CONFIG.ASSET_SK or "").strip() or (CONFIG.TOS_SK or "").strip()
+          or os.environ.get(CONFIG.TOS_SK_ENV, "").strip())
+    return ak, sk
+
+
+def _asset_api_ready() -> bool:
+    ak, sk = _asset_credentials()
+    return bool(ak and sk)
+
+
+def _ark_norm_query(params: dict) -> str:
+    """Canonical query string (sorted keys, RFC3986 quoting) per the Volc scheme."""
+    from urllib.parse import quote
+    parts = []
+    for key in sorted(params.keys()):
+        v = params[key]
+        seq = v if isinstance(v, (list, tuple)) else [v]
+        for item in seq:
+            parts.append(quote(str(key), safe="-_.~") + "=" + quote(str(item), safe="-_.~"))
+    return "&".join(parts).replace("+", "%20")
+
+
+def _ark_call(action: str, body: dict, method: str = "POST"):
+    """Signed call to the BytePlus 'ark' OpenAPI (Volcengine HMAC-SHA256). Returns
+    the parsed `Result` dict (falls back to the top-level object). Raises
+    RuntimeError on any API/HTTP error. NETWORK ONLY -- call from a _Worker."""
+    ak, sk = _asset_credentials()
+    if not (ak and sk):
+        raise RuntimeError(
+            "The Trusted Asset Library needs an Access Key + Secret Key (AK/SK) from "
+            "your BytePlus console (IAM > Access Keys) -- not the Bearer API key.\n\n"
+            "Add them in BYTEPLUS > Settings > Secrets.")
+    host = (CONFIG.ASSET_API_HOST or "").strip()
+    region, service = CONFIG.ASSET_REGION, CONFIG.ASSET_SERVICE
+    body_str = json.dumps(body or {})
+    x_date = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    short_date = x_date[:8]
+    body_hash = hashlib.sha256(body_str.encode("utf-8")).hexdigest()
+    query = {"Action": action, "Version": CONFIG.ASSET_API_VERSION}
+    signed_headers = "content-type;host;x-content-sha256;x-date"
+    canonical_request = "\n".join([
+        method.upper(), "/", _ark_norm_query(query),
+        "content-type:application/json",
+        "host:" + host,
+        "x-content-sha256:" + body_hash,
+        "x-date:" + x_date,
+        "",
+        signed_headers, body_hash,
+    ])
+    scope = "/".join([short_date, region, service, "request"])
+    string_to_sign = "\n".join([
+        "HMAC-SHA256", x_date, scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()])
+
+    def _h(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_signing = _h(_h(_h(_h(sk.encode("utf-8"), short_date), region), service), "request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"),
+                         hashlib.sha256).hexdigest()
+    headers = {
+        "Host": host,
+        "Content-Type": "application/json",
+        "X-Content-Sha256": body_hash,
+        "X-Date": x_date,
+        "Authorization": "HMAC-SHA256 Credential={}/{}, SignedHeaders={}, "
+                         "Signature={}".format(ak, scope, signed_headers, signature),
+    }
+    url = "https://{}/?{}".format(host, _ark_norm_query(query))
+    req = urllib.request.Request(url, data=body_str.encode("utf-8"),
+                                 headers=headers, method=method.upper())
+    try:
+        with _open(req) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8")
+        except Exception:
+            detail = str(e)
+        raise RuntimeError("Assets API HTTP {}: {}".format(e.code, detail))
+    data = json.loads(raw) if raw else {}
+    meta = data.get("ResponseMetadata") or {}
+    err = meta.get("Error")
+    if err:
+        raise RuntimeError("Assets API error {}: {}".format(
+            err.get("Code", "?"), err.get("Message", "")))
+    result = data.get("Result")
+    return result if result is not None else data
+
+
+# --- Asset (group) operations (thin wrappers over _ark_call) ------------------
+# Param names Id/GroupId/URL/AssetType/ProjectName/Filter verified from the BytePlus
+# doc + demo; Delete* use "Id" (standard for this API family).
+
+def _asset_create_group(name, description="", group_type="AIGC"):
+    res = _ark_call("CreateAssetGroup", {
+        "Name": name, "Description": description, "GroupType": group_type,
+        "ProjectName": CONFIG.ASSET_PROJECT})
+    return res.get("Id") or res.get("GroupId") or ""
+
+
+def _asset_list_groups():
+    res = _ark_call("ListAssetGroups", {
+        "Filter": {"GroupType": "AIGC"}, "PageNumber": 1, "PageSize": 100})
+    return res.get("Items") or []
+
+
+def _asset_create_asset(group_id, url, asset_type="Image", name=""):
+    body = {"GroupId": group_id, "URL": url, "AssetType": asset_type,
+            "ProjectName": CONFIG.ASSET_PROJECT}
+    if name:
+        body["Name"] = name
+    res = _ark_call("CreateAsset", body)
+    return res.get("Id") or res.get("AssetId") or ""
+
+
+def _asset_get(asset_id):
+    return _ark_call("GetAsset", {"Id": asset_id, "ProjectName": CONFIG.ASSET_PROJECT})
+
+
+def _asset_list(group_id):
+    res = _ark_call("ListAssets", {
+        "Filter": {"GroupIds": [group_id], "GroupType": "AIGC",
+                   "Statuses": ["Active", "Processing", "Failed"]},
+        "PageNumber": 1, "PageSize": 200})
+    return res.get("Items") or []
+
+
+def _asset_delete(asset_id):
+    _ark_call("DeleteAsset", {"Id": asset_id, "ProjectName": CONFIG.ASSET_PROJECT})
+
+
+def _asset_delete_group(group_id):
+    _ark_call("DeleteAssetGroup", {"Id": group_id, "ProjectName": CONFIG.ASSET_PROJECT})
+
+
+def _asset_public_url(src):
+    """Return (public_url, cleanup) for CreateAsset. A fresh http(s) URL is used
+    as-is; a local file is uploaded to the configured host (TOS/R2). NETWORK."""
+    if isinstance(src, str) and src.startswith("http"):
+        return src, (lambda: None)
+    if not (isinstance(src, str) and os.path.isfile(src)):
+        raise RuntimeError("image not found: {}".format(src))
+    if not _motion_host_ready():
+        raise RuntimeError(
+            "To upload a LOCAL image the plugin needs a public host (Cloudflare R2 / "
+            "TOS). Set one up in BYTEPLUS > Set up motion hosting..., or add an image "
+            "that still has a fresh Seedream URL (from the gallery).")
+    return _host_video(src)                              # hosts any file bytes
+
+
+def _asset_add_and_wait(group_id, src, name="", poll_timeout=180, poll_interval=3):
+    """NETWORK ONLY. Host `src`, CreateAsset, then poll GetAsset until Active/Failed/
+    timeout. Keeps the hosted URL alive until processing finishes (the server fetches
+    it), then cleans up. Returns {id, status, uri, url, error}."""
+    url, cleanup = _asset_public_url(src)
+    try:
+        asset_id = _asset_create_asset(group_id, url, "Image", name)
+        if not asset_id:
+            raise RuntimeError("CreateAsset returned no asset id")
+        status, final_url, err = "Processing", "", ""
+        deadline = time.time() + poll_timeout
+        while time.time() < deadline:
+            res = _asset_get(asset_id)
+            status = (res.get("Status") or "").strip() or "Processing"
+            final_url = res.get("URL") or final_url
+            err = res.get("Error") or ""
+            if status in ("Active", "Failed"):
+                break
+            time.sleep(poll_interval)
+        return {"id": asset_id, "status": status, "uri": "asset://" + asset_id,
+                "url": final_url, "error": err}
+    finally:
+        try:
+            cleanup()
+        except Exception:
+            pass
+
+
+# --- Local cache (group/asset names + a local thumbnail; the API URL expires 12h) --
+
+def _asset_store_load():
+    try:
+        with open(CONFIG.ASSET_STORE_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    data.setdefault("groups", {})
+    return data
+
+
+def _asset_store_save(data):
+    try:
+        with open(CONFIG.ASSET_STORE_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+def _asset_store_group(group_id, name):
+    data = _asset_store_load()
+    g = data["groups"].setdefault(group_id, {"name": name, "assets": {}})
+    g["name"] = name or g.get("name") or group_id
+    _asset_store_save(data)
+
+
+def _asset_store_asset(group_id, asset_id, name="", thumb="", status="Processing"):
+    data = _asset_store_load()
+    g = data["groups"].setdefault(group_id, {"name": group_id, "assets": {}})
+    a = g.setdefault("assets", {}).setdefault(asset_id, {})
+    a["name"] = name or a.get("name") or ""
+    if thumb:
+        a["thumb"] = thumb
+    a["status"] = status
+    _asset_store_save(data)
+
+
+def _asset_store_forget(group_id, asset_id=None):
+    data = _asset_store_load()
+    if asset_id is None:
+        data["groups"].pop(group_id, None)
+    else:
+        g = data["groups"].get(group_id)
+        if g:
+            g.get("assets", {}).pop(asset_id, None)
+    _asset_store_save(data)
+
+
+# =============================================================================
 # Usage counter + anonymous telemetry
 #   - Usage: in-memory counters persisted to USAGE_PATH, shown in 'Usage...'.
 #   - Telemetry: anonymized events buffered and flushed to R2 in a daemon
 #     thread (never blocks generation). No prompts / scene / keys are sent.
 # =============================================================================
 # Per-project counter fields (a sub-bucket per Maya scene under "projects").
-_PROJECT_FIELDS = ("images", "videos", "textures", "llm",
+_PROJECT_FIELDS = ("images", "videos", "textures", "models", "llm",
                    "tokens_in", "tokens_out", "tokens_total")
-_USAGE = {"images": 0, "videos": 0, "textures": 0, "llm": 0,
+_USAGE = {"images": 0, "videos": 0, "textures": 0, "models": 0, "llm": 0,
           "tokens_in": 0, "tokens_out": 0, "tokens_total": 0,
           "projects": {}}
 _USAGE_LOCK = threading.Lock()
@@ -1335,7 +1643,7 @@ def _usage_tokens(resp):
 
 def _track(kind: str, resp=None, model="", extra=None):
     """Record one event: bump the local counter and enqueue a telemetry event.
-    `kind` in {'images','videos','textures','llm'}. Cheap + non-blocking."""
+    `kind` in {'images','videos','textures','models','llm'}. Cheap + non-blocking."""
     ti, to, tt = _usage_tokens(resp)
     with _USAGE_LOCK:
         if kind in _USAGE:
@@ -1347,8 +1655,8 @@ def _track(kind: str, resp=None, model="", extra=None):
         proj = _ACTIVE_PROJECT or "untitled"
         pb = _USAGE["projects"].setdefault(
             proj, {f: 0 for f in _PROJECT_FIELDS})
-        if kind in pb:
-            pb[kind] += 1
+        if kind in _PROJECT_FIELDS:              # backfills buckets saved before 'models' existed
+            pb[kind] = pb.get(kind, 0) + 1
         pb["tokens_in"] += ti
         pb["tokens_out"] += to
         pb["tokens_total"] += tt
@@ -1416,19 +1724,30 @@ def _msgbox(icon, title, text, buttons=None):
     are always-on-top, so a modal (even one with stay-on-top) can still open behind
     a gallery that was raised more recently -- making Maya look frozen. So for the
     duration of the dialog we DROP always-on-top from every other visible window
-    and restore it afterward. Returns the clicked StandardButton."""
+    and restore it afterward. Returns the clicked StandardButton.
+
+    RE-ENTRANCY (critical): toggling WindowStaysOnTopHint + show() RECREATES a
+    window's native handle. Doing that to a window that is CURRENTLY driving a
+    modal event loop (an open QDialog.exec() such as AnimateDialog, or an outer
+    _msgbox still in exec()) drops its modal grab and WEDGES Maya's UI (the
+    "Animate freeze"): a worker's queued failed()/done() callback can fire _msgbox
+    while such a modal loop is on the stack. So when a modal is already active we
+    SKIP the flag dance entirely (it's only needed at the TOP level to clear the
+    always-on-top galleries) and just parent/raise the box above that modal."""
+    active_modal = QtWidgets.QApplication.activeModalWidget()
     lifted = []
-    for w in QtWidgets.QApplication.topLevelWidgets():
-        try:
-            if (w.isVisible() and w.isWindow()
-                    and bool(w.windowFlags() & QtCore.Qt.WindowStaysOnTopHint)):
-                w.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, False)
-                w.show()                              # re-apply the cleared flag
-                lifted.append(w)
-        except Exception:
-            pass
+    if active_modal is None:                          # top-level only -- safe to lift
+        for w in QtWidgets.QApplication.topLevelWidgets():
+            try:
+                if (w.isVisible() and w.isWindow()
+                        and bool(w.windowFlags() & QtCore.Qt.WindowStaysOnTopHint)):
+                    w.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, False)
+                    w.show()                          # re-apply the cleared flag
+                    lifted.append(w)
+            except Exception:
+                pass
     try:
-        box = QtWidgets.QMessageBox(_main_window())
+        box = QtWidgets.QMessageBox(active_modal or _main_window())
         box.setIcon(icon)
         box.setWindowTitle(title)
         box.setText(text)
@@ -1463,7 +1782,8 @@ def _usage_title(base: str) -> str:
 
 
 _EVENT_NAMES = {"images": "image_generated", "videos": "video_generated",
-                "textures": "texture_generated", "llm": "llm_call"}
+                "textures": "texture_generated", "models": "model_generated",
+                "llm": "llm_call"}
 
 
 def _telemetry_ready() -> bool:
@@ -2432,11 +2752,46 @@ def _extract_video_frames(video_path: str, out_dir: str, n: int = 3) -> list:
     return out
 
 
+_POSTER_VER = "2"                                    # bump to re-generate old posters
+
+
+def _poster_up_to_date(video_path):
+    """True if the poster was made with the CURRENT extraction logic, so the one-time
+    retrofit skips it. Bumping _POSTER_VER re-posterizes existing videos once."""
+    try:
+        with open(video_path[:-4] + ".jpg.vframe") as f:
+            return f.read().strip() == _POSTER_VER
+    except OSError:
+        return False
+
+
+def _is_dark_image(path, thresh=22.0):
+    """True if the image is essentially black (a fade-in intro frame). Cheap: samples
+    a tiny scaled copy. Best-effort -- False on any error so we never reject a frame
+    we can't read."""
+    try:
+        img = QtGui.QImage(path)
+        if img.isNull():
+            return False
+        img = img.scaled(12, 12)
+        n = img.width() * img.height()
+        if not n:
+            return False
+        tot = 0.0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                c = img.pixelColor(x, y)
+                tot += c.red() + c.green() + c.blue()
+        return (tot / (n * 3.0)) < thresh
+    except Exception:
+        return False
+
+
 def _extract_poster_frame(video_path: str, poster_path: str) -> bool:
-    """Extract one representative frame (the video midpoint) from `video_path` into
-    `poster_path` (JPG), so a Video Gallery thumbnail shows the actual result, not
-    the source image. Writes a '<poster>.vframe' marker on success so the one-time
-    retrofit doesn't redo it. Returns True on success. Best-effort -- never raises."""
+    """Extract the FIRST non-black frame from `video_path` into `poster_path` (JPG),
+    so the Video Gallery thumbnail is predictable (~the start) yet never a black
+    fade-in intro. Tries the first frame, steps forward if it's black, and falls back
+    to the midpoint. Writes a '<poster>.vframe' marker on success. Never raises."""
     ff = _ffmpeg_exe()
     if not ff:
         return False
@@ -2445,17 +2800,28 @@ def _extract_poster_frame(video_path: str, poster_path: str) -> bool:
     if sys.platform.startswith("win"):
         kw["creationflags"] = 0x08000000
     dur = _video_duration(video_path)
-    t = (dur * 0.5) if (dur and dur > 0) else 0.0    # midpoint avoids a black intro
-    cmd = [ff, "-y", "-ss", "{:.3f}".format(t), "-i", video_path,
-           "-frames:v", "1", "-q:v", "3", poster_path]
-    try:
-        subprocess.run(cmd, check=True, **kw)
-    except Exception:
-        return False
-    if os.path.exists(poster_path) and os.path.getsize(poster_path) > 0:
+    mid = (dur * 0.5) if (dur and dur > 0) else 0.0
+    times = [0.0, 0.25, 0.6, 1.2]                    # first frame, then step past a fade-in
+    if dur and dur > 0:
+        times = [t for t in times if t < dur]
+    if mid not in times:
+        times.append(mid)                            # midpoint as the last resort
+    ok = False
+    for t in times:
+        cmd = [ff, "-y", "-ss", "{:.3f}".format(t), "-i", video_path,
+               "-frames:v", "1", "-q:v", "3", poster_path]
+        try:
+            subprocess.run(cmd, check=True, **kw)
+        except Exception:
+            continue
+        if os.path.exists(poster_path) and os.path.getsize(poster_path) > 0:
+            ok = True
+            if not _is_dark_image(poster_path):
+                break                                # first non-black frame -> use it
+    if ok:
         try:
             with open(poster_path + ".vframe", "w") as f:
-                f.write("1")
+                f.write(_POSTER_VER)
         except OSError:
             pass
         return True
@@ -3042,6 +3408,67 @@ def _to_pixmap(src):
     return pix
 
 
+class _ZoomView(QtWidgets.QGraphicsView):
+    """Image preview with mouse-wheel zoom (centred under the cursor) + drag-to-pan.
+    Double-click resets to fit. Drop-in for the old QLabel preview: `set_pixmap()` /
+    `clear()`. Keeps the whole image at full resolution so zooming reveals detail."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QtWidgets.QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._item = QtWidgets.QGraphicsPixmapItem()
+        self._item.setTransformationMode(QtCore.Qt.SmoothTransformation)
+        self._scene.addItem(self._item)
+        self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)          # drag = pan
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setRenderHints(QtGui.QPainter.SmoothPixmapTransform | QtGui.QPainter.Antialiasing)
+        self.setStyleSheet("background:#1d1d1d; border:0;")
+        self.setMinimumHeight(380)
+        self.setToolTip("Scroll to zoom · drag to pan · double-click to fit")
+        self._zoom = 0
+        self._has = False
+
+    def set_pixmap(self, pix):
+        self._item.setPixmap(pix or QtGui.QPixmap())
+        self._has = bool(pix) and not pix.isNull()
+        self._scene.setSceneRect(QtCore.QRectF(self._item.boundingRect()))
+        self._fit()
+
+    def clear(self):
+        self._item.setPixmap(QtGui.QPixmap())
+        self._has = False
+
+    def _fit(self):
+        if self._has:
+            self.resetTransform()
+            self.fitInView(self._item, QtCore.Qt.KeepAspectRatio)
+            self._zoom = 0
+
+    def wheelEvent(self, e):
+        if not self._has:
+            return
+        up = e.angleDelta().y() > 0
+        if not up and self._zoom <= 0:          # never zoom out past 'fit'
+            self._fit()
+            return
+        if up and self._zoom >= 25:             # cap zoom-in
+            return
+        self._zoom += 1 if up else -1
+        self.scale(1.25 if up else 1 / 1.25, 1.25 if up else 1 / 1.25)
+
+    def mouseDoubleClickEvent(self, e):
+        self._fit()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._zoom == 0:                     # keep it fitted until the user zooms
+            self._fit()
+
+
 def _evt_x(e):
     """Mouse-event X, tolerant of Qt5 (e.x()) vs Qt6 (e.position().x())."""
     try:
@@ -3301,6 +3728,7 @@ class VideoGallery(QtWidgets.QDialog):
         self.strip.setMovement(QtWidgets.QListView.Static)
         self.strip.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.strip.itemClicked.connect(self._on_select)
+        self.strip.currentItemChanged.connect(self._on_current)   # keyboard-arrow nav
         self.strip.itemDoubleClicked.connect(lambda _i: self._open())
         v.addWidget(self.strip)
 
@@ -3315,18 +3743,13 @@ class VideoGallery(QtWidgets.QDialog):
         b_refine.clicked.connect(self._regen)
         b_save = QtWidgets.QPushButton("\U0001F4BE Save As...")
         b_save.clicked.connect(self._save)
-        b_cmp = QtWidgets.QPushButton("⇄ Compare")
-        b_cmp.setToolTip("Select two clips (Ctrl/Shift-click) then Compare — or "
-                         "compare the current one against another. Drag slider "
-                         "(A/B wipe).")
-        b_cmp.clicked.connect(self._compare)
         b_del = QtWidgets.QPushButton("\U0001F5D1 Delete")
         b_del.clicked.connect(self._delete)
         b_clear = QtWidgets.QPushButton("Clear all")
         b_clear.clicked.connect(self._clear_all)
         b_close = QtWidgets.QPushButton("Close")
         b_close.clicked.connect(self.accept)
-        for b in (b_open, b_refine, b_save, b_cmp, b_del, b_clear):
+        for b in (b_open, b_refine, b_save, b_del, b_clear):
             row.addWidget(b)
         row.addStretch(1)
         row.addWidget(b_close)
@@ -3338,7 +3761,9 @@ class VideoGallery(QtWidgets.QDialog):
         import glob
         existing = {it["video"] for it in self._items}
         hidden = _load_hidden()
-        for vid in sorted(glob.glob(os.path.join(self._mov_dir, "*video*.mp4"))):
+        # oldest -> newest so the most recent lands on the RIGHT of the strip.
+        for vid in sorted(glob.glob(os.path.join(self._mov_dir, "*video*.mp4")),
+                          key=os.path.getmtime):
             if vid in existing or vid in hidden:
                 continue                       # cleared earlier without disk delete
             poster = vid[:-4] + ".jpg"
@@ -3355,7 +3780,7 @@ class VideoGallery(QtWidgets.QDialog):
         '<poster>.jpg.vframe' marker; safe no-op when ffmpeg is missing."""
         specs = [it["video"] for it in self._items
                  if it.get("video") and os.path.exists(it["video"])
-                 and not os.path.exists(it["video"][:-4] + ".jpg.vframe")]
+                 and not _poster_up_to_date(it["video"])]
         if not specs:
             return
 
@@ -3399,6 +3824,25 @@ class VideoGallery(QtWidgets.QDialog):
             self._show(item)
 
     def add_video(self, video, poster, regen, prompt=None):
+        # The .mp4 is written to disk BEFORE this gallery is (re)created, so a fresh
+        # gallery's _load_existing() may already have picked it up -> adding again
+        # would show a SECOND thumbnail. Dedup by path: if it's already here, refresh
+        # the loaded item with the in-memory regen/poster/prompt and just select it.
+        key = os.path.normcase(os.path.normpath(video))
+        for i in range(self.strip.count()):
+            lw = self.strip.item(i)
+            it = lw.data(QtCore.Qt.UserRole) if lw else None
+            if it and os.path.normcase(os.path.normpath(it.get("video", ""))) == key:
+                it["regen"] = regen or it.get("regen")     # restore Edit/Regenerate
+                if poster:
+                    it["poster"] = poster
+                    if os.path.exists(poster):
+                        lw.setIcon(QtGui.QIcon(poster))
+                if prompt:
+                    it["prompt"] = prompt
+                self.strip.setCurrentItem(lw)
+                self._show(it)
+                return
         self._add(video, poster, regen, select=True, prompt=prompt)
 
     def _selected_items(self):
@@ -3461,6 +3905,10 @@ class VideoGallery(QtWidgets.QDialog):
 
     def _on_select(self, lw):
         self._show(lw.data(QtCore.Qt.UserRole))
+
+    def _on_current(self, cur, _prev):
+        if cur is not None:                          # arrow keys move current -> preview
+            self._show(cur.data(QtCore.Qt.UserRole))
 
     def _open(self):
         if self._current:
@@ -3552,33 +4000,37 @@ class VideoGallery(QtWidgets.QDialog):
         self._worker.start()
 
     def _delete(self):
-        lw = self.strip.currentItem()
-        if not lw:
+        # Delete every SELECTED clip (multi-select), or the current one.
+        lws = [lw for lw in (self.strip.selectedItems()
+                             or [self.strip.currentItem()]) if lw is not None]
+        if not lws:
             return
-        item = lw.data(QtCore.Qt.UserRole)
+        items = [lw.data(QtCore.Qt.UserRole) for lw in lws]
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("BYTEPLUS - Delete video")
         box.setIcon(QtWidgets.QMessageBox.Question)
         box.setText("Remove '{}' from the gallery?".format(
-            os.path.basename(item["video"])))
+            os.path.basename(items[0]["video"])) if len(items) == 1
+            else "Remove {} videos from the gallery?".format(len(items)))
         cb = QtWidgets.QCheckBox("Also delete the file(s) from disk")
         cb.setChecked(True)
         box.setCheckBox(cb)
         box.setStandardButtons(QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel)
         if box.exec() != QtWidgets.QMessageBox.Ok:
             return
-        if cb.isChecked():
-            for p in (item["video"], item.get("poster"), item["video"] + ".txt"):
-                if p:
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
-        else:
-            _hide_paths([item["video"]])         # keep it off the gallery on reopen
-        if item in self._items:
-            self._items.remove(item)
-        self.strip.takeItem(self.strip.row(lw))
+        for lw, item in zip(lws, items):
+            if cb.isChecked():
+                for p in (item["video"], item.get("poster"), item["video"] + ".txt"):
+                    if p:
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+            else:
+                _hide_paths([item["video"]])         # keep it off the gallery on reopen
+            if item in self._items:
+                self._items.remove(item)
+            self.strip.takeItem(self.strip.row(lw))
         nxt = self.strip.currentItem()
         if nxt:
             self._show(nxt.data(QtCore.Qt.UserRole))
@@ -3653,8 +4105,9 @@ def _img_ref_uri(src: str) -> str:
     """Resolve an image reference source to a URL/URI for Seedance.
     - An http(s) URL is passed THROUGH UNCHANGED -- critical for Seedream face
       images, whose biometric 'Trusted Outputs' chain breaks if re-uploaded.
-    - A local file path is uploaded to TOS (or base64'd) via _asset_uri."""
-    if isinstance(src, str) and src.startswith("http"):
+    - A local file path is uploaded to TOS (or base64'd) via _asset_uri.
+    - An asset://<id> (trusted-library digital character) is passed THROUGH."""
+    if isinstance(src, str) and (src.startswith("http") or src.startswith("asset://")):
         return src
     return _asset_uri(src, _image_mime(src))
 
@@ -4140,6 +4593,59 @@ def _pick_gallery_video(items, parent):
     return cur.data(QtCore.Qt.UserRole) if cur else None
 
 
+def _pick_trusted_asset(parent):
+    """Modal picker over the locally-known trusted assets (from the store, no
+    network). Returns (asset_uri, thumb_path) or (None, None)."""
+    groups = _asset_store_load()["groups"]
+    entries = []
+    for gid, g in groups.items():
+        gname = g.get("name", gid)
+        for aid, a in g.get("assets", {}).items():
+            entries.append((gname, aid, a.get("name", ""), a.get("thumb", ""),
+                            a.get("status", "")))
+    if not entries:
+        _error("No trusted characters yet.\n\nCreate them in  BYTEPLUS > Trusted "
+               "Characters  — upload an AI character and it becomes a permanent "
+               "asset:// you can animate forever.")
+        return None, None
+    dlg = QtWidgets.QDialog(parent)
+    dlg.setWindowTitle("Pick a trusted character")
+    dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+    dlg.setMinimumSize(620, 420)
+    lay = QtWidgets.QVBoxLayout(dlg)
+    lay.addWidget(QtWidgets.QLabel(
+        "Double-click a trusted image (✅ = ready). It becomes the main image "
+        "(Image 1) — permanent, no 24h expiry."))
+    lw = QtWidgets.QListWidget()
+    lw.setViewMode(QtWidgets.QListView.IconMode)
+    lw.setIconSize(QtCore.QSize(140, 140))
+    lw.setResizeMode(QtWidgets.QListView.Adjust)
+    lw.setMovement(QtWidgets.QListView.Static)
+    lw.setSpacing(8)
+    badge = {"Active": "✅", "Processing": "⏳", "Failed": "❌"}
+    for gname, aid, aname, thumb, status in entries:
+        icon = QtGui.QIcon(_to_pixmap(thumb)) if thumb else QtGui.QIcon()
+        it = QtWidgets.QListWidgetItem(icon, "{} {} · {}".format(
+            badge.get(status, "•"), gname, aname or aid[-6:]))
+        it.setData(QtCore.Qt.UserRole, (aid, thumb))
+        lw.addItem(it)
+    lay.addWidget(lw, 1)
+    chosen = {}
+
+    def _accept(it):
+        aid, thumb = it.data(QtCore.Qt.UserRole)
+        chosen["uri"] = "asset://" + aid
+        chosen["thumb"] = thumb
+        dlg.accept()
+
+    lw.itemDoubleClicked.connect(_accept)
+    bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel)
+    bb.rejected.connect(dlg.reject)
+    lay.addWidget(bb)
+    dlg.exec()
+    return chosen.get("uri"), chosen.get("thumb")
+
+
 class AnimateDialog(QtWidgets.QDialog):
     """Mini-dialog for Animate: auto-analyzes the image for a motion prompt and
     offers to drive the motion from the scene's animation (playblast)."""
@@ -4158,6 +4664,7 @@ class AnimateDialog(QtWidgets.QDialog):
         self._vid_refs = []
         self._img_n = 0
         self._vid_n = 0
+        self._trusted_uri = None                     # chosen trusted character (asset://)
         v = QtWidgets.QVBoxLayout(self)
         self.lbl = QtWidgets.QLabel()
         v.addWidget(self.lbl)
@@ -4200,6 +4707,12 @@ class AnimateDialog(QtWidgets.QDialog):
                                   "tagged images (cleaner binding for Seedance).")
         self.b_compose.clicked.connect(self._compose)
         rr.addWidget(self.b_compose)
+        self.b_trusted = QtWidgets.QPushButton("🎭 Trusted character")
+        self.b_trusted.setToolTip("Use a PERMANENT trusted character (asset://) from "
+                                  "your Trusted Characters library as the main image — "
+                                  "no 24h expiry, animates without face rejection.")
+        self.b_trusted.clicked.connect(self._pick_trusted)
+        rr.addWidget(self.b_trusted)
         rr.addStretch(1)
         v.addLayout(rr)
         self.ref_list = QtWidgets.QListWidget()
@@ -4386,6 +4899,21 @@ class AnimateDialog(QtWidgets.QDialog):
     def wants_audio(self):
         return self.cb_audio.isChecked()
 
+    def trusted_uri(self):
+        """The chosen trusted-character asset:// URI (permanent Image 1), or None."""
+        return self._trusted_uri
+
+    def _pick_trusted(self):
+        uri, thumb = _pick_trusted_asset(self)
+        if not uri:
+            return
+        self._trusted_uri = uri
+        self.b_trusted.setText("🎭 Trusted ✓")
+        self.lbl.setText("Main image = TRUSTED character  ({})  — permanent, "
+                         "animates without face rejection.".format(uri))
+        cmds.inViewMessage(amg="Using <hl>trusted character</hl> as the main image.",
+                           pos="midCenter", fade=True)
+
     def image_refs(self):
         return list(self._img_refs)
 
@@ -4475,6 +5003,47 @@ class AnimateDialog(QtWidgets.QDialog):
         self._cmp_worker.start()
 
 
+# --- Seedance concurrency pool -----------------------------------------------
+# BytePlus limits concurrent Seedance video tasks (individual: 3 non-4k / 1 for 4k;
+# enterprise-verified: 10 / 1). We track in-flight video workers so a submit that
+# would exceed the cap is refused with a friendly message instead of (a) piling up
+# overlapping jobs and (b) enabling the freeze where a failed job's error dialog
+# re-enters _msgbox over another still-open modal. The list also keeps each worker
+# referenced (each also has parent=_main_window()).
+_VIDEO_JOBS = []
+
+
+def _video_cap():
+    """The concurrency cap, clamped to BytePlus's published ceiling [1, 10]."""
+    try:
+        return max(1, min(10, int(getattr(CONFIG, "SEEDANCE_MAX_CONCURRENT", 3) or 3)))
+    except Exception:
+        return 3
+
+
+def _video_jobs_active():
+    """Prune finished workers; return how many Seedance videos are still running."""
+    global _VIDEO_JOBS
+    alive = []
+    for w in _VIDEO_JOBS:
+        try:
+            if w is not None and w.isRunning():
+                alive.append(w)
+        except Exception:
+            pass
+    _VIDEO_JOBS = alive
+    return len(alive)
+
+
+def _register_video_job(worker):
+    _VIDEO_JOBS.append(worker)
+
+
+def _discard_video_job(worker):
+    global _VIDEO_JOBS
+    _VIDEO_JOBS = [w for w in _VIDEO_JOBS if w is not worker]
+
+
 def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
                           video_items=None):
     """Dream -> Animate: feed a Seedream image (+ the scene's animation) to
@@ -4487,11 +5056,32 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
     the Video Gallery thumbnail."""
     if not _scene_ok_to_proceed():
         return
+    # Concurrency cap: don't let a new submit exceed the account's Seedance limit.
+    # This also prevents overlapping jobs piling up (the state the crash was reported
+    # in). Up to _video_cap() may run at once (default 3); a 4th waits.
+    active = _video_jobs_active()
+    cap = _video_cap()
+    if active >= cap:
+        _msgbox(QtWidgets.QMessageBox.Information, "BYTEPLUS - Seedance is busy",
+                "You already have {a} Seedance video job{s} generating -- that's the "
+                "maximum ({c}) at once.\n\nWait for one to finish (watch the Video "
+                "Gallery title), then Animate again.\n\nYou can change this limit in "
+                "BYTEPLUS > Settings > Generation (up to 10). NOTE: only "
+                "enterprise-verified BytePlus accounts allow more than 3 concurrent "
+                "Seedance jobs -- on an individual account a 4th is rejected by the "
+                "API, so keep it at 3.".format(
+                    a=active, s="" if active == 1 else "s", c=cap))
+        return
     has_anim = _has_animation()
     d = AnimateDialog(image_src, has_anim, dream_items=dream_items,
                       video_items=video_items)
     if not d.exec():
         return
+    # A chosen trusted character (asset://) REPLACES the main image -> permanent,
+    # Seedance-trusted (no 24h expiry, no face rejection).
+    trusted_uri = d.trusted_uri()
+    if trusted_uri:
+        image_src = trusted_uri
     use_anim = d.wants_anim()
     audio = d.wants_audio()
     img_refs = d.image_refs()
@@ -4515,20 +5105,27 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
     extra_imgs = extra_imgs[:8]
     image_sources = [image_src] + extra_imgs
     # The main image is a fresh trusted Seedream URL when it's an http link (see
-    # _on_animate). Lets _seedance_generate retry a flaky face-exemption rejection.
-    trusted_input = isinstance(image_src, str) and image_src.startswith("http")
+    # _on_animate), or a permanent asset:// digital character. Lets _seedance_generate
+    # retry a flaky face-exemption rejection.
+    trusted_input = isinstance(image_src, str) and (
+        image_src.startswith("http") or image_src.startswith("asset://"))
     # REFERENCE-MEDIA mode: image = look, video = motion. Seedance's multimodal API
     # refers to each attachment by a NUMBERED label matching the content order
     # (Image 1 = the main image, Image 2.. = extras; Video 1 = the playblast, or the
     # first gallery clip when there's no playblast). See the Seedance r2v docs.
     if extra_imgs:
-        look_tag = ("The main subject is Image 1 — keep its exact appearance, "
-                    "materials, colours and identity. Use the other reference "
-                    "images (Image 2, Image 3, …) as described in the text. ")
+        look_tag = ("Treat every subject in Image 1 as fixed characters "
+                    "(Subject_1, Subject_2, …) — keep their exact appearance, "
+                    "materials, colours and identity throughout, no mutation. Use "
+                    "the other reference images (Image 2, Image 3, …) as described "
+                    "in the text. ")
     else:
-        look_tag = ("Animate the subject from Image 1, keeping its exact "
-                    "appearance, materials, colours and style from Image 1; do "
-                    "not restyle or change its look. ")
+        look_tag = ("Treat the subject(s) in Image 1 as fixed characters "
+                    "(Subject_1, Subject_2, …) — keep their exact appearance, "
+                    "materials, colours and identity from Image 1 throughout; do "
+                    "not restyle, mutate or change them. ")
+    if use_anim:                                  # playblast intended -> reinforce it
+        look_tag = "Camera and pacing follow the reference video exactly. " + look_tag
     prompt = look_tag + (("Action: " + motion) if motion else "")
 
     # Playblast ON -> clip length follows the scene animation; OFF -> the user's
@@ -4708,9 +5305,9 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
                 "output from this same account (the moderation-exemption / "
                 "Trusted-Outputs path). Real human faces are never allowed.\n\n"
                 "What works:\n"
-                "  • Generate the face with  BYTEPLUS > Dream  and tick "
-                "'Text-to-Image' (exempt for everyone), then Animate it — the "
-                "plugin passes the trusted link automatically.\n"
+                "  • Generate the face with  BYTEPLUS > Text to Image  (exempt for "
+                "everyone), then Animate it — the plugin passes the trusted link "
+                "automatically.\n"
                 "  • Viewport-guided (image-to-image) faces work too once your "
                 "account has KYC HIGH.\n"
                 "  • The trusted link expires in ~24h — if this image is older, "
@@ -4721,8 +5318,9 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
             _error(tb)
 
     # poster for the Video Gallery: explicit poster, else a local source image
-    poster = poster_path or (image_src if not str(image_src).startswith("http")
-                             else None)
+    poster = poster_path or (image_src if (isinstance(image_src, str)
+                             and not image_src.startswith("http")
+                             and not image_src.startswith("asset://")) else None)
 
     def make_video(p):                               # re-runnable with a new prompt
         # Resolve @tags now that the video numbering is known (playblast = Video 1,
@@ -4761,11 +5359,11 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
                                   fit_motion=True, trusted_input=trusted_input)
 
     worker = _Worker(lambda: make_video(prompt), parent=_main_window())
-    worker.done.connect(lambda vb: (dlg.close(),
+    worker.done.connect(lambda vb: (_discard_video_job(worker), dlg.close(),
                         _add_video_result(vb, poster, make_video, prompt=prompt)))
-    worker.failed.connect(failed)
+    worker.failed.connect(lambda tb: (_discard_video_job(worker), failed(tb)))
+    _register_video_job(worker)                       # count against the concurrency cap
     worker.start()
-    animate_with_seedance._w = worker  # keep ref alive
 
 
 # =============================================================================
@@ -4885,6 +5483,34 @@ def _image_size():
     return CONFIG.IMAGE_DIMS.get(CONFIG.IMAGE_RATIO, "2K")
 
 
+def _is_pro(model) -> bool:
+    """True for Seedream 5.0 Pro (tighter limits: <=4.19M px, <=10 refs, png)."""
+    return bool(model) and "pro" in str(model).lower()
+
+
+def _pro_size(size: str) -> str:
+    """Keep a Seedream Pro request within its 4,194,304 px (2048x2048) cap WHILE
+    PRESERVING the requested aspect ratio: an oversized explicit WxH is scaled down
+    to the same ratio (dims rounded to multiples of 16, Pro's requirement) instead of
+    falling back to the descriptive '2K' (which lets the model pick the aspect and
+    caused variations to drift off 16:9). 3K/4K levels -> '2K'. Lite/base unaffected."""
+    s = str(size)
+    if "x" in s.lower():
+        try:
+            w, h = (int(x) for x in s.lower().split("x"))
+        except Exception:
+            return "2K"
+        if w <= 0 or h <= 0:
+            return "2K"
+        if w * h <= 4194304:
+            return size
+        scale = (4194304.0 / (w * h)) ** 0.5      # shrink to fit the cap, same ratio
+        nw = max(16, (int(w * scale) // 16) * 16)
+        nh = max(16, (int(h * scale) // 16) * 16)
+        return "{}x{}".format(nw, nh)
+    return "2K" if s.upper() in ("3K", "4K") else s
+
+
 def _seedream(prompt: str, ref_uris: list[str] | None = None, size: str = "2K",
               return_url: bool = False, model: str | None = None):
     """One synchronous Seedream image generation. `ref_uris` are reference-image
@@ -4894,6 +5520,14 @@ def _seedream(prompt: str, ref_uris: list[str] | None = None, size: str = "2K",
     where `url` is the original Seedream platform URL -- needed to keep the
     biometric trust chain intact when feeding the image to Seedance."""
     m = model or CONFIG.SEEDREAM_MODEL
+    # Seedream 5.0 Pro caps: output area <=4.19M px and <=10 reference images. Clamp/
+    # cap centrally so EVERY caller is safe on Pro; Lite/base keep their larger sizes.
+    if _is_pro(m):
+        size = _pro_size(size)
+        if ref_uris and len(ref_uris) > 10:
+            sys.stderr.write("[BYTEPLUS] Seedream Pro accepts <=10 refs; using the "
+                             "first 10 of {}.\n".format(len(ref_uris)))
+            ref_uris = ref_uris[:10]
 
     def _call(fmt):
         def _post(sz):
@@ -4906,6 +5540,8 @@ def _seedream(prompt: str, ref_uris: list[str] | None = None, size: str = "2K",
             }
             if ref_uris:
                 body["image"] = ref_uris
+            if _is_pro(m) or "lite" in str(m).lower():   # Pro & Lite support output_format
+                body["output_format"] = CONFIG.SEEDREAM_OUTPUT_FORMAT
             return _request("POST", CONFIG.BASE_URL + CONFIG.IMAGE_GEN, body)
         try:
             return _post(size)
@@ -4951,11 +5587,19 @@ MODE_AROUND = (   # Mode 1: dream AROUND the reference
     "angle, framing, composition AND the subjects/content present. Keep that "
     "layout, viewpoint and the subjects' poses and placement. Realize it as a "
     "finished, photorealistic image. Scene direction:\n\n")
-MODE_LAYOUT = (   # Mode 2: use the LAYOUT only
-    "Use the attached reference image ONLY for the camera angle, framing and "
-    "spatial layout (where things sit in the frame). Do NOT copy its content, "
-    "materials or look -- freely reinterpret the scene as described below, "
-    "keeping only that composition:\n\n")
+MODE_LAYOUT = (   # Mode 2: use the LAYOUT only (LOOK comes from the prompt text)
+    # Validated by A/B (2026-07-07): this strong 'composition lock' + describing the
+    # look in TEXT makes Seedream follow the viewport layout, instead of copying a
+    # competing look-image. Reproduce number/positions/facing/camera from the image.
+    "Use the attached reference image ONLY for the spatial LAYOUT: reproduce the "
+    "EXACT number of subjects and objects and their positions, relative sizes, "
+    "facing/orientation, AND the exact POSE of every person — body orientation, "
+    "limb positions, gesture and action (e.g. arms raised, crouching, leaning, "
+    "mid-stride) — precisely as shown; keep every object in its shown placement. "
+    "Do NOT add, remove, re-pose or rearrange any subject or object. Match the "
+    "camera angle and framing. Do NOT copy its colours, materials or style. Render "
+    "the entire LOOK from the description below only, keeping the composition and "
+    "every pose locked to the reference:\n\n")
 
 # Two-image variants: when an Extra reference is supplied, image 1 (viewport) and
 # image 2 (extra) get distinct roles so Seedream actually uses the extra image.
@@ -4977,6 +5621,49 @@ MODE_LAYOUT_EXTRA = (   # Mode 2 + extra: extra IS the subject placed into the l
 
 _REPLACE_TEMPLATE = ("Replace the mannequin(s)/placeholder figure(s) with "
                      "<describe what each becomes>. ")
+
+# Per-window model choice. The capability note shows in grey next to the prompt.
+_MODEL_NOTES = {
+    "pro":  ("Seedream 5.0 Pro — top quality + precise editing · animatable AI faces · "
+             "up to 2K & 10 refs · ~$0.045/img."),
+    "lite": ("Seedream 5.0 Lite — up to 4K & 14 refs · animatable AI faces · lighter/"
+             "cheaper (~$0.035/img)."),
+}
+
+
+class _ModelPicker(QtWidgets.QWidget):
+    """Reusable 'Model:' dropdown (Seedream 5.0 Pro / Lite) + a grey capability note.
+    Dropped into any T2I/I2I window; `.model()` returns the chosen model ID. Only the
+    two Seedance-trusted models are offered (base 5.0 stays in Settings for advanced
+    use), so a face stays animatable whatever the user picks."""
+
+    def __init__(self, parent=None, default_id=None):
+        super().__init__(parent)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QtWidgets.QLabel("Model:"))
+        self.combo = QtWidgets.QComboBox()
+        self.combo.addItem("Seedream 5.0 Pro", (CONFIG.SEEDREAM_PRO_MODEL, "pro"))
+        self.combo.addItem("Seedream 5.0 Lite", (CONFIG.SEEDREAM_LITE_MODEL, "lite"))
+        row.addWidget(self.combo, 1)
+        lay.addLayout(row)
+        self.note = QtWidgets.QLabel()
+        self.note.setWordWrap(True)
+        self.note.setStyleSheet("color:#888;")
+        lay.addWidget(self.note)
+        self.combo.currentIndexChanged.connect(self._upd)
+        # Default to Lite only if that's explicitly the configured default; else Pro.
+        if (default_id or CONFIG.SEEDREAM_MODEL) == CONFIG.SEEDREAM_LITE_MODEL:
+            self.combo.setCurrentIndex(1)
+        self._upd()
+
+    def _upd(self, *_):
+        self.note.setText(_MODEL_NOTES.get(self.combo.currentData()[1], ""))
+
+    def model(self):
+        return self.combo.currentData()[0]
 
 
 class DreamDialog(QtWidgets.QDialog):
@@ -5040,9 +5727,12 @@ class DreamDialog(QtWidgets.QDialog):
         parts = [p for p in parts if p]
         return (".  " + ", ".join(parts) + ".") if parts else ""
 
-    def __init__(self, snapshot_path, parent=None, initial_prompt=None):
+    def __init__(self, snapshot_path, parent=None, initial_prompt=None,
+                 text_only_mode=False):
         super().__init__(parent or _main_window())
-        self.setWindowTitle("BYTEPLUS - Dream with Seedream 5.0")
+        self._t2i_mode = text_only_mode
+        self.setWindowTitle("BYTEPLUS - Text to Image" if text_only_mode
+                            else "BYTEPLUS - Dream with Seedream 5.0")
         self.setMinimumSize(580, 640)
         self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._snap = snapshot_path
@@ -5053,12 +5743,14 @@ class DreamDialog(QtWidgets.QDialog):
         # --- reference thumbnails -------------------------------------------
         refs = QtWidgets.QHBoxLayout()
         vb = QtWidgets.QVBoxLayout()
-        vb.addWidget(QtWidgets.QLabel("Viewport reference"))
+        self._vp_lbl = QtWidgets.QLabel("Viewport reference")
+        vb.addWidget(self._vp_lbl)
         self.vp_thumb = QtWidgets.QLabel()
         self.vp_thumb.setFixedSize(240, 135)
         self.vp_thumb.setStyleSheet("background:#1d1d1d;")
-        self.vp_thumb.setPixmap(QtGui.QPixmap(snapshot_path).scaled(
-            240, 135, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        if snapshot_path:
+            self.vp_thumb.setPixmap(QtGui.QPixmap(snapshot_path).scaled(
+                240, 135, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
         vb.addWidget(self.vp_thumb)
         refs.addLayout(vb)
 
@@ -5100,14 +5792,20 @@ class DreamDialog(QtWidgets.QDialog):
             "human faces are never allowed — only AI-generated people.")
         self.cb_text_only.toggled.connect(self._on_text_only)
         v.addWidget(self.cb_text_only)
+        self.cb_text_only.hide()             # removed from the UI; mode set by the menu
 
         # --- mode ------------------------------------------------------------
-        v.addWidget(QtWidgets.QLabel("<b>Mode</b>"))
+        self._mode_lbl = QtWidgets.QLabel("<b>Mode</b>")
+        v.addWidget(self._mode_lbl)
         self.mode_around = QtWidgets.QRadioButton(
             "Dream AROUND the reference  (keep subjects + layout, just finish it)")
         self.mode_around.setChecked(True)
         self.mode_layout = QtWidgets.QRadioButton(
-            "Use the LAYOUT only  (same composition, reinterpret the content)")
+            "Use the LAYOUT only  (same composition, describe the look in the prompt)")
+        self.mode_layout.setToolTip(
+            "The viewport gives the LAYOUT (positions, facing, camera); the LOOK "
+            "comes from your Prompt below. For this, DON'T add an Extra reference — a "
+            "second image competes with the layout and usually wins (A/B-verified).")
         v.addWidget(self.mode_around)
         v.addWidget(self.mode_layout)
 
@@ -5115,8 +5813,8 @@ class DreamDialog(QtWidgets.QDialog):
         ph = QtWidgets.QHBoxLayout()
         ph.addWidget(QtWidgets.QLabel("<b>Prompt</b>"))
         ph.addStretch(1)
-        b_tpl = QtWidgets.QPushButton("Insert replace template")
-        b_tpl.clicked.connect(self._insert_template)
+        self._b_tpl = QtWidgets.QPushButton("Insert replace template")
+        self._b_tpl.clicked.connect(self._insert_template)
         self.b_enhance = QtWidgets.QPushButton("✦ Enhance")
         self.b_enhance.setToolTip("Improve the scene/subject wording only — "
                                   "camera & look are set by the Camera dropdowns")
@@ -5124,7 +5822,7 @@ class DreamDialog(QtWidgets.QDialog):
         self.b_auto = QtWidgets.QPushButton("✨ Auto")
         self.b_auto.setToolTip("Write a prompt from scratch by analyzing the viewport")
         self.b_auto.clicked.connect(self._auto)
-        ph.addWidget(b_tpl); ph.addWidget(self.b_enhance); ph.addWidget(self.b_auto)
+        ph.addWidget(self._b_tpl); ph.addWidget(self.b_enhance); ph.addWidget(self.b_auto)
         v.addLayout(ph)
 
         self.prompt = QtWidgets.QPlainTextEdit()
@@ -5135,6 +5833,9 @@ class DreamDialog(QtWidgets.QDialog):
         _add_dictate_button(ph, self.prompt)     # prompt now exists -> safe
         if initial_prompt:                       # e.g. handed over from Seed Chat
             self.prompt.setPlainText(initial_prompt)
+
+        self.mp = _ModelPicker(self)             # per-window model choice + note
+        v.addWidget(self.mp)
 
         # --- camera controls (optional, appended to the prompt) --------------
         cam = QtWidgets.QHBoxLayout()
@@ -5186,6 +5887,19 @@ class DreamDialog(QtWidgets.QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
+
+        # Two menus share this dialog: "Dream with Seedream" (viewport-guided) and
+        # "Text to Image" (no viewport, face-safe). The mode is set by the menu, not a
+        # checkbox; for T2I hide every viewport-only control.
+        self.cb_text_only.setChecked(text_only_mode)
+        if text_only_mode:
+            for w in (self._vp_lbl, self.vp_thumb, ex_label, self.ex_thumb,
+                      self._b_browse, self._b_clear, self._mode_lbl,
+                      self.mode_around, self.mode_layout, self._b_tpl, self.b_auto):
+                w.hide()
+            self.prompt.setPlaceholderText(
+                "Describe the image (subject, lighting, lens, style). Pure "
+                "text-to-image, no viewport — required for AI human faces (animatable).")
 
     # -- controls ------------------------------------------------------------
     def _browse(self):
@@ -5307,6 +6021,8 @@ class RefineDialog(QtWidgets.QDialog):
         _add_dictate_button(hb, self.prompt)
         hb.addStretch(1)
         v.addLayout(hb)
+        self.mp = _ModelPicker(self)             # per-window model choice + note
+        v.addWidget(self.mp)
         if CONFIG.SHOW_COST:
             cost = QtWidgets.QLabel(_fmt_cost(0, _est_image_cost(1)) + "  (per image)")
             cost.setStyleSheet("color:#2E8BE6; font-weight:bold;")
@@ -5347,6 +6063,471 @@ class RefineDialog(QtWidgets.QDialog):
         return self.prompt.toPlainText().strip()
 
 
+# =============================================================================
+# Interactive Edit -- annotate an image (box/arrow/pencil/text/marker) and let
+# Seedream 5.0 Pro edit it from the marks + a prompt. New window; the simple Refine
+# is untouched. The marks are baked into the image (that IS how Pro reads them) and
+# removed from the result via the prompt.
+# =============================================================================
+_IE_TEMPLATES = {
+    "Layer separation": (
+        "Perform precise layer separation: identify and independently treat the "
+        "title text, main subject, background and decorative elements. Only adjust "
+        "the marked area / the layer named here; preserve the original visual style, "
+        "lighting, colour tone and overall aesthetic. "),
+    "Precise coordinates": (
+        "Edit according to the marked correspondences: describe what each numbered "
+        "marker means and how they map. Match the corresponding labels. "),
+    "Sketch tags": (
+        "Edit the image based on the hand-drawn marks: add <what> in the boxed area, "
+        "<action> at the arrow. Keep the composition unchanged and blend the new "
+        "elements naturally into the scene. "),
+}
+
+
+class _AnnotateCanvas(QtWidgets.QGraphicsView):
+    """Zoomable image canvas the user draws edit-marks on. render_png() flattens the
+    image + marks into a PNG for Seedream Pro. Tools: pan/box/arrow/pencil/text/
+    marker; wheel = zoom, pan tool = drag, undo/clear supported."""
+
+    def __init__(self, pixmap, parent=None):
+        super().__init__(parent)
+        self._scene = QtWidgets.QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._bg = self._scene.addPixmap(pixmap)
+        self._bg.setTransformationMode(QtCore.Qt.SmoothTransformation)
+        self._scene.setSceneRect(QtCore.QRectF(pixmap.rect()))
+        self.setRenderHints(QtGui.QPainter.SmoothPixmapTransform | QtGui.QPainter.Antialiasing)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+        self.setStyleSheet("background:#1d1d1d; border:0;")
+        self.setMinimumHeight(420)
+        self._annos = []                      # top-level annotation items (undo/clear)
+        self._tool = "box"
+        self._color = QtGui.QColor("#ff3030")
+        w = pixmap.width() or 1024
+        self._pw = max(3, round(w / 350))     # pen width scaled to the image
+        self._fs = max(14, round(w / 45))     # label font size
+        self._markers = 0
+        self._start = self._cur = self._path = None
+        self._zoom = 0
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)   # so it receives the Delete key
+        self.set_tool("box")
+        QtCore.QTimer.singleShot(0, self._fit)
+
+    def set_tool(self, tool):
+        self._tool = tool
+        mode = {"pan": QtWidgets.QGraphicsView.ScrollHandDrag,
+                "select": QtWidgets.QGraphicsView.RubberBandDrag}.get(
+                    tool, QtWidgets.QGraphicsView.NoDrag)
+        self.setDragMode(mode)
+        cur = {"pan": QtCore.Qt.OpenHandCursor,
+               "select": QtCore.Qt.ArrowCursor}.get(tool, QtCore.Qt.CrossCursor)
+        self.viewport().setCursor(cur)
+
+    def sizeHint(self):
+        return QtCore.QSize(760, 460)       # don't let a big image blow up the window
+
+    def _reg(self, item):
+        """Register a drawn annotation: make it selectable + movable (Select tool)."""
+        item.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable, True)
+        item.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, True)
+        self._annos.append(item)
+        return item
+
+    def set_color(self, color):
+        self._color = color
+
+    def _pen(self):
+        p = QtGui.QPen(self._color, self._pw)
+        p.setCapStyle(QtCore.Qt.RoundCap)
+        p.setJoinStyle(QtCore.Qt.RoundJoin)
+        return p
+
+    def undo(self):
+        if self._annos:
+            self._scene.removeItem(self._annos.pop())
+
+    def clear_annotations(self):
+        for it in self._annos:
+            self._scene.removeItem(it)
+        self._annos = []
+        self._markers = 0
+
+    def has_marks(self):
+        return bool(self._annos)
+
+    # -- drawing -------------------------------------------------------------
+    def mousePressEvent(self, e):
+        if self._tool in ("pan", "select") or e.button() != QtCore.Qt.LeftButton:
+            return super().mousePressEvent(e)
+        p = self.mapToScene(e.pos())
+        self._start = p
+        if self._tool == "box":
+            self._cur = self._scene.addRect(QtCore.QRectF(p, p), self._pen())
+        elif self._tool in ("arrow", "pencil"):
+            self._path = QtGui.QPainterPath(p)
+            self._cur = self._scene.addPath(self._path, self._pen())
+        elif self._tool == "text":
+            self._add_text(p)
+        elif self._tool == "marker":
+            self._add_marker(p)
+
+    def mouseMoveEvent(self, e):
+        if self._tool in ("pan", "select"):
+            return super().mouseMoveEvent(e)
+        if self._start is None or self._cur is None:
+            return
+        p = self.mapToScene(e.pos())
+        if self._tool == "box":
+            self._cur.setRect(QtCore.QRectF(self._start, p).normalized())
+        elif self._tool == "arrow":
+            path = QtGui.QPainterPath(self._start)
+            path.lineTo(p)
+            self._cur.setPath(path)
+        elif self._tool == "pencil":
+            self._path.lineTo(p)
+            self._cur.setPath(self._path)
+
+    def mouseReleaseEvent(self, e):
+        if self._tool in ("pan", "select"):
+            return super().mouseReleaseEvent(e)
+        if self._cur is not None:
+            if self._tool == "arrow":
+                self._cur.setPath(self._arrow_path(self._start, self.mapToScene(e.pos())))
+            self._reg(self._cur)
+        self._start = self._cur = self._path = None
+
+    def keyPressEvent(self, e):
+        if e.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace):
+            for it in self._scene.selectedItems():
+                self._scene.removeItem(it)
+                if it in self._annos:
+                    self._annos.remove(it)
+            return
+        super().keyPressEvent(e)
+
+    def _arrow_path(self, a, b):
+        import math
+        path = QtGui.QPainterPath(a)
+        path.lineTo(b)
+        ang = math.atan2(b.y() - a.y(), b.x() - a.x())
+        h = max(12, self._pw * 4)
+        for da in (math.radians(150), math.radians(-150)):
+            path.moveTo(b)
+            path.lineTo(b.x() + h * math.cos(ang + da), b.y() + h * math.sin(ang + da))
+        return path
+
+    def _add_text(self, p):
+        # Build the input dialog explicitly with stay-on-top + raise so it can't open
+        # BEHIND the always-on-top edit window (the static QInputDialog.getText could,
+        # wedging input). Same always-on-top handling as _msgbox.
+        dlg = QtWidgets.QInputDialog(self)
+        dlg.setInputMode(QtWidgets.QInputDialog.TextInput)
+        dlg.setWindowTitle("Text label")
+        dlg.setLabelText("Label:")
+        dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        dlg.raise_()
+        dlg.activateWindow()
+        ok = bool(dlg.exec())
+        txt = dlg.textValue() if ok else ""
+        self._start = None
+        if not ok or not txt.strip():
+            return
+        t = self._scene.addText(txt.strip())
+        f = t.font(); f.setPixelSize(self._fs); f.setBold(True); t.setFont(f)
+        t.setDefaultTextColor(self._color)
+        t.setPos(p)
+        self._reg(t)
+
+    def _add_marker(self, p):
+        self._markers += 1
+        r = max(10, self._pw * 5)
+        path = QtGui.QPainterPath()
+        path.addEllipse(p, r, r)
+        path.moveTo(p.x() - r * 1.4, p.y()); path.lineTo(p.x() + r * 1.4, p.y())
+        path.moveTo(p.x(), p.y() - r * 1.4); path.lineTo(p.x(), p.y() + r * 1.4)
+        cross = self._scene.addPath(path, self._pen())
+        label = self._scene.addText(str(self._markers))
+        f = label.font(); f.setPixelSize(self._fs); f.setBold(True); label.setFont(f)
+        label.setDefaultTextColor(self._color)
+        label.setPos(p.x() + r * 1.4, p.y() - r * 1.9)
+        self._reg(self._scene.createItemGroup([cross, label]))
+        self._start = None
+
+    # -- zoom ----------------------------------------------------------------
+    def wheelEvent(self, e):
+        up = e.angleDelta().y() > 0
+        if not up and self._zoom <= 0:
+            self._fit(); return
+        if up and self._zoom >= 25:
+            return
+        self._zoom += 1 if up else -1
+        s = 1.25 if up else 1 / 1.25
+        self.scale(s, s)
+
+    def _fit(self):
+        self.resetTransform()
+        self.fitInView(self._bg, QtCore.Qt.KeepAspectRatio)
+        self._zoom = 0
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._zoom == 0:
+            self._fit()
+
+    def render_png(self) -> bytes:
+        rect = self._scene.sceneRect()
+        img = QtGui.QImage(max(1, int(rect.width())), max(1, int(rect.height())),
+                           QtGui.QImage.Format_RGB32)
+        img.fill(QtCore.Qt.white)
+        painter = QtGui.QPainter(img)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+        self._scene.render(painter, QtCore.QRectF(img.rect()), rect)
+        painter.end()
+        buf = QtCore.QBuffer()
+        buf.open(QtCore.QIODevice.WriteOnly)
+        img.save(buf, "PNG")
+        return bytes(buf.data())
+
+
+class InteractiveEditDialog(QtWidgets.QDialog):
+    """Draw edit-marks on an image + a prompt -> Seedream 5.0 Pro interactive edit."""
+
+    def __init__(self, pixmap, parent=None):
+        super().__init__(parent or _main_window())
+        self.setWindowTitle("BYTEPLUS - Interactive Edit (Seedream 5.0 Pro)")
+        self.setMinimumSize(760, 780)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self._enh_worker = None
+        self._refs = []                       # extra reference images (glasses, hat...)
+        v = QtWidgets.QVBoxLayout(self)
+
+        self.canvas = _AnnotateCanvas(pixmap, self)
+
+        tb = QtWidgets.QHBoxLayout()
+        self._grp = QtWidgets.QButtonGroup(self)
+        self._grp.setExclusive(True)
+        for key, label in (("pan", "✥ Pan"), ("select", "☝ Select"),
+                           ("box", "▭ Box"), ("arrow", "↗ Arrow"),
+                           ("pencil", "✎ Pencil"), ("text", "T Text"),
+                           ("marker", "⊕ Marker")):
+            b = QtWidgets.QPushButton(label)
+            b.setCheckable(True)
+            b.clicked.connect(lambda _c=False, k=key: self.canvas.set_tool(k))
+            self._grp.addButton(b)
+            tb.addWidget(b)
+            if key == "box":
+                b.setChecked(True)
+        tb.addStretch(1)
+        b_color = QtWidgets.QPushButton("🎨 Colour"); b_color.clicked.connect(self._pick_color)
+        b_undo = QtWidgets.QPushButton("↶ Undo"); b_undo.clicked.connect(self.canvas.undo)
+        b_clear = QtWidgets.QPushButton("✕ Clear"); b_clear.clicked.connect(self.canvas.clear_annotations)
+        for b in (b_color, b_undo, b_clear):
+            tb.addWidget(b)
+        v.addLayout(tb)
+
+        v.addWidget(self.canvas, 1)
+        hint = QtWidgets.QLabel(
+            "Draw marks, then describe the edit referring to them. ☝ Select = "
+            "click/drag to move a mark, Delete key removes it · ✥ Pan = drag view · "
+            "scroll = zoom · marks are removed from the result automatically.")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#888;")
+        v.addWidget(hint)
+
+        # -- reference images (an object to add: glasses, a hat, a logo...) ---
+        rr = QtWidgets.QHBoxLayout()
+        rr.addWidget(QtWidgets.QLabel("Reference images:"))
+        b_addref = QtWidgets.QPushButton("＋ Add image")
+        b_addref.setToolTip("Add object image(s) to insert (glasses, hat, logo…). The "
+                            "edited image is 'reference image 1'; these are 2, 3, … — "
+                            "name them in the prompt.")
+        b_addref.clicked.connect(self._add_ref)
+        b_galref = QtWidgets.QPushButton("From gallery")
+        b_galref.clicked.connect(self._add_ref_gallery)
+        b_rmref = QtWidgets.QPushButton("Remove")
+        b_rmref.clicked.connect(self._remove_ref)
+        rr.addWidget(b_addref); rr.addWidget(b_galref); rr.addWidget(b_rmref)
+        rr.addStretch(1)
+        v.addLayout(rr)
+        self.reflist = QtWidgets.QListWidget()
+        self.reflist.setViewMode(QtWidgets.QListView.IconMode)
+        self.reflist.setIconSize(QtCore.QSize(72, 72))
+        self.reflist.setFixedHeight(90)
+        self.reflist.setResizeMode(QtWidgets.QListView.Adjust)
+        self.reflist.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        v.addWidget(self.reflist)
+
+        ph = QtWidgets.QHBoxLayout()
+        ph.addWidget(QtWidgets.QLabel("<b>Describe the edit</b>:"))
+        ph.addStretch(1)
+        b_tpl = QtWidgets.QToolButton()
+        b_tpl.setText("Insert template ▾")
+        b_tpl.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        tmenu = QtWidgets.QMenu(b_tpl)
+        for name, tpl in _IE_TEMPLATES.items():
+            tmenu.addAction(name, lambda t=tpl: self.prompt.insertPlainText(t))
+        b_tpl.setMenu(tmenu)
+        self.b_enhance = QtWidgets.QPushButton("✦ Enhance")
+        self.b_enhance.clicked.connect(self._enhance)
+        ph.addWidget(b_tpl); ph.addWidget(self.b_enhance)
+        v.addLayout(ph)
+        self.prompt = QtWidgets.QPlainTextEdit()
+        self.prompt.setPlaceholderText(
+            "e.g. replace the object in the box with a ceramic mug; add a plant at "
+            "the arrow; keep everything else the same.")
+        self.prompt.setFixedHeight(70)
+        v.addWidget(self.prompt)
+
+        self.mp = _ModelPicker(self)          # defaults to Pro (interactive edit = Pro)
+        v.addWidget(self.mp)
+        if CONFIG.SHOW_COST:
+            cost = QtWidgets.QLabel(_fmt_cost(0, _est_image_cost(1)) + "  (per image)")
+            cost.setStyleSheet("color:#2E8BE6; font-weight:bold;")
+            v.addWidget(cost)
+
+        bb = QtWidgets.QHBoxLayout(); bb.addStretch(1)
+        b_gen = QtWidgets.QPushButton("Generate"); b_gen.setDefault(True)
+        b_gen.clicked.connect(self.accept)
+        b_close = QtWidgets.QPushButton("Close"); b_close.clicked.connect(self.reject)
+        bb.addWidget(b_gen); bb.addWidget(b_close)
+        v.addLayout(bb)
+
+        # Open at a sensible size (never full ultrawide); user can still resize.
+        try:
+            scr = QtWidgets.QApplication.primaryScreen().availableGeometry()
+            self.resize(min(1080, int(scr.width() * 0.72)),
+                        min(900, int(scr.height() * 0.9)))
+        except Exception:
+            self.resize(1000, 860)
+
+    def _pick_color(self):
+        c = QtWidgets.QColorDialog.getColor(self.canvas._color, self, "Mark colour")
+        if c.isValid():
+            self.canvas.set_color(c)
+
+    def _enhance(self):
+        text = self.prompt.toPlainText().strip()
+        if not text:
+            cmds.inViewMessage(amg="Type the edit first, then ✦ Enhance.",
+                               pos="midCenter", fade=True)
+            return
+        self.b_enhance.setEnabled(False); self.b_enhance.setText("Enhancing…")
+        self._enh_worker = _Worker(lambda: _enhance_edit(text), parent=self)
+
+        def done(t):
+            if t:
+                self.prompt.setPlainText(t)
+            self.b_enhance.setEnabled(True); self.b_enhance.setText("✦ Enhance")
+
+        def fail(tb):
+            self.b_enhance.setEnabled(True); self.b_enhance.setText("✦ Enhance")
+            cmds.inViewMessage(amg="Enhance failed (see Script Editor).",
+                               pos="midCenter", fade=True)
+            sys.stderr.write("[BYTEPLUS] Interactive Edit enhance failed:\n" + tb + "\n")
+
+        self._enh_worker.done.connect(done)
+        self._enh_worker.failed.connect(fail)
+        self._enh_worker.start()
+
+    def prompt_text(self):
+        return self.prompt.toPlainText().strip()
+
+    # -- reference images ----------------------------------------------------
+    def _add_ref(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Add reference image(s)", "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)")
+        self._push_refs(paths)
+
+    def _add_ref_gallery(self):
+        try:
+            start = _scene_images_dir()
+        except Exception:
+            start = ""
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Add from generated images", start,
+            "Images (*.png *.jpg *.jpeg *.webp)")
+        self._push_refs(paths)
+
+    def _push_refs(self, paths):
+        for p in paths:
+            if p and len(self._refs) < 9:     # +1 (the edited image) = 10 max on Pro
+                self._refs.append(p)
+        self._refresh_refs()
+
+    def _remove_ref(self):
+        rows = sorted((self.reflist.row(i) for i in self.reflist.selectedItems()),
+                      reverse=True)
+        for r in rows:
+            if 0 <= r < len(self._refs):
+                del self._refs[r]
+        self._refresh_refs()
+
+    def _refresh_refs(self):
+        self.reflist.clear()
+        for i, p in enumerate(self._refs):
+            it = QtWidgets.QListWidgetItem("ref {}".format(i + 2))   # image 1 = the canvas
+            pm = QtGui.QPixmap(p)
+            if not pm.isNull():
+                it.setIcon(QtGui.QIcon(pm))
+            self.reflist.addItem(it)
+
+    def refs(self):
+        return list(self._refs)
+
+
+def interactive_edit(src, img_dir=None):
+    """Open the Interactive Edit canvas for a gallery image (bytes or path), then
+    send the annotated image + prompt to Seedream 5.0 Pro. Result -> Dream Gallery."""
+    pix = _to_pixmap(src)
+    if pix.isNull():
+        _error("Could not load the image to edit.")
+        return
+    d = InteractiveEditDialog(pix)
+    if not d.exec():
+        return
+    prompt = d.prompt_text()
+    if not prompt:
+        cmds.inViewMessage(amg="Describe the edit first.", pos="midCenter", fade=True)
+        return
+    model = d.mp.model()
+    annotated = d.canvas.render_png()
+    marks = d.canvas.has_marks()
+    extra_refs = d.refs()                          # objects to add (glasses, hat...)
+    img_dir = img_dir or _scene_images_dir()
+    scene = _scene_tag()
+
+    def regen():
+        # persist the exact annotated image we send (the '_ref' name keeps it OUT of
+        # the gallery listing, like other reference images)
+        ref_path = _unique_path(img_dir, scene + "_edit_ref")
+        with open(ref_path, "wb") as fh:
+            fh.write(annotated)
+        # image 1 = the annotated edit target; images 2.. = the extra references.
+        uris = [_asset_uri(ref_path, "image/png")]
+        for r in extra_refs:
+            uris.append(r if (isinstance(r, str) and r.startswith("http"))
+                        else _ref_data_uri(r, 1600))
+        full = prompt
+        if marks:
+            full += (" Follow the drawn marks/annotations precisely, and REMOVE all "
+                     "annotation lines, boxes, arrows, markers and text labels from "
+                     "the final image so none of them remain visible.")
+        data, url = _seedream(full, uris, size="2K", return_url=True, model=model)
+        if _cancel_requested():
+            raise _Cancelled()
+        out = _unique_path(img_dir, scene + "_dream")
+        with open(out, "wb") as f:
+            f.write(data)
+        return {"bytes": data, "path": out, "url": url, "prompt": prompt, "t2i": False}
+
+    gallery = _dream_gallery(regen, img_dir, 1)
+    gallery.show()
+    gallery.raise_()
+    gallery.generate_batch()
+
+
 class DreamGallery(QtWidgets.QDialog):
     """Holds every Dream result (this session + previous ones loaded from disk),
     with regenerate, save, and animate. Stays on top of Maya."""
@@ -5365,9 +6546,7 @@ class DreamGallery(QtWidgets.QDialog):
         self._batch_workers = []      # keep parallel-variation workers alive
 
         v = QtWidgets.QVBoxLayout(self)
-        self.view = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
-        self.view.setStyleSheet("background:#1d1d1d;")
-        self.view.setMinimumHeight(380)
+        self.view = _ZoomView()              # wheel-zoom + drag-pan preview
         v.addWidget(self.view, 1)
         self._ov = _overlay_button(self.view, self._prompt)   # floating Prompt button
         QtCore.QTimer.singleShot(0, lambda: _place_overlay(self.view, self._ov))
@@ -5381,6 +6560,9 @@ class DreamGallery(QtWidgets.QDialog):
         self.strip.setMovement(QtWidgets.QListView.Static)
         self.strip.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.strip.itemClicked.connect(self._on_select)
+        self.strip.currentItemChanged.connect(self._on_current)   # keyboard-arrow nav
+        self.strip.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.strip.customContextMenuRequested.connect(self._strip_menu)
         v.addWidget(self.strip)
 
         row = QtWidgets.QHBoxLayout()
@@ -5396,6 +6578,10 @@ class DreamGallery(QtWidgets.QDialog):
         b_refine.setToolTip("Edit the selected image with a comment "
                             "(e.g. 'make it night', 'add a robot')")
         b_refine.clicked.connect(self._refine)
+        b_edit = QtWidgets.QPushButton("✎ Interactive Edit")
+        b_edit.setToolTip("Draw marks (box / arrow / pencil / text / marker) on the "
+                          "selected image, then let Seedream 5.0 Pro edit from them")
+        b_edit.clicked.connect(self._interactive_edit)
         b_import = QtWidgets.QPushButton("\U0001F4C2 Import")
         b_import.setToolTip("Bring in external image(s) to refine or animate")
         b_import.clicked.connect(self._import)
@@ -5414,7 +6600,7 @@ class DreamGallery(QtWidgets.QDialog):
         b_anim.clicked.connect(self._on_animate)
         b_close = QtWidgets.QPushButton("Close")
         b_close.clicked.connect(self.accept)
-        for b in (b_regen, b_refine, b_import, b_save, b_cmp, b_del, b_clear, b_anim):
+        for b in (b_regen, b_refine, b_edit, b_import, b_save, b_cmp, b_del, b_clear, b_anim):
             row.addWidget(b)
         row.addStretch(1)
         row.addWidget(b_close)
@@ -5426,7 +6612,9 @@ class DreamGallery(QtWidgets.QDialog):
         import glob
         hidden = _load_hidden()
         scene = _scene_tag()
-        for f in sorted(glob.glob(os.path.join(self._img_dir, "*dream*.png"))):
+        # oldest -> newest so the most recent lands on the RIGHT of the strip.
+        for f in sorted(glob.glob(os.path.join(self._img_dir, "*dream*.png")),
+                        key=os.path.getmtime):
             base = os.path.basename(f)
             # strip the scene prefix before checking tokens, so a scene whose
             # name contains 'ref'/'anim' can't be misclassified.
@@ -5483,39 +6671,46 @@ class DreamGallery(QtWidgets.QDialog):
         self._current = item
         pix = QtGui.QPixmap()
         pix.loadFromData(item["bytes"])
-        self.view.setPixmap(pix.scaled(900, 600, QtCore.Qt.KeepAspectRatio,
-                                       QtCore.Qt.SmoothTransformation))
+        self.view.set_pixmap(pix)            # full-res -> zoom reveals detail
 
     def _on_select(self, lw):
         self._show(lw.data(QtCore.Qt.UserRole))
 
+    def _on_current(self, cur, _prev):
+        if cur is not None:                          # arrow keys move current -> preview
+            self._show(cur.data(QtCore.Qt.UserRole))
+
     def _delete(self):
-        lw = self.strip.currentItem()
-        if not lw:
+        # Delete every SELECTED thumbnail (multi-select), or the current one.
+        lws = [lw for lw in (self.strip.selectedItems()
+                             or [self.strip.currentItem()]) if lw is not None]
+        if not lws:
             return
-        item = lw.data(QtCore.Qt.UserRole)
+        items = [lw.data(QtCore.Qt.UserRole) for lw in lws]
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle("BYTEPLUS - Delete image")
         box.setIcon(QtWidgets.QMessageBox.Question)
         box.setText("Remove '{}' from the gallery?".format(
-            os.path.basename(item["path"])))
-        cb = QtWidgets.QCheckBox("Also delete the file from disk")
+            os.path.basename(items[0]["path"])) if len(items) == 1
+            else "Remove {} images from the gallery?".format(len(items)))
+        cb = QtWidgets.QCheckBox("Also delete the file(s) from disk")
         cb.setChecked(True)
         box.setCheckBox(cb)
         box.setStandardButtons(QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel)
         if box.exec() != QtWidgets.QMessageBox.Ok:
             return
-        if cb.isChecked():
-            for p in (item["path"], item["path"] + ".url", item["path"] + ".txt"):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-        else:
-            _hide_paths([item["path"]])          # keep it off the gallery on reopen
-        if item in self._items:
-            self._items.remove(item)
-        self.strip.takeItem(self.strip.row(lw))
+        for lw, item in zip(lws, items):
+            if cb.isChecked():
+                for p in (item["path"], item["path"] + ".url", item["path"] + ".txt"):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            else:
+                _hide_paths([item["path"]])          # keep it off the gallery on reopen
+            if item in self._items:
+                self._items.remove(item)
+            self.strip.takeItem(self.strip.row(lw))
         nxt = self.strip.currentItem()
         if nxt:
             self._show(nxt.data(QtCore.Qt.UserRole))
@@ -5629,6 +6824,46 @@ class DreamGallery(QtWidgets.QDialog):
             self._batch_workers.append(w)
             w.start()
 
+    def _strip_menu(self, pos):
+        """Right-click a thumbnail → context actions (no extra buttons in the row)."""
+        it = self.strip.itemAt(pos)
+        if it is None:
+            return
+        item = it.data(QtCore.Qt.UserRole)
+        if not item:
+            return
+        menu = QtWidgets.QMenu(self)
+        act_edit = menu.addAction("Interactive Edit (draw marks → Pro)")
+        act_blockout = menu.addAction("Blockout from image")
+        act_3d_turn = menu.addAction("Send to Seed 3D — split A-pose turnaround (3 views)")
+        act_3d_one = menu.addAction("Send to Seed 3D — this image")
+        chosen = menu.exec(self.strip.mapToGlobal(pos))
+        if chosen is act_edit:
+            interactive_edit(item.get("bytes") or item.get("path"), self._img_dir)
+        elif chosen is act_blockout:
+            src = item.get("path") or item.get("url")
+            if src:
+                blockout_from_image(src)
+        elif chosen is act_3d_turn:
+            src = item.get("path")
+            if src and os.path.exists(src):
+                open_seed_3d(initial_images=_split_turnaround(src, 3), game_ready=True)
+            else:
+                cmds.inViewMessage(amg="Need the image saved on disk to split it.",
+                                   pos="midCenter", fade=True)
+        elif chosen is act_3d_one:
+            src = item.get("path") or item.get("url")
+            if src:
+                open_seed_3d(initial_images=[src], game_ready=True)
+
+    def _interactive_edit(self):
+        """Open the annotate-and-edit canvas for the SELECTED image (Seedream Pro)."""
+        if not self._current:
+            cmds.inViewMessage(amg="Select an image first.", pos="midCenter", fade=True)
+            return
+        interactive_edit(self._current.get("bytes") or self._current.get("path"),
+                         self._img_dir)
+
     def _refine(self):
         """Edit the SELECTED image with a free-text comment, as a new variation."""
         if not self._current:
@@ -5639,6 +6874,7 @@ class DreamGallery(QtWidgets.QDialog):
         comment = d.text()
         if not comment:
             return
+        chosen_model = d.mp.model()               # per-window model choice (Pro=precise edit)
         # Refine is a normal Seedream image edit -- it does NOT need the trust
         # chain, so use the LOCAL file (the saved platform URL expires in ~24h and
         # would 403). Fall back to the URL only if there's no local file.
@@ -5652,7 +6888,7 @@ class DreamGallery(QtWidgets.QDialog):
                       "subjects and overall style, and apply ONLY this change: "
                       + comment)
             data, url = _seedream(prompt, [ref_uri], size=_image_size(),
-                                  return_url=True)
+                                  return_url=True, model=chosen_model)
             if _cancel_requested():                  # discard, no orphan file
                 raise _Cancelled()
             out = _unique_path(img_dir, "byteplus_dream")
@@ -5720,8 +6956,8 @@ class DreamGallery(QtWidgets.QDialog):
         ref = url if fresh else self._current.get("path")
         # Diagnostic: a FACE only survives Seedance moderation when we send a FRESH
         # trusted Seedream platform URL. If this logs 'LOCAL FILE', the image wasn't
-        # made with Dream > Text-to-Image, or is >24h old, or was imported -->
-        # regenerate it (Dream > Text-to-Image) and animate within ~24h.
+        # made with the Text to Image menu, or is >24h old, or was imported -->
+        # regenerate it (the Text to Image menu) and animate within ~24h.
         t2i = self._current.get("t2i")
         sys.stderr.write("[BYTEPLUS] Animate source = {} (fresh trusted URL: {}, "
                          "T2I origin: {}).\n".format(
@@ -5732,17 +6968,18 @@ class DreamGallery(QtWidgets.QDialog):
         # (image-to-image) faces need KYC HIGH; a stale/re-uploaded URL loses trust.
         warn = None
         if t2i is False:
-            warn = ("This image was refined / edited / imported (image-to-image), so "
-                    "it is NOT a trusted Text-to-Image output.\n\nIf it contains a "
+            warn = ("This image is image-to-image (refined / edited / imported, or "
+                    "made with Layout→Still / viewport-guided Dream), so it is NOT a "
+                    "trusted Text-to-Image output.\n\nIf it contains a "
                     "HUMAN FACE, Seedance will REJECT it unless your BytePlus account "
                     "has KYC HIGH.\n\nTo animate a face, regenerate it with  "
-                    "Dream ▸ Text-to-Image  (put your change in the prompt).\n\n"
+                    "the Text to Image menu  (put your change in the prompt).\n\n"
                     "Objects and scenes without faces animate fine.\n\nContinue anyway?")
         elif not fresh:
             warn = ("This image has no fresh trusted Seedream link — it wasn't made "
-                    "with Dream ▸ Text-to-Image, or it's over ~24h old, or it was "
+                    "with the Text to Image menu, or it's over ~24h old, or it was "
                     "imported.\n\nIf it contains a HUMAN FACE, Seedance will REJECT "
-                    "it. To animate a face: regenerate it with  Dream ▸ Text-to-Image"
+                    "it. To animate a face: regenerate it with  the Text to Image menu"
                     "  and animate within ~24h.\n\nObjects and scenes without faces "
                     "animate fine.\n\nContinue anyway?")
         if warn and _msgbox(
@@ -5782,23 +7019,25 @@ class DreamGallery(QtWidgets.QDialog):
             self._add(data, dst, None, select=True, t2i=False)  # imported -> not T2I-trusted
 
 
-def dream_with_seedream(initial_prompt=None):
+def dream_with_seedream(initial_prompt=None, text_only_mode=False):
     """Snapshot the viewport, collect intent via DreamDialog, then open the
     persistent Dream Gallery (generate / regenerate / save / animate).
 
     `initial_prompt` pre-fills the prompt box (used by Seed Chat's 'Send to
-    Dream'); the menu still calls this with no arguments."""
+    Dream'); the menu still calls this with no arguments. `text_only_mode=True`
+    opens the same engine as pure Text-to-Image (no viewport, face-safe Lite)."""
     import shutil
     if not _scene_ok_to_proceed():
         return
-    snap = _viewport_snapshot()
-    d = DreamDialog(snap, initial_prompt=initial_prompt)
+    snap = None if text_only_mode else _viewport_snapshot()
+    d = DreamDialog(snap, initial_prompt=initial_prompt, text_only_mode=text_only_mode)
     if not d.exec():
         return
     prompt = d.prompt_text()
     if not prompt:
         return
     text_only = d.text_only()                    # T2I: no viewport ref (face-safe)
+    chosen_model = d.mp.model()                  # per-window model choice (Pro / Lite)
     extra = None if text_only else d.extra_ref()
     directive = "" if text_only else d.directive(has_extra=bool(extra))
     n_variations = d.variations()                # how many to generate at once
@@ -5822,7 +7061,7 @@ def dream_with_seedream(initial_prompt=None):
         # TRUSTED input for Seedance (base 5.0 faces are rejected -- see CONFIG).
         data, url = _seedream(directive + prompt, ref_uris, size=_image_size(),
                               return_url=True,
-                              model=(CONFIG.SEEDREAM_FACE_MODEL if text_only else None))
+                              model=chosen_model)
         if _cancel_requested():                  # cancelled during the call ->
             raise _Cancelled()                   # discard, don't write an orphan file
         out = _unique_path(img_dir, scene + "_dream")
@@ -5837,6 +7076,38 @@ def dream_with_seedream(initial_prompt=None):
     gallery.show()
     gallery.raise_()
     gallery.generate_batch()                  # first generation (n variations)
+
+
+def dream_text_to_image(initial_prompt=None):
+    """Text to Image: pure prompt -> image, NO viewport, face-safe (Seedream 5.0
+    Lite, animatable). Same engine as Dream with the viewport controls hidden."""
+    dream_with_seedream(initial_prompt=initial_prompt, text_only_mode=True)
+
+
+def _split_turnaround(path, n=3):
+    """Split a horizontal turnaround strip (front|side|back) into n equal-width view
+    images (temp PNGs) so Seed 3D gets SEPARATE clean views for Image->3D -- feeding
+    the whole strip makes the 3D model reconstruct the flat sheet. Best-effort ->
+    [path] on any failure."""
+    try:
+        import tempfile
+        img = QtGui.QImage(path)
+        if img.isNull() or n < 2:
+            return [path]
+        w, h = img.width(), img.height()
+        cw = w // n
+        base = _safe_name(os.path.splitext(os.path.basename(path))[0])
+        out = []
+        for i in range(n):
+            x = i * cw
+            ww = cw if i < n - 1 else (w - x)     # last column takes the remainder
+            tmp = os.path.join(tempfile.gettempdir(),
+                               "byteplus_view_{}_{}.png".format(base, i))
+            img.copy(x, 0, ww, h).save(tmp, "PNG")
+            out.append(tmp)
+        return out
+    except Exception:
+        return [path]
 
 
 def _dream_gallery(regen, img_dir, variations=1):
@@ -5862,6 +7133,1293 @@ def open_gallery():
     gallery = _dream_gallery(None, _scene_images_dir())
     gallery.show()
     gallery.raise_()
+
+
+# =============================================================================
+# Trusted Characters -- manage the Seedance 2.0 private asset library (UI)
+# =============================================================================
+
+def _trusted_dream_items():
+    """Dream Gallery items if the gallery is open, else []."""
+    g = getattr(_dream_gallery, "_inst", None)
+    if g is None:
+        return []
+    try:
+        return list(g._items)
+    except Exception:
+        return []
+
+
+class TrustedCharacterDialog(QtWidgets.QDialog):
+    """Manage the Trusted Asset Library (Seedance 2.0 "digital characters"). Create
+    character groups, upload images (each becomes a permanent asset://<id> that
+    Seedance trusts forever), watch processing status, and reuse them in Animate."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent or _main_window())
+        self.setWindowTitle("BYTEPLUS - Trusted Characters")
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self.resize(840, 540)
+        self._group_id = None
+        self._workers = []
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.addWidget(QtWidgets.QLabel(
+            "Upload an AI character ONCE → a permanent trusted asset you can animate "
+            "forever (no 24h expiry). For best identity consistency, add a full-body "
+            "frontal image AND a face close-up to the same character."))
+
+        cols = QtWidgets.QHBoxLayout()
+        root.addLayout(cols, 1)
+
+        left = QtWidgets.QVBoxLayout()
+        cols.addLayout(left)
+        left.addWidget(QtWidgets.QLabel("Characters"))
+        self.groups = QtWidgets.QListWidget()
+        self.groups.setFixedWidth(230)
+        self.groups.currentItemChanged.connect(lambda *_: self._on_group())
+        left.addWidget(self.groups, 1)
+        gb = QtWidgets.QHBoxLayout()
+        left.addLayout(gb)
+        b_new = QtWidgets.QPushButton("+ New")
+        b_new.clicked.connect(self._new_group)
+        b_delg = QtWidgets.QPushButton("Delete")
+        b_delg.clicked.connect(self._del_group)
+        b_refg = QtWidgets.QPushButton("↻")
+        b_refg.setFixedWidth(32)
+        b_refg.clicked.connect(self._refresh_groups)
+        gb.addWidget(b_new)
+        gb.addWidget(b_delg)
+        gb.addWidget(b_refg)
+
+        right = QtWidgets.QVBoxLayout()
+        cols.addLayout(right, 1)
+        right.addWidget(QtWidgets.QLabel("Images in this character  "
+                                         "(✅ Active · ⏳ Processing · ❌ Failed)"))
+        self.assets = QtWidgets.QListWidget()
+        self.assets.setViewMode(QtWidgets.QListView.IconMode)
+        self.assets.setIconSize(QtCore.QSize(140, 140))
+        self.assets.setResizeMode(QtWidgets.QListView.Adjust)
+        self.assets.setMovement(QtWidgets.QListView.Static)
+        self.assets.setSpacing(8)
+        right.addWidget(self.assets, 1)
+        ab = QtWidgets.QHBoxLayout()
+        right.addLayout(ab)
+        for label, slot in (("+ From gallery", self._add_from_gallery),
+                            ("+ From file", self._add_from_file),
+                            ("Delete image", self._del_asset),
+                            ("Copy asset://", self._copy_uri),
+                            ("↻ Status", self._refresh_assets)):
+            b = QtWidgets.QPushButton(label)
+            b.clicked.connect(slot)
+            ab.addWidget(b)
+
+        self.status = QtWidgets.QLabel("")
+        self.status.setStyleSheet("color:#888;")
+        self.status.setWordWrap(True)
+        root.addWidget(self.status)
+
+        if not _asset_api_ready():
+            self._set_status("⚠ Add your Access Key + Secret Key (AK/SK) in "
+                             "BYTEPLUS > Settings > Secrets, then reopen this window.")
+        else:
+            self._refresh_groups()
+
+    # -- helpers -------------------------------------------------------------
+    def _set_status(self, text):
+        try:
+            self.status.setText(text)
+        except Exception:
+            pass
+
+    def _run(self, fn, on_done, on_fail=None):
+        """Run `fn` in a worker (parented to the main window so it survives if this
+        dialog closes mid-op -- never parent a running QThread to a closable dialog)."""
+        w = _Worker(fn, parent=_main_window())
+        self._workers.append(w)
+
+        def _cleanup():
+            try:
+                self._workers.remove(w)
+            except ValueError:
+                pass
+
+        w.done.connect(lambda r: (_cleanup(), on_done(r)))
+        w.failed.connect(lambda tb: (_cleanup(), (on_fail or self._fail)(tb)))
+        w.start()
+
+    def _fail(self, tb):
+        sys.stderr.write("[BYTEPLUS] asset op failed:\n" + tb + "\n")
+        self._set_status("❌ " + tb.strip().splitlines()[-1][:200])
+
+    def _ask_text(self, title, label, default=""):
+        dlg = QtWidgets.QInputDialog(self)
+        dlg.setInputMode(QtWidgets.QInputDialog.TextInput)
+        dlg.setWindowTitle(title)
+        dlg.setLabelText(label)
+        dlg.setTextValue(default)
+        dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        dlg.raise_()
+        dlg.activateWindow()
+        return dlg.textValue().strip() if dlg.exec() else ""
+
+    # -- groups --------------------------------------------------------------
+    def _refresh_groups(self):
+        if not _asset_api_ready():
+            return
+        self._set_status("Loading characters…")
+        self._run(_asset_list_groups, self._on_groups)
+
+    def _on_groups(self, items):
+        self.groups.clear()
+        store = _asset_store_load()["groups"]
+        for it in (items or []):
+            gid = it.get("Id") or it.get("GroupId") or ""
+            name = it.get("Name") or it.get("Title") or (store.get(gid, {}).get("name")) or gid
+            _asset_store_group(gid, name)
+            w = QtWidgets.QListWidgetItem(name)
+            w.setData(QtCore.Qt.UserRole, gid)
+            self.groups.addItem(w)
+        self._set_status("{} character(s).".format(self.groups.count())
+                         if self.groups.count() else
+                         "No characters yet — click + New to create one.")
+
+    def _new_group(self):
+        if not self._require_api():
+            return
+        name = self._ask_text("New character", "Character name (e.g. 'Ana - shopkeeper'):")
+        if not name:
+            return
+        self._set_status("Creating character…")
+
+        def _make():
+            return _asset_create_group(name)
+
+        def _done(gid):
+            if gid:
+                _asset_store_group(gid, name)
+            self._refresh_groups()
+            self._set_status("Created '{}'.".format(name) if gid else
+                             "Create returned no id — check the console.")
+
+        def _fail(tb):
+            # First-ever group needs the authorization letter signed in the console.
+            hint = ""
+            if "authoriz" in tb.lower() or "agreement" in tb.lower() or "sign" in tb.lower():
+                hint = ("\n\nFIRST TIME: you must sign the asset-library authorization "
+                        "letter in the BytePlus console (Model Playground > My assets > "
+                        "Virtual Portrait), then try again.")
+            _error("Could not create the character group:\n\n" + tb + hint)
+            self._set_status("❌ create failed (see dialog).")
+
+        self._run(_make, _done, _fail)
+
+    def _del_group(self):
+        gid = self._group_id
+        if not gid:
+            return
+        if _msgbox(QtWidgets.QMessageBox.Warning, "Delete character",
+                   "Delete this character group and ALL its trusted images? Videos "
+                   "already generated are unaffected, but the asset:// ids stop working.",
+                   QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel
+                   ) != QtWidgets.QMessageBox.Ok:
+            return
+        self._set_status("Deleting…")
+        self._run(lambda: (_asset_delete_group(gid), gid)[1],
+                  lambda _r: (_asset_store_forget(gid), self._refresh_groups(),
+                              self.assets.clear(), self._set_status("Deleted.")))
+
+    def _on_group(self):
+        it = self.groups.currentItem()
+        self._group_id = it.data(QtCore.Qt.UserRole) if it else None
+        self._refresh_assets()
+
+    # -- assets --------------------------------------------------------------
+    def _refresh_assets(self):
+        gid = self._group_id
+        self.assets.clear()
+        if not gid or not _asset_api_ready():
+            return
+        self._set_status("Loading images…")
+        self._run(lambda: _asset_list(gid), lambda items: self._on_assets(gid, items))
+
+    def _on_assets(self, gid, items):
+        if self._group_id != gid:
+            return
+        self.assets.clear()
+        store = _asset_store_load()["groups"].get(gid, {}).get("assets", {})
+        badge = {"Active": "✅", "Processing": "⏳", "Failed": "❌"}
+        active = 0
+        for it in (items or []):
+            aid = it.get("Id") or it.get("AssetId") or ""
+            status = (it.get("Status") or "").strip() or "Processing"
+            name = it.get("Name") or store.get(aid, {}).get("name") or aid[-6:]
+            _asset_store_asset(gid, aid, name=it.get("Name") or "", status=status)
+            thumb = store.get(aid, {}).get("thumb", "")
+            icon = QtGui.QIcon(_to_pixmap(thumb)) if thumb else QtGui.QIcon()
+            w = QtWidgets.QListWidgetItem(icon, "{} {}".format(badge.get(status, "•"), name))
+            w.setData(QtCore.Qt.UserRole, aid)
+            w.setToolTip("asset://{}   ({})".format(aid, status))
+            self.assets.addItem(w)
+            active += status == "Active"
+        self._set_status("{} image(s), {} active. Use them in Animate → "
+                         "🎭 Trusted character.".format(self.assets.count(), active))
+
+    def _add_from_gallery(self):
+        if not self._require_api() or not self._require_group():
+            return
+        items = _trusted_dream_items()
+        if not items:
+            _error("Open the Dream Gallery (with images) first, or use + From file.")
+            return
+        picked = _pick_gallery_image(items, self, warn_trust=False)
+        if not picked:
+            return
+        url = picked.get("url")
+        src = url if (url and _url_is_fresh(url)) else picked.get("path")
+        self._start_add(src, picked.get("path") or "")
+
+    def _add_from_file(self):
+        if not self._require_api() or not self._require_group():
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Add image to this character", "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.gif)")
+        if path:
+            self._start_add(path, path)
+
+    def _start_add(self, src, thumb):
+        gid = self._group_id
+        if not src:
+            _error("That image has no fresh URL and no local file to upload.")
+            return
+        self._set_status("Uploading & registering (this can take a minute)…")
+        name = os.path.basename(str(thumb) or str(src))[:40]
+
+        def _add():
+            return _asset_add_and_wait(gid, src, name=name)
+
+        def _done(res):
+            _asset_store_asset(gid, res["id"], name=name, thumb=thumb,
+                               status=res.get("status", "Processing"))
+            if self._group_id == gid:
+                self._refresh_assets()
+            s = res.get("status")
+            if s == "Active":
+                self._set_status("✅ '{}' is trusted and ready to animate.".format(name))
+            elif s == "Failed":
+                self._set_status("❌ '{}' failed moderation: {}".format(
+                    name, res.get("error") or "rejected"))
+            else:
+                self._set_status("⏳ '{}' still processing — press ↻ Status in a "
+                                 "moment.".format(name))
+
+        self._run(_add, _done)
+
+    def _del_asset(self):
+        gid = self._group_id
+        aid = self._current_asset()
+        if not aid:
+            return
+        if _msgbox(QtWidgets.QMessageBox.Warning, "Delete image",
+                   "Remove this trusted image? Its asset:// id will stop working.",
+                   QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel
+                   ) != QtWidgets.QMessageBox.Ok:
+            return
+        self._set_status("Deleting…")
+        self._run(lambda: (_asset_delete(aid), aid)[1],
+                  lambda _r: (_asset_store_forget(gid, aid), self._refresh_assets()))
+
+    def _copy_uri(self):
+        aid = self._current_asset()
+        if not aid:
+            return
+        QtWidgets.QApplication.clipboard().setText("asset://" + aid)
+        self._set_status("Copied  asset://{}".format(aid))
+
+    # -- small utils ---------------------------------------------------------
+    def _require_api(self):
+        if _asset_api_ready():
+            return True
+        _msgbox(QtWidgets.QMessageBox.Information, "BYTEPLUS - credentials needed",
+                "The Trusted Asset Library needs an Access Key + Secret Key (AK/SK) "
+                "from your BytePlus console — these are DIFFERENT from the Bearer API "
+                "key.\n\n"
+                "1.  BytePlus console  >  IAM  >  Access Keys  >  create an AK/SK.\n"
+                "2.  BYTEPLUS > Settings > Secrets > 'Trusted Asset Library'  >  paste "
+                "the Access Key + Secret Key\n"
+                "     (or leave them blank to reuse your TOS keys — same account).\n"
+                "3.  Save, then reopen this window.\n\n"
+                "You also need Advanced Creation Rights active on the account "
+                "(you do). Creating the character itself is done here, not in the "
+                "console — but the FIRST time, BytePlus asks you to sign a one-time "
+                "authorization letter in the console (Model Playground > My assets > "
+                "Virtual Portrait).")
+        return False
+
+    def _require_group(self):
+        if not self._group_id:
+            _error("Select or create a character (left list) first.")
+            return False
+        return True
+
+    def _current_asset(self):
+        it = self.assets.currentItem()
+        return it.data(QtCore.Qt.UserRole) if it else None
+
+
+def open_trusted_characters():
+    g = getattr(open_trusted_characters, "_inst", None)
+    if g is not None:
+        try:
+            g.objectName()
+        except Exception:
+            g = None
+    if g is None:
+        g = TrustedCharacterDialog()
+        open_trusted_characters._inst = g
+    g.show()
+    g.raise_()
+    g.activateWindow()
+
+
+# =============================================================================
+# Layout -> Still  (guided): viewport locks the composition, you describe the look
+# -----------------------------------------------------------------------------
+# A streamlined front-end for the A/B-verified layout workflow: send ONLY the
+# viewport (LAYOUT) + describe the LOOK in text + the strong MODE_LAYOUT directive,
+# so Seedream follows your Maya composition instead of copying a competing image.
+# =============================================================================
+
+class LayoutStillDialog(QtWidgets.QDialog):
+    """Just: your viewport (locked composition) + a LOOK description. No mode /
+    extra-reference choices to get wrong."""
+
+    def __init__(self, snapshot_path, parent=None):
+        super().__init__(parent or _main_window())
+        self.setWindowTitle("BYTEPLUS - Layout → Still")
+        self.setMinimumSize(560, 520)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self._enh_worker = None
+        v = QtWidgets.QVBoxLayout(self)
+
+        v.addWidget(QtWidgets.QLabel(
+            "Your viewport = the LAYOUT (positions, facing, camera):"))
+        thumb = QtWidgets.QLabel()
+        thumb.setFixedSize(360, 203)
+        thumb.setStyleSheet("background:#1d1d1d;")
+        thumb.setPixmap(QtGui.QPixmap(snapshot_path).scaled(
+            360, 203, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        v.addWidget(thumb)
+
+        ph = QtWidgets.QHBoxLayout()
+        ph.addWidget(QtWidgets.QLabel(
+            "<b>Describe the LOOK</b> (subjects, style, materials, lighting, scene):"))
+        ph.addStretch(1)
+        self.b_enhance = QtWidgets.QPushButton("✦ Enhance")
+        self.b_enhance.setToolTip("Improve the wording of your look description")
+        self.b_enhance.clicked.connect(self._enhance)
+        ph.addWidget(self.b_enhance)
+        v.addLayout(ph)
+        self.prompt = QtWidgets.QPlainTextEdit()
+        self.prompt.setPlaceholderText(
+            "e.g. three cowgirls riding, Monument Valley desert, red buttes, "
+            "golden-hour cinematic light, photoreal")
+        v.addWidget(self.prompt, 1)
+        note = QtWidgets.QLabel(
+            "The composition is locked to your viewport; the look comes from this "
+            "text. No reference image needed (a second image competes with the "
+            "layout and usually wins).")
+        note.setWordWrap(True); note.setStyleSheet("color:#888;")
+        v.addWidget(note)
+        self.mp = _ModelPicker(self)             # per-window model choice + note
+        v.addWidget(self.mp)
+
+        vr = QtWidgets.QHBoxLayout()
+        vr.addWidget(QtWidgets.QLabel("Variations:"))
+        self.cb_variations = QtWidgets.QComboBox()
+        for k in ("1", "2", "4", "6", "8"):
+            self.cb_variations.addItem(k, int(k))
+        self.cb_variations.setCurrentText("4")
+        vr.addWidget(self.cb_variations); vr.addStretch(1)
+        v.addLayout(vr)
+
+        if CONFIG.SHOW_COST:
+            cost = QtWidgets.QLabel()
+            cost.setStyleSheet("color:#2E8BE6; font-weight:bold;")
+
+            def _upd():
+                n = self.variations()
+                cost.setText("{}  ({} image{})".format(
+                    _fmt_cost(0, _est_image_cost(n)), n, "s" if n > 1 else ""))
+            self.cb_variations.currentIndexChanged.connect(_upd)
+            _upd()
+            v.addWidget(cost)
+
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.button(QtWidgets.QDialogButtonBox.Ok).setText("Generate")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def prompt_text(self):
+        return self.prompt.toPlainText().strip()
+
+    def variations(self):
+        return self.cb_variations.currentData()
+
+    def _enhance(self):
+        text = self.prompt.toPlainText().strip()
+        if not text:
+            cmds.inViewMessage(amg="Type the look first, then ✦ Enhance.",
+                               pos="midCenter", fade=True)
+            return
+        self.b_enhance.setEnabled(False)
+        self.b_enhance.setText("Enhancing…")
+        # Layout->Still: enrich the LOOK only; pose/positions/camera are locked by
+        # the viewport, so use the look-only enhancer (not the generic one).
+        self._enh_worker = _Worker(lambda: _enhance_look(text), parent=self)
+
+        def done(t):
+            if t:
+                self.prompt.setPlainText(t)
+            self.b_enhance.setEnabled(True)
+            self.b_enhance.setText("✦ Enhance")
+
+        def fail(tb):                                # NB: no _msgbox from a modal dialog
+            self.b_enhance.setEnabled(True)
+            self.b_enhance.setText("✦ Enhance")
+            cmds.inViewMessage(amg="Enhance failed (see Script Editor).",
+                               pos="midCenter", fade=True)
+            sys.stderr.write("[BYTEPLUS] Layout->Still enhance failed:\n" + tb + "\n")
+
+        self._enh_worker.done.connect(done)
+        self._enh_worker.failed.connect(fail)
+        self._enh_worker.start()
+
+
+def layout_to_still():
+    """Guided Layout -> Still: capture the viewport (LAYOUT), collect a LOOK
+    description, then generate matched photoreal stills into the Dream Gallery."""
+    import shutil
+    if not _scene_ok_to_proceed():
+        return
+    snap = _viewport_snapshot()
+    d = LayoutStillDialog(snap)
+    if not d.exec():
+        return
+    look = d.prompt_text()
+    if not look:
+        return
+    n_variations = d.variations()
+    chosen_model = d.mp.model()
+    img_dir = _scene_images_dir()
+    scene = _scene_tag()
+
+    def regen():
+        # Single reference = the viewport (LAYOUT); look comes from the text + the
+        # strong MODE_LAYOUT 'composition lock' directive (A/B-verified).
+        ref_path = _unique_path(img_dir, scene + "_dream_ref")
+        shutil.copyfile(snap, ref_path)
+        ref_uris = [_asset_uri(ref_path, "image/png")]
+        data, url = _seedream(MODE_LAYOUT + look, ref_uris, size=_image_size(),
+                              return_url=True, model=chosen_model)
+        if _cancel_requested():
+            raise _Cancelled()
+        out = _unique_path(img_dir, scene + "_dream")
+        with open(out, "wb") as f:
+            f.write(data)
+        # t2i=False: image-to-image (viewport-guided) -> a face here isn't a trusted
+        # Seedance input (the Animate face-warning will flag it).
+        return {"bytes": data, "path": out, "url": url, "prompt": look, "t2i": False}
+
+    gallery = _dream_gallery(regen, img_dir, n_variations)
+    gallery.show()
+    gallery.raise_()
+    gallery.generate_batch()
+
+
+# =============================================================================
+# Compose Scene -- multi-image reference render (Seedream, up to 14 refs)
+# -----------------------------------------------------------------------------
+# Pure image composition (no viewport): add N reference images (a layout, materials,
+# products, decor), describe the final scene referencing them by number (skill 9),
+# generate a composited render. A/B-verified: works well when the refs have DISTINCT
+# roles (one composition + materials/products) rather than competing scenes.
+# =============================================================================
+
+def _ref_data_uri(src, max_px=1600):
+    """A reference image as a compact data URI, downscaled to avoid HTTP 413 with
+    many refs. http(s) URLs pass through unchanged. Best-effort -> raw file on error."""
+    if isinstance(src, str) and src.startswith("http"):
+        return src
+    try:
+        import tempfile
+        img = QtGui.QImage(src)
+        if img.isNull():
+            raise ValueError("unreadable image")
+        if img.width() > max_px or img.height() > max_px:
+            img = img.scaled(max_px, max_px, QtCore.Qt.KeepAspectRatio,
+                             QtCore.Qt.SmoothTransformation)
+        tmp = os.path.join(tempfile.gettempdir(),
+                           "byteplus_ref_" + _safe_name(os.path.basename(src)) + ".jpg")
+        img.save(tmp, "JPG", 88)
+        return _data_uri(tmp, "image/jpeg")
+    except Exception:
+        return _data_uri(src, _image_mime(src))
+
+
+_COMPOSE_SYSTEM = (
+    "You help compose ONE photorealistic render from multiple reference images "
+    "(labelled Image 1, Image 2, …). For EACH image silently identify its role: "
+    "composition/layout, material/finish, product/fixture, furniture, or decor/plant. "
+    "Then write ONE clear English prompt (under 150 words) that: states it's a "
+    "photorealistic render of the scene; takes the COMPOSITION and camera from the "
+    "layout image ('follow the composition and camera of Image X'); assigns every "
+    "other image its explicit job BY NUMBER ('walls/floor in the material of Image Y', "
+    "'install the fixture from Image Z at each basin', 'add the decor from Image W'); "
+    "and ends with lighting/quality cues. Output ONLY the prompt, no preamble, no list.")
+
+
+def _compose_auto_prompt(sources, goal=""):
+    """Seed 2.0 looks at the reference images, gives each a role, and writes the
+    structured compose prompt (referencing them by number). NETWORK ONLY -- worker."""
+    content = [{"type": "text", "text": "Reference images for one composited render:"}]
+    for i, s in enumerate(sources):
+        content.append({"type": "text", "text": "Image {}:".format(i + 1)})
+        content.append({"type": "image_url", "image_url": {"url": _ref_data_uri(s, 1024)}})
+    goal = (goal or "").strip() or "a single photorealistic render combining these"
+    content.append({"type": "text", "text":
+                    "Goal: {}. Write the compose prompt now.".format(goal)})
+    return _chat([{"role": "user", "content": content}], system=_COMPOSE_SYSTEM)
+
+
+class ComposeSceneDialog(QtWidgets.QDialog):
+    """Add reference images + describe the final scene -> composited render."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent or _main_window())
+        self.setWindowTitle("BYTEPLUS - Image to Image")
+        self.setMinimumSize(620, 640)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self._sources = []
+        self._enh_worker = None
+        self._auto_worker = None
+        v = QtWidgets.QVBoxLayout(self)
+
+        v.addWidget(QtWidgets.QLabel(
+            "<b>Reference images</b> (a layout, materials, products, decor) — you "
+            "reference them in the prompt as Image 1, Image 2, …:"))
+        self.listw = QtWidgets.QListWidget()
+        self.listw.setViewMode(QtWidgets.QListView.IconMode)
+        self.listw.setIconSize(QtCore.QSize(120, 84))
+        self.listw.setResizeMode(QtWidgets.QListView.Adjust)
+        self.listw.setFixedHeight(140)
+        self.listw.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        v.addWidget(self.listw)
+        brow = QtWidgets.QHBoxLayout()
+        b_add = QtWidgets.QPushButton("Add images…"); b_add.clicked.connect(self._add)
+        b_gal = QtWidgets.QPushButton("From gallery"); b_gal.clicked.connect(self._add_gallery)
+        b_rm = QtWidgets.QPushButton("Remove"); b_rm.clicked.connect(self._remove)
+        b_clr = QtWidgets.QPushButton("Clear"); b_clr.clicked.connect(self._clear)
+        for b in (b_add, b_gal, b_rm, b_clr):
+            brow.addWidget(b)
+        brow.addStretch(1)
+        v.addLayout(brow)
+
+        ph = QtWidgets.QHBoxLayout()
+        ph.addWidget(QtWidgets.QLabel("<b>Describe the final scene</b>:"))
+        ph.addStretch(1)
+        self.b_auto = QtWidgets.QPushButton("✨ Auto-compose")
+        self.b_auto.setToolTip("Seed 2.0 looks at your images, gives each a role, and "
+                               "writes the structured prompt for you (recommended)")
+        self.b_auto.clicked.connect(self._auto)
+        self.b_enhance = QtWidgets.QPushButton("✦ Enhance")
+        self.b_enhance.clicked.connect(self._enhance)
+        ph.addWidget(self.b_auto); ph.addWidget(self.b_enhance)
+        v.addLayout(ph)
+        self.prompt = QtWidgets.QPlainTextEdit()
+        self.prompt.setPlaceholderText(
+            "Add your images, then hit ✨ Auto-compose (it writes the prompt for you), "
+            "or write it: Photoreal interior render. Follow "
+            "the composition of Image 1 (layout). Walls in the marble of Image 2. Fit "
+            "the fixture from Image 3 at each basin. Add the vases from Image 4. …")
+        v.addWidget(self.prompt, 1)
+        self.mp = _ModelPicker(self)             # per-window model choice + note
+        v.addWidget(self.mp)
+        note = QtWidgets.QLabel(
+            "Tip: 5–8 references with DISTINCT roles (ONE for composition, others for "
+            "materials / products / decor) work best. Give each a clear job. Products "
+            "come out 'in the spirit', not pixel-exact. (Lite: up to 14 refs · Pro: 10.)")
+        note.setWordWrap(True); note.setStyleSheet("color:#888;")
+        v.addWidget(note)
+
+        vr = QtWidgets.QHBoxLayout()
+        vr.addWidget(QtWidgets.QLabel("Variations:"))
+        self.cb_variations = QtWidgets.QComboBox()
+        for k in ("1", "2", "4", "6", "8"):
+            self.cb_variations.addItem(k, int(k))
+        self.cb_variations.setCurrentText("2")
+        vr.addWidget(self.cb_variations); vr.addStretch(1)
+        v.addLayout(vr)
+        if CONFIG.SHOW_COST:
+            self.cost = QtWidgets.QLabel()
+            self.cost.setStyleSheet("color:#2E8BE6; font-weight:bold;")
+
+            def _upd():
+                n = self.variations()
+                self.cost.setText("{}  ({} image{})".format(
+                    _fmt_cost(0, _est_image_cost(n)), n, "s" if n > 1 else ""))
+            self.cb_variations.currentIndexChanged.connect(_upd)
+            _upd()
+            v.addWidget(self.cost)
+
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.button(QtWidgets.QDialogButtonBox.Ok).setText("Generate")
+        bb.accepted.connect(self._on_ok)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def _refresh(self):
+        self.listw.clear()
+        for i, s in enumerate(self._sources):
+            it = QtWidgets.QListWidgetItem("Image {}\n{}".format(
+                i + 1, os.path.basename(str(s))[:16]))
+            if not str(s).startswith("http"):
+                pm = QtGui.QPixmap(s)
+                if not pm.isNull():
+                    it.setIcon(QtGui.QIcon(pm))
+            it.setData(QtCore.Qt.UserRole, s)
+            self.listw.addItem(it)
+
+    def _add(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Add reference images", "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)")
+        for p in paths:
+            if len(self._sources) < 14:
+                self._sources.append(p)
+        self._refresh()
+
+    def _add_gallery(self):
+        try:
+            start = _scene_images_dir()
+        except Exception:
+            start = ""
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Add from generated images", start,
+            "Images (*.png *.jpg *.jpeg *.webp)")
+        for p in paths:
+            if len(self._sources) < 14:
+                self._sources.append(p)
+        self._refresh()
+
+    def _remove(self):
+        rows = sorted((self.listw.row(i) for i in self.listw.selectedItems()),
+                      reverse=True)
+        for r in rows:
+            if 0 <= r < len(self._sources):
+                del self._sources[r]
+        self._refresh()
+
+    def _clear(self):
+        self._sources = []
+        self._refresh()
+
+    def _on_ok(self):
+        if not self._sources:
+            cmds.inViewMessage(amg="Add at least one reference image.",
+                               pos="midCenter", fade=True)
+            return
+        if not self.prompt.toPlainText().strip():
+            cmds.inViewMessage(amg="Describe the final scene.", pos="midCenter", fade=True)
+            return
+        self.accept()
+
+    def prompt_text(self):
+        return self.prompt.toPlainText().strip()
+
+    def variations(self):
+        return self.cb_variations.currentData()
+
+    def sources(self):
+        return list(self._sources)
+
+    def _auto(self):
+        if not self._sources:
+            cmds.inViewMessage(amg="Add reference images first.",
+                               pos="midCenter", fade=True)
+            return
+        self.b_auto.setEnabled(False)
+        self.b_auto.setText("Analyzing…")
+        goal = self.prompt.toPlainText().strip()
+        srcs = list(self._sources)
+        self._auto_worker = _Worker(lambda: _compose_auto_prompt(srcs, goal), parent=self)
+
+        def done(t):
+            if t:
+                self.prompt.setPlainText(t)
+            self.b_auto.setEnabled(True)
+            self.b_auto.setText("✨ Auto-compose")
+
+        def fail(tb):                                # NB: no _msgbox from a modal dialog
+            self.b_auto.setEnabled(True)
+            self.b_auto.setText("✨ Auto-compose")
+            cmds.inViewMessage(amg="Auto-compose failed (see Script Editor).",
+                               pos="midCenter", fade=True)
+            sys.stderr.write("[BYTEPLUS] Auto-compose failed:\n" + tb + "\n")
+
+        self._auto_worker.done.connect(done)
+        self._auto_worker.failed.connect(fail)
+        self._auto_worker.start()
+
+    def _enhance(self):
+        text = self.prompt.toPlainText().strip()
+        if not text:
+            cmds.inViewMessage(amg="Type the scene first, then ✦ Enhance.",
+                               pos="midCenter", fade=True)
+            return
+        self.b_enhance.setEnabled(False)
+        self.b_enhance.setText("Enhancing…")
+        self._enh_worker = _Worker(lambda: _enhance_prompt(text), parent=self)
+
+        def done(t):
+            if t:
+                self.prompt.setPlainText(t)
+            self.b_enhance.setEnabled(True)
+            self.b_enhance.setText("✦ Enhance")
+
+        def fail(tb):                                # NB: no _msgbox from a modal dialog
+            self.b_enhance.setEnabled(True)
+            self.b_enhance.setText("✦ Enhance")
+            cmds.inViewMessage(amg="Enhance failed (see Script Editor).",
+                               pos="midCenter", fade=True)
+            sys.stderr.write("[BYTEPLUS] Compose enhance failed:\n" + tb + "\n")
+
+        self._enh_worker.done.connect(done)
+        self._enh_worker.failed.connect(fail)
+        self._enh_worker.start()
+
+
+def compose_scene():
+    """Compose Scene: N reference images + a prompt -> a composited render (no
+    viewport). Downscales refs to avoid HTTP 413; results land in the Dream Gallery."""
+    if not _scene_ok_to_proceed():
+        return
+    d = ComposeSceneDialog()
+    if not d.exec():
+        return
+    prompt = d.prompt_text()
+    sources = d.sources()
+    if not prompt or not sources:
+        return
+    n_variations = d.variations()
+    chosen_model = d.mp.model()
+    img_dir = _scene_images_dir()
+    scene = _scene_tag()
+
+    def regen():
+        uris = [_ref_data_uri(s) for s in sources]
+        data, url = _seedream(prompt, uris, size=_image_size(), return_url=True,
+                              model=chosen_model)
+        if _cancel_requested():
+            raise _Cancelled()
+        out = _unique_path(img_dir, scene + "_dream")
+        with open(out, "wb") as f:
+            f.write(data)
+        return {"bytes": data, "path": out, "url": url, "prompt": prompt, "t2i": False}
+
+    gallery = _dream_gallery(regen, img_dir, n_variations)
+    gallery.show()
+    gallery.raise_()
+    gallery.generate_batch()
+
+
+# =============================================================================
+# Seed Human -- Character Creator (grey-bg character sheets + item sheets)
+# -----------------------------------------------------------------------------
+# Everything is a "sheet on neutral grey" made with Seedream Text-to-Image.
+# Person sheets use the face-safe Lite model (moderation-exempt AI face, animatable
+# within ~24h); item sheets (props/clothing/shoes) have no face and use the base
+# model. Consistency comes from generating all angles in ONE image (a 2x2 / 2x3
+# grid). An uploaded photo is only DESCRIBED into fields by Seed 2.0 vision -- never
+# copied -- which is both the requested flow and the only moderation-compliant path
+# (real faces are never reproduced). A/B-validated (scratchpad/test_charsheet.py).
+# =============================================================================
+
+_HUMAN_GREY = (
+    "Neutral seamless light-grey studio background, even soft softbox lighting, "
+    "no harsh shadows, standing neutral A-pose, full body head-to-toe in frame, "
+    "fashion lookbook e-commerce style, photorealistic.")
+
+_HUMAN_GREY_ITEM = (
+    "Neutral seamless light-grey studio background, even soft softbox lighting, "
+    "e-commerce product photography style, photorealistic.")
+
+_HUMAN_2X2 = (
+    "Professional character reference sheet, ONE image split into a clean 2x2 grid, "
+    "four FULL-BODY shots of THE SAME character, head-to-toe in every panel: top-left "
+    "front view, top-right 3/4 view, bottom-left side profile, bottom-right back "
+    "view. Identical face, hair and outfit in all four panels. ")
+
+_HUMAN_2X3 = (
+    "Professional character reference sheet, ONE image in a 3-column by 2-row grid "
+    "of THE SAME character. Top row: three FULL-BODY shots head-to-toe (front, side "
+    "profile, back). Bottom row: a FULL-BODY 3/4 view, then two CLOSE-UP portraits "
+    "(front face close-up, 3/4 face close-up). Identical face, hair and outfit in "
+    "every panel. ")
+
+_HUMAN_ITEM = (
+    "Product reference sheet, THE ITEM ONLY, no person, invisible-mannequin ghost "
+    "flat-lay: {item}. Shown front and back, plus a fabric/detail close-up, soft "
+    "contact shadow. ")
+
+# Game template: a clean orthographic A-pose TURNAROUND (front|side|back) on a plain
+# white background, evenly spaced so it can be split into 3 separate views and fed to
+# Seed 3D (Image->3D wants 1-5 SEPARATE clean views, never a composited sheet).
+_HUMAN_GAME = (
+    "Orthographic character turnaround for 3D modelling: ONE image, a horizontal "
+    "strip of THREE full-body views of THE SAME character, evenly spaced and EQUAL "
+    "size, aligned on the same ground line — left third = FRONT view, middle third = "
+    "LEFT SIDE profile, right third = BACK view. Neutral A-pose, arms slightly away "
+    "from the body, legs straight, symmetrical. Plain flat WHITE background, even "
+    "flat lighting, no shadows, no props, no text, no labels. Identical identity, "
+    "design, colours and proportions across all three views, clean readable "
+    "silhouette, orthographic (no perspective), full body head-to-toe. ")
+
+_HUMAN_DESCRIBE_SYSTEM = (
+    "You analyze a reference photo of a CHARACTER (a person, creature, robot, or "
+    "stylized figure) to PRE-FILL a character-generator form used to generate a NEW "
+    "original AI character inspired by the look -- never a copy of a real person. "
+    "Output ONLY compact JSON with keys: identity (species/type, age or era, build, "
+    "hair/fur/surface, facial features, colours, notable features), wardrobe (tops + "
+    "bottoms / armor / outer layer: colour, material, fit — or 'none'), shoes/feet, "
+    "props (hats/glasses/scarf/jewellery/gear, or 'none'). Each value ONE short "
+    "English phrase. No prose, no markdown fences.")
+
+
+def _human_describe(photo_src):
+    """Seed 2.0 vision reads a photo and returns {identity,wardrobe,shoes,props} to
+    pre-fill the form. The photo is DESCRIBED, never reproduced. NETWORK-only --
+    call from a _Worker."""
+    txt = _chat([{"role": "user", "content": [
+        {"type": "text", "text": "Fill the character form from this reference photo."},
+        {"type": "image_url", "image_url": {"url": _ref_data_uri(photo_src, 1024)}}]}],
+        system=_HUMAN_DESCRIBE_SYSTEM)
+    s = (txt or "").strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+    a, b = s.find("{"), s.rfind("}")
+    if a < 0 or b < 0:
+        raise RuntimeError("Model did not return a JSON form:\n" + txt)
+    return json.loads(s[a:b + 1])
+
+
+def _human_look_clause(identity="", wardrobe="", shoes="", props=""):
+    """Assemble the person's look into one clause for the character-sheet prompt."""
+    bits = []
+    if identity.strip():
+        bits.append(identity.strip().rstrip("."))
+    wear = [x.strip().rstrip(".") for x in (wardrobe, shoes) if x.strip()]
+    if wear:
+        bits.append("wearing " + ", ".join(wear))
+    if props.strip() and props.strip().lower() not in ("none", "n/a", "-"):
+        bits.append("with " + props.strip().rstrip("."))
+    return (". ".join(bits) + ".") if bits else "an original character."
+
+
+def _human_sheet_prompt(template, look, no_text):
+    if template == "game":                       # 3D-ready A-pose turnaround (white bg)
+        return _HUMAN_GAME + look + " No text, no captions, no watermark."
+    head = _HUMAN_2X3 if template == "2x3" else _HUMAN_2X2
+    p = head + _HUMAN_GREY + " " + look
+    if no_text:
+        p += " No text labels, no captions, no watermarks."
+    return p
+
+
+def _item_sheet_prompt(item_desc, no_text):
+    p = _HUMAN_ITEM.format(item=item_desc.strip().rstrip(".")) + _HUMAN_GREY_ITEM
+    if no_text:
+        p += " No text labels, no captions."
+    return p
+
+
+_HUMAN_LAST = {}          # remembers the last form so reopening the window is fast
+
+
+class SeedCharacterDialog(QtWidgets.QDialog):
+    """Character Creator: describe-from-photo -> fields -> grey character sheet
+    (2x2 / 2x3) and per-item ghost-mannequin sheets. One window, several sections;
+    each field has its own Enhance."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent or _main_window())
+        self.setWindowTitle("BYTEPLUS - Seed Character Generator")
+        self.setMinimumSize(600, 720)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self._photo = None
+        self._action = None
+        self._workers = []
+        self._desc_worker = None
+
+        v = QtWidgets.QVBoxLayout(self)
+
+        # -- describe from photo (optional) ----------------------------------
+        v.addWidget(QtWidgets.QLabel(
+            "<b>Describe from a photo</b> (optional) — the photo is only described "
+            "into the fields, never copied:"))
+        prow = QtWidgets.QHBoxLayout()
+        self.thumb = QtWidgets.QLabel("(no photo)")
+        self.thumb.setFixedSize(120, 120)
+        self.thumb.setAlignment(QtCore.Qt.AlignCenter)
+        self.thumb.setStyleSheet("background:#1d1d1d; color:#888;")
+        prow.addWidget(self.thumb)
+        pbtns = QtWidgets.QVBoxLayout()
+        b_browse = QtWidgets.QPushButton("Browse…")
+        b_browse.clicked.connect(self._browse_photo)
+        b_gal = QtWidgets.QPushButton("From gallery")
+        b_gal.clicked.connect(self._photo_from_gallery)
+        self.b_desc = QtWidgets.QPushButton("✨ Auto-fill fields")
+        self.b_desc.setToolTip("Seed 2.0 looks at the photo and fills the fields "
+                               "below (identity, wardrobe, shoes, props)")
+        self.b_desc.clicked.connect(self._describe)
+        b_clearf = QtWidgets.QPushButton("✕ Clear fields")
+        b_clearf.setToolTip("Empty all fields + photo to start a fresh character "
+                            "(otherwise the last one is remembered for quick tweaks)")
+        b_clearf.clicked.connect(self._clear_fields)
+        for b in (b_browse, b_gal, self.b_desc, b_clearf):
+            pbtns.addWidget(b)
+        pbtns.addStretch(1)
+        prow.addLayout(pbtns)
+        prow.addStretch(1)
+        v.addLayout(prow)
+
+        # -- the four described fields ---------------------------------------
+        self.f_identity = self._field(
+            v, "Character (identity / face / hair / body)",
+            "e.g. man in his 20s, lean build, curly dark hair, thin moustache")
+        self.f_wardrobe = self._field(
+            v, "Wardrobe (shirt / pants / skirt…)",
+            "e.g. oversized washed-charcoal tee, baggy black cargo denim")
+        self.f_shoes = self._field(
+            v, "Shoes (type)", "e.g. black chunky leather low shoes")
+        self.f_props = self._field(
+            v, "Props (caps / glasses / scarf / jewellery…)",
+            "e.g. small silver hoop earrings, thin neck chain — or leave empty")
+
+        # -- template + options ----------------------------------------------
+        orow = QtWidgets.QHBoxLayout()
+        orow.addWidget(QtWidgets.QLabel("Sheet:"))
+        self.rb_2x2 = QtWidgets.QRadioButton("2×2 · 4 full-body angles")
+        self.rb_2x2.setChecked(True)
+        self.rb_2x3 = QtWidgets.QRadioButton("2×3 · 4 full-body + 2 close-ups")
+        self.rb_game = QtWidgets.QRadioButton("Game A-pose turnaround (for 3D)")
+        self.rb_game.setToolTip("Clean orthographic front/side/back A-pose on white — "
+                                "the right input for Seed 3D (split into 3 views).")
+        orow.addWidget(self.rb_2x2)
+        orow.addWidget(self.rb_2x3)
+        orow.addWidget(self.rb_game)
+        orow.addStretch(1)
+        v.addLayout(orow)
+
+        crow = QtWidgets.QHBoxLayout()
+        self.cb_grey = QtWidgets.QCheckBox("Grey seamless background")
+        self.cb_grey.setChecked(True)
+        self.cb_grey.setToolTip("The lookbook grey studio backdrop (recommended)")
+        self.cb_notext = QtWidgets.QCheckBox("No text labels on panels")
+        self.cb_notext.setToolTip("Seedream tends to add small captions (SIDE "
+                                  "PROFILE, FABRIC DETAIL). Tick for clean panels.")
+        crow.addWidget(self.cb_grey)
+        crow.addWidget(self.cb_notext)
+        crow.addStretch(1)
+        crow.addWidget(QtWidgets.QLabel("Variations:"))
+        self.cb_variations = QtWidgets.QComboBox()
+        for k in ("1", "2", "4", "6", "8"):
+            self.cb_variations.addItem(k, int(k))
+        self.cb_variations.setCurrentText("2")
+        crow.addWidget(self.cb_variations)
+        v.addLayout(crow)
+
+        if CONFIG.SHOW_COST:
+            self.cost = QtWidgets.QLabel()
+            self.cost.setStyleSheet("color:#2E8BE6; font-weight:bold;")
+
+            def _upd():
+                n = self.variations()
+                self.cost.setText("{}  ({} image{})".format(
+                    _fmt_cost(0, _est_image_cost(n)), n, "s" if n > 1 else ""))
+            self.cb_variations.currentIndexChanged.connect(_upd)
+            _upd()
+            v.addWidget(self.cost)
+
+        note = QtWidgets.QLabel(
+            "Character sheets use the face-safe Text-to-Image path (AI face, animatable "
+            "~24h). Item sheets show the garment/prop alone on grey. Game turnaround = a "
+            "clean A-pose front/side/back on white → right-click it in the gallery → "
+            "'Send to Seed 3D — split turnaround' for a game-ready mesh.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#888;")
+        v.addWidget(note)
+        self.mp = _ModelPicker(self)             # per-window model choice + note
+        v.addWidget(self.mp)
+
+        # -- generate buttons ------------------------------------------------
+        b_char = QtWidgets.QPushButton("Generate character sheet")
+        b_char.setDefault(True)
+        b_char.clicked.connect(lambda: self._go("char"))
+        v.addWidget(b_char)
+
+        irow = QtWidgets.QHBoxLayout()
+        b_item = QtWidgets.QPushButton("Generate item sheet:")
+        b_item.clicked.connect(lambda: self._go("item"))
+        self.item_which = QtWidgets.QComboBox()
+        self.item_which.addItem("Full outfit", "outfit")
+        self.item_which.addItem("Wardrobe", "wardrobe")
+        self.item_which.addItem("Shoes", "shoes")
+        self.item_which.addItem("Props", "props")
+        irow.addWidget(b_item)
+        irow.addWidget(self.item_which, 1)
+        v.addLayout(irow)
+
+        brow = QtWidgets.QHBoxLayout()
+        brow.addStretch(1)
+        b_close = QtWidgets.QPushButton("Close")
+        b_close.clicked.connect(self.reject)
+        brow.addWidget(b_close)
+        v.addLayout(brow)
+
+        self._restore()
+
+    # -- field factory ------------------------------------------------------
+    def _field(self, layout, title, placeholder):
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("<b>{}</b>".format(title)))
+        row.addStretch(1)
+        btn = QtWidgets.QPushButton("✦ Enhance")
+        row.addWidget(btn)
+        layout.addLayout(row)
+        edit = QtWidgets.QPlainTextEdit()
+        edit.setPlaceholderText(placeholder)
+        edit.setFixedHeight(52)
+        layout.addWidget(edit)
+        btn.clicked.connect(lambda: self._enh_field(edit, btn))
+        return edit
+
+    # -- photo picking ------------------------------------------------------
+    def _set_photo(self, path):
+        self._photo = path
+        pm = QtGui.QPixmap(path)
+        if not pm.isNull():
+            self.thumb.setPixmap(pm.scaled(120, 120, QtCore.Qt.KeepAspectRatio,
+                                           QtCore.Qt.SmoothTransformation))
+        else:
+            self.thumb.setText(os.path.basename(path)[:16])
+
+    def _browse_photo(self):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Pick a reference photo", "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)")
+        if p:
+            self._set_photo(p)
+
+    def _photo_from_gallery(self):
+        try:
+            start = _scene_images_dir()
+        except Exception:
+            start = ""
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Pick from generated images", start,
+            "Images (*.png *.jpg *.jpeg *.webp)")
+        if p:
+            self._set_photo(p)
+
+    def _describe(self):
+        if not self._photo:
+            cmds.inViewMessage(amg="Pick a photo first (Browse / From gallery).",
+                               pos="midCenter", fade=True)
+            return
+        self.b_desc.setEnabled(False)
+        self.b_desc.setText("Analyzing…")
+        photo = self._photo
+        self._desc_worker = _Worker(lambda: _human_describe(photo), parent=self)
+
+        def done(d):
+            if isinstance(d, dict):
+                self.f_identity.setPlainText(str(d.get("identity", "")))
+                self.f_wardrobe.setPlainText(str(d.get("wardrobe", "")))
+                self.f_shoes.setPlainText(str(d.get("shoes", "")))
+                self.f_props.setPlainText(str(d.get("props", "")))
+            self.b_desc.setEnabled(True)
+            self.b_desc.setText("✨ Auto-fill fields")
+
+        def fail(tb):                                # NB: no _msgbox from a modal dialog
+            self.b_desc.setEnabled(True)
+            self.b_desc.setText("✨ Auto-fill fields")
+            cmds.inViewMessage(amg="Auto-fill failed (see Script Editor).",
+                               pos="midCenter", fade=True)
+            sys.stderr.write("[BYTEPLUS] Human auto-fill failed:\n" + tb + "\n")
+
+        self._desc_worker.done.connect(done)
+        self._desc_worker.failed.connect(fail)
+        self._desc_worker.start()
+
+    def _enh_field(self, field, btn):
+        text = field.toPlainText().strip()
+        if not text:
+            cmds.inViewMessage(amg="Type something first, then ✦ Enhance.",
+                               pos="midCenter", fade=True)
+            return
+        btn.setEnabled(False)
+        btn.setText("…")
+        w = _Worker(lambda: _enhance_prompt(text), parent=self)
+        self._workers.append(w)                      # keep the QThread ref alive
+
+        def done(t):
+            if t:
+                field.setPlainText(t)
+            btn.setEnabled(True)
+            btn.setText("✦ Enhance")
+
+        def fail(tb):
+            btn.setEnabled(True)
+            btn.setText("✦ Enhance")
+            cmds.inViewMessage(amg="Enhance failed (see Script Editor).",
+                               pos="midCenter", fade=True)
+            sys.stderr.write("[BYTEPLUS] Human enhance failed:\n" + tb + "\n")
+
+        w.done.connect(done)
+        w.failed.connect(fail)
+        w.start()
+
+    # -- accessors ----------------------------------------------------------
+    def fields(self):
+        return {"identity": self.f_identity.toPlainText().strip(),
+                "wardrobe": self.f_wardrobe.toPlainText().strip(),
+                "shoes": self.f_shoes.toPlainText().strip(),
+                "props": self.f_props.toPlainText().strip()}
+
+    def template(self):
+        if self.rb_game.isChecked():
+            return "game"
+        return "2x3" if self.rb_2x3.isChecked() else "2x2"
+
+    def variations(self):
+        return self.cb_variations.currentData()
+
+    def no_text(self):
+        return self.cb_notext.isChecked()
+
+    def use_grey(self):
+        return self.cb_grey.isChecked()
+
+    def action(self):
+        return self._action
+
+    def item_choice(self):
+        return self.item_which.currentData()
+
+    def item_desc(self, which, f=None):
+        f = f or self.fields()
+        if which in ("wardrobe", "shoes", "props"):
+            return f[which]
+        return ", ".join(f[k] for k in ("wardrobe", "shoes") if f[k])   # full outfit
+
+    def _go(self, action):
+        f = self.fields()
+        if action == "char" and not f["identity"] and not f["wardrobe"]:
+            cmds.inViewMessage(amg="Describe the character (or auto-fill from a photo).",
+                               pos="midCenter", fade=True)
+            return
+        if action == "item" and not self.item_desc(self.item_choice(), f):
+            cmds.inViewMessage(amg="That item section is empty — fill it first.",
+                               pos="midCenter", fade=True)
+            return
+        self._action = action
+        _HUMAN_LAST.update(f)
+        self.accept()
+
+    def _restore(self):
+        if _HUMAN_LAST:
+            self.f_identity.setPlainText(_HUMAN_LAST.get("identity", ""))
+            self.f_wardrobe.setPlainText(_HUMAN_LAST.get("wardrobe", ""))
+            self.f_shoes.setPlainText(_HUMAN_LAST.get("shoes", ""))
+            self.f_props.setPlainText(_HUMAN_LAST.get("props", ""))
+
+    def _clear_fields(self):
+        for fld in (self.f_identity, self.f_wardrobe, self.f_shoes, self.f_props):
+            fld.clear()
+        self._photo = None
+        self.thumb.clear()
+        self.thumb.setText("(no photo)")
+        _HUMAN_LAST.clear()                # so reopening starts fresh too
+
+
+def open_seed_character():
+    """Seed Character Generator. Grey-bg character sheets (2x2 / 2x3), a game A-pose
+    turnaround for 3D, and per-item ghost-mannequin sheets, all via Seedream
+    Text-to-Image. Results land in the Dream Gallery."""
+    if not _scene_ok_to_proceed():
+        return
+    d = SeedCharacterDialog()
+    if not d.exec():
+        return
+    action = d.action()
+    if not action:
+        return
+    f = d.fields()
+    n = d.variations()
+    no_text = d.no_text()
+    grey = d.use_grey()
+    chosen_model = d.mp.model()                   # per-window model choice (Pro / Lite)
+    img_dir = _scene_images_dir()
+    scene = _scene_tag()
+
+    if action == "char":
+        look = _human_look_clause(**f)
+        template = d.template()
+        if template == "game":                       # 3D-ready A-pose turnaround, white bg
+            size = "3840x1600"                       # wide strip: front | side | back
+            model = chosen_model                     # picked model (Pro caps turnaround at 2K; Lite = 4K)
+            t2i = False
+            stem = scene + "_turnaround_dream"       # 'dream' -> gallery reloads it
+        else:
+            size = "2560x2560" if template == "2x2" else "3200x1800"
+            model = chosen_model                     # picked model (Pro caps sheet at 2K; Lite = 4K)
+            t2i = True
+            stem = scene + "_human_dream"            # 'dream' -> gallery reloads it
+        prompt = _human_sheet_prompt(template, look, no_text)
+        if not grey and template != "game":          # game turnaround is white by design
+            prompt = prompt.replace(_HUMAN_GREY, "Plain studio background, even soft "
+                                    "lighting, photorealistic.")
+    else:
+        item_desc = d.item_desc(d.item_choice(), f)
+        if not item_desc:
+            return
+        prompt = _item_sheet_prompt(item_desc, no_text)
+        if not grey:
+            prompt = prompt.replace(_HUMAN_GREY_ITEM, "Plain studio background, even "
+                                    "soft lighting, photorealistic.")
+        size = "3200x1800"
+        model = chosen_model                         # picked model
+        t2i = False
+        stem = scene + "_item_dream"                 # 'dream' -> gallery reloads it
+
+    def regen():
+        data, url = _seedream(prompt, None, size=size, return_url=True, model=model)
+        if _cancel_requested():
+            raise _Cancelled()
+        out = _unique_path(img_dir, stem)
+        with open(out, "wb") as fh:
+            fh.write(data)
+        return {"bytes": data, "path": out, "url": url, "prompt": prompt, "t2i": t2i}
+
+    gallery = _dream_gallery(regen, img_dir, n)
+    gallery.show()
+    gallery.raise_()
+    gallery.generate_batch()
 
 
 # =============================================================================
@@ -5891,6 +8449,8 @@ class TextureDialog(QtWidgets.QDialog):
         _add_dictate_button(hb, self.prompt)
         hb.addStretch(1)
         v.addLayout(hb)
+        self.mp = _ModelPicker(self)             # per-window model choice + note
+        v.addWidget(self.mp)
         note = QtWidgets.QLabel(
             "Generates albedo + roughness + normal (+ metalness) and wires them "
             "into a new OpenPBR shader on the object.")
@@ -5951,6 +8511,7 @@ def generate_texture():
     prompt = d.text()
     if not prompt:
         return
+    chosen_model = d.mp.model()                   # per-window model choice (Pro / Lite)
     dlg = _progress("Generating PBR map set (albedo / roughness / normal)...")
 
     # One folder per texture set: images/textures/<material>/<material>_<map>.png
@@ -5969,7 +8530,8 @@ def generate_texture():
         #    maps reference it for spatial alignment.
         albedo = _seedream(
             prompt + ", seamless tileable PBR base color albedo, flat even "
-            "lighting, no cast shadows, no specular highlights, top-down")
+            "lighting, no cast shadows, no specular highlights, top-down",
+            model=chosen_model)
         albedo_path = _save_map(albedo, "baseColor")
         albedo_ref = _asset_uri(albedo_path, "image/png")
 
@@ -5993,7 +8555,7 @@ def generate_texture():
         }
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-            futures = {k: pool.submit(_seedream, p, [albedo_ref])
+            futures = {k: pool.submit(_seedream, p, [albedo_ref], model=chosen_model)
                        for k, p in jobs.items()}
             results = {k: _save_map(f.result(), k) for k, f in futures.items()}
 
@@ -6141,13 +8703,33 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow(QtWidgets.QLabel("<b>Models &amp; endpoint</b>"))
         self.base_url = QtWidgets.QLineEdit(CONFIG.BASE_URL)
         form.addRow("Base URL", self.base_url)
-        self.seedream_model = QtWidgets.QLineEdit(CONFIG.SEEDREAM_MODEL)
-        self.seedream_model.setPlaceholderText("e.g. seedream model ID or ep-xxxx")
-        form.addRow("Seedream (image) model", self.seedream_model)
-        self.seedream_face_model = QtWidgets.QLineEdit(CONFIG.SEEDREAM_FACE_MODEL)
-        self.seedream_face_model.setPlaceholderText(
-            "Seedream 5.0 Lite -- required so AI faces (Text-to-Image) are animatable")
-        form.addRow("Seedream face model (T2I)", self.seedream_face_model)
+        # Each T2I/I2I window has a Model: dropdown (Pro / Lite); these two fields set
+        # the actual IDs it offers, and 'Default' sets which one it starts on.
+        self.seedream_pro_model = QtWidgets.QLineEdit(CONFIG.SEEDREAM_PRO_MODEL)
+        self.seedream_pro_model.setToolTip("Seedream 5.0 Pro ID (or an ep-... endpoint). "
+                                           "Best quality + precise editing; <=2K, <=10 refs.")
+        form.addRow("Seedream Pro model ID", self.seedream_pro_model)
+        self.seedream_lite_model = QtWidgets.QLineEdit(CONFIG.SEEDREAM_LITE_MODEL)
+        self.seedream_lite_model.setToolTip("Seedream 5.0 Lite ID. Up to 4K & 14 refs; "
+                                            "cheaper. Faces still animatable.")
+        form.addRow("Seedream Lite model ID", self.seedream_lite_model)
+        self.seedream_default = QtWidgets.QComboBox()
+        self.seedream_default.addItem("Seedream 5.0 Pro", "pro")
+        self.seedream_default.addItem("Seedream 5.0 Lite", "lite")
+        if CONFIG.SEEDREAM_MODEL == CONFIG.SEEDREAM_LITE_MODEL:
+            self.seedream_default.setCurrentIndex(1)
+        self.seedream_default.setToolTip("Which model each window's dropdown starts on. "
+                                         "You can still change it per generation.")
+        form.addRow("Default image model", self.seedream_default)
+        self.seedream_outfmt = QtWidgets.QComboBox()
+        self.seedream_outfmt.addItem("JPEG (lighter/faster)", "jpeg")
+        self.seedream_outfmt.addItem("PNG (lossless, heavy)", "png")
+        if CONFIG.SEEDREAM_OUTPUT_FORMAT == "png":
+            self.seedream_outfmt.setCurrentIndex(1)
+        self.seedream_outfmt.setToolTip("Output format for Pro & Lite. JPEG is much "
+                                        "lighter/faster (avoids timeouts); PNG is "
+                                        "lossless but heavy.")
+        form.addRow("Image output format (Pro / Lite)", self.seedream_outfmt)
         self.seedance_model = QtWidgets.QLineEdit(CONFIG.SEEDANCE_MODEL)
         self.seedance_model.setPlaceholderText("e.g. seedance model ID or ep-xxxx")
         form.addRow("Seedance (video) model", self.seedance_model)
@@ -6173,6 +8755,16 @@ class SettingsDialog(QtWidgets.QDialog):
         self.resolution.addItems(["480p", "720p", "1080p", "4k"])
         self.resolution.setCurrentText(CONFIG.VIDEO_RESOLUTION)
         form.addRow("Video resolution", self.resolution)
+        self.seedance_conc = QtWidgets.QSpinBox()
+        self.seedance_conc.setRange(1, 10)
+        self.seedance_conc.setValue(_video_cap())
+        self.seedance_conc.setToolTip(
+            "How many Seedance videos may generate at the same time. BytePlus caps "
+            "this per account: individual = 3, enterprise-verified = 10 (4k is always "
+            "1). A submit beyond the limit waits; a job beyond your account's REAL "
+            "limit is rejected by the API -- keep 3 unless your account is "
+            "enterprise-verified.")
+        form.addRow("Max concurrent Seedance jobs", self.seedance_conc)
         res_hint = QtWidgets.QLabel(
             "4k = 10-bit HDR-grade color, encoded in H.265 (HEVC). Only the base "
             "Seedance 2.0 model supports it (not Fast); some players may not play "
@@ -6198,14 +8790,23 @@ class SettingsDialog(QtWidgets.QDialog):
         self.refs.setValue(CONFIG.MAX_IMAGE_REFS)
         form.addRow("Max reference frames", self.refs)
 
-        self.ref_w = QtWidgets.QSpinBox(); self.ref_w.setRange(64, 4096)
-        self.ref_w.setValue(CONFIG.REF_WIDTH)
-        self.ref_h = QtWidgets.QSpinBox(); self.ref_h.setRange(64, 4096)
-        self.ref_h.setValue(CONFIG.REF_HEIGHT)
-        wh = QtWidgets.QHBoxLayout()
-        wh.addWidget(self.ref_w); wh.addWidget(QtWidgets.QLabel("x")); wh.addWidget(self.ref_h)
-        whw = QtWidgets.QWidget(); whw.setLayout(wh)
-        form.addRow("Reference render size", whw)
+        self.ref_size = QtWidgets.QComboBox()
+        self.ref_size.setToolTip("Resolution of the reference frames + playblast sent "
+                                 "to Seedance (the look + motion reference).")
+        _ref_presets = [("480p  (854 × 480)", (854, 480)),
+                        ("720p  (1280 × 720)", (1280, 720)),
+                        ("1080p (1920 × 1080)", (1920, 1080)),
+                        ("1440p (2560 × 1440)", (2560, 1440))]
+        _cur = (CONFIG.REF_WIDTH, CONFIG.REF_HEIGHT)
+        for _lbl, _wh in _ref_presets:
+            self.ref_size.addItem(_lbl, _wh)
+        if _cur not in [wh for _, wh in _ref_presets]:      # keep any custom saved value
+            self.ref_size.addItem("Custom ({} × {})".format(*_cur), _cur)
+        for _i in range(self.ref_size.count()):
+            if self.ref_size.itemData(_i) == _cur:
+                self.ref_size.setCurrentIndex(_i)
+                break
+        form.addRow("Playblast size", self.ref_size)
 
         self.bump_depth = QtWidgets.QDoubleSpinBox()
         self.bump_depth.setRange(0.0, 5.0)
@@ -6320,6 +8921,34 @@ class SettingsDialog(QtWidgets.QDialog):
         r2hint.setWordWrap(True); r2hint.setStyleSheet("color:#888;")
         form.addRow("", r2hint)
 
+        form.addRow(QtWidgets.QLabel("<b>Trusted Asset Library (digital characters)</b>"))
+        self.asset_ak = QtWidgets.QLineEdit(CONFIG.ASSET_AK)
+        self.asset_ak.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.asset_ak.setPlaceholderText("IAM Access Key  (blank = reuse TOS AK)")
+        form.addRow("Asset Library Access Key", self.asset_ak)
+        self.asset_sk = QtWidgets.QLineEdit(CONFIG.ASSET_SK)
+        self.asset_sk.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.asset_sk.setPlaceholderText("IAM Secret Key  (blank = reuse TOS SK)")
+        asset_reveal = QtWidgets.QCheckBox("show")
+        asset_reveal.toggled.connect(lambda on: (
+            self.asset_ak.setEchoMode(QtWidgets.QLineEdit.Normal if on
+                                      else QtWidgets.QLineEdit.Password),
+            self.asset_sk.setEchoMode(QtWidgets.QLineEdit.Normal if on
+                                      else QtWidgets.QLineEdit.Password)))
+        asrow = QtWidgets.QHBoxLayout()
+        asrow.addWidget(self.asset_sk, 1); asrow.addWidget(asset_reveal)
+        asw = QtWidgets.QWidget(); asw.setLayout(asrow)
+        form.addRow("Asset Library Secret Key", asw)
+        self.asset_host = QtWidgets.QLineEdit(CONFIG.ASSET_API_HOST)
+        self.asset_host.setPlaceholderText("ark.ap-southeast-1.byteplusapi.com")
+        form.addRow("Asset API host", self.asset_host)
+        ashint = QtWidgets.QLabel(
+            "For BYTEPLUS > Trusted Characters. AK/SK come from your BytePlus console "
+            "(IAM > Access Keys) and need Advanced Creation Rights activated. Leave "
+            "AK/SK blank to reuse the TOS keys above (same account).")
+        ashint.setWordWrap(True); ashint.setStyleSheet("color:#888;")
+        form.addRow("", ashint)
+
         form = _tab("Analytics && Webhook")
         form.addRow(QtWidgets.QLabel("<b>Usage analytics</b>"))
 
@@ -6376,18 +9005,24 @@ class SettingsDialog(QtWidgets.QDialog):
         CONFIG.API_KEY = self.api_key.text().strip()
         CONFIG.REMEMBER_API_KEY = self.remember.isChecked()
         CONFIG.BASE_URL = self.base_url.text().strip().rstrip("/")
-        CONFIG.SEEDREAM_MODEL = self.seedream_model.text().strip()
-        CONFIG.SEEDREAM_FACE_MODEL = self.seedream_face_model.text().strip()
+        CONFIG.SEEDREAM_PRO_MODEL = self.seedream_pro_model.text().strip()
+        CONFIG.SEEDREAM_LITE_MODEL = self.seedream_lite_model.text().strip()
+        # 'Default' picks which model the window dropdowns start on.
+        CONFIG.SEEDREAM_MODEL = (CONFIG.SEEDREAM_LITE_MODEL
+                                 if self.seedream_default.currentData() == "lite"
+                                 else CONFIG.SEEDREAM_PRO_MODEL)
+        CONFIG.SEEDREAM_FACE_MODEL = CONFIG.SEEDREAM_MODEL   # legacy fallback (windows pick per-use)
+        CONFIG.SEEDREAM_OUTPUT_FORMAT = self.seedream_outfmt.currentData()
         CONFIG.SEEDANCE_MODEL = self.seedance_model.text().strip()
         CONFIG.LLM_MODEL = self.llm_model.text().strip()
         CONFIG.SEED_CHAT_MODEL = self.seed_chat_model.text().strip()
         CONFIG.THREE_D_MODEL = self.three_d_model.text().strip()
         CONFIG.VIDEO_RESOLUTION = self.resolution.currentText()
+        CONFIG.SEEDANCE_MAX_CONCURRENT = int(self.seedance_conc.value())
         CONFIG.VIDEO_RATIO = self.ratio.currentText()
         CONFIG.IMAGE_RATIO = self.image_ratio.currentText()
         CONFIG.MAX_IMAGE_REFS = self.refs.value()
-        CONFIG.REF_WIDTH = self.ref_w.value()
-        CONFIG.REF_HEIGHT = self.ref_h.value()
+        CONFIG.REF_WIDTH, CONFIG.REF_HEIGHT = self.ref_size.currentData()
         CONFIG.BUMP_DEPTH = self.bump_depth.value()
         CONFIG.COLOR_MANAGE = self.color_manage.isChecked()
         CONFIG.SHOW_COST = self.show_cost.isChecked()
@@ -6404,6 +9039,9 @@ class SettingsDialog(QtWidgets.QDialog):
         CONFIG.R2_ACCESS_KEY = self.r2_ak.text().strip()
         CONFIG.R2_SECRET_KEY = self.r2_sk.text().strip()
         CONFIG.R2_BUCKET = self.r2_bucket.text().strip()
+        CONFIG.ASSET_AK = self.asset_ak.text().strip()
+        CONFIG.ASSET_SK = self.asset_sk.text().strip()
+        CONFIG.ASSET_API_HOST = self.asset_host.text().strip() or CONFIG.ASSET_API_HOST
         # Telemetry is always on (CONFIG.TELEMETRY) and the analytics backend
         # (PostHog host/key/bucket/callback) is a build-time constant -- not
         # exposed in the UI. The only analytics control we save is Developer mode.
@@ -6679,12 +9317,14 @@ def show_usage():
     # --- global totals section ---------------------------------------------
     g_head = QtWidgets.QLabel("<b>Totals on this machine</b>")
     v.addWidget(g_head)
-    summary = ("Image generations (incl. texture maps):  {images}\n"
-               "Texture sets:                             {textures}\n"
-               "Videos generated:                         {videos}\n"
-               "Auto-prompt LLM calls:                    {llm}\n"
-               "Tokens  in {tokens_in:,}  ·  out {tokens_out:,}  ·  "
-               "total {tokens_total:,}").format(**u)
+    _rows = [("Image generations (incl. texture maps):", u.get("images", 0)),
+             ("Texture sets:", u.get("textures", 0)),
+             ("3D models generated:", u.get("models", 0)),
+             ("Videos generated:", u.get("videos", 0)),
+             ("Auto-prompt LLM calls:", u.get("llm", 0))]
+    summary = "\n".join("{}  {}".format(lbl.ljust(39), val) for lbl, val in _rows)
+    summary += ("\nTokens  in {tokens_in:,}  ·  out {tokens_out:,}  ·  "
+                "total {tokens_total:,}").format(**u)
     lbl = QtWidgets.QLabel(summary)
     lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
     v.addWidget(lbl)
@@ -6695,8 +9335,8 @@ def show_usage():
     projects = u.get("projects") or {}
     rows = sorted(projects.items(),
                   key=lambda kv: kv[1].get("tokens_total", 0), reverse=True)
-    tbl = QtWidgets.QTableWidget(len(rows), 5)
-    tbl.setHorizontalHeaderLabels(["Project", "Imgs", "Vids", "Tex", "Tokens"])
+    tbl = QtWidgets.QTableWidget(len(rows), 6)
+    tbl.setHorizontalHeaderLabels(["Project", "Imgs", "Vids", "Tex", "3D", "Tokens"])
     tbl.verticalHeader().setVisible(False)
     tbl.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
     tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -6705,7 +9345,7 @@ def show_usage():
     for r, (name, pb) in enumerate(rows):
         vals = [name,
                 str(pb.get("images", 0)), str(pb.get("videos", 0)),
-                str(pb.get("textures", 0)),
+                str(pb.get("textures", 0)), str(pb.get("models", 0)),
                 "{:,}".format(pb.get("tokens_total", 0))]
         for c, text in enumerate(vals):
             it = QtWidgets.QTableWidgetItem(text)
@@ -6895,13 +9535,15 @@ _SEED_CHAT_SYSTEM = (
     "You can: (1) answer technical questions about the BytePlus ModelArk platform "
     "and its models (act as 'Model Genius'); (2) write and repair image/video "
     "prompts; (3) describe or critique images the user attaches; (4) give creative "
-    "and technical direction for their Maya renders.\n\n"
+    "and technical direction for their Maya renders; (5) explain HOW TO USE this "
+    "BYTEPLUS plugin — its menu items and workflows (guide below).\n\n"
     "GROUNDED FACTS (BytePlus ModelArk, region ap-southeast-1, base URL "
     "https://ark.ap-southeast.bytepluses.com/api/v3):\n"
-    "- IMAGE = Seedream (flagship 'seedream-5-0-260128', plus -lite, "
-    "'seedream-4-5-251128', 'seedream-4-0-250828'). Sync endpoint "
-    "/images/generations. Up to 14 reference images; prompts in ENGLISH under 600 "
-    "words; sizes 2K/3K/4K or exact WxH pixels; watermark defaults TRUE.\n"
+    "- IMAGE = Seedream. Flagship 'dola-seedream-5-0-pro-260628' (5.0 Pro: best "
+    "quality + precise editing + animatable faces; output <=4.19M px / 2048x2048, up "
+    "to 10 refs, png output). Also 'seedream-5-0-lite-260128' (up to 4K & 14 refs, "
+    "used for the large Seed Character sheets), 4-5, 4-0. The plugin defaults to 5.0 "
+    "Pro. Sync endpoint /images/generations; prompts in ENGLISH under 600 words.\n"
     "- VIDEO = Seedance 2.0 ('dreamina-seedance-2-0-260128' base, plus -fast and "
     "-mini-260615). Async /contents/generations/tasks. 480p/720p/1080p/4k (1080p & "
     "4k = base model only), 4-15 s, 24 fps, up to 9 reference images. Prompt "
@@ -6916,9 +9558,49 @@ _SEED_CHAT_SYSTEM = (
     "- COMPLIANCE: real human faces are NEVER allowed as references. AI-generated "
     "people are only allowed via the Seedream text-to-image 'Trusted Output' path "
     "on the same account.\n\n"
-    "The plugin's BYTEPLUS menu already offers: Render with Seedance, Dream with "
-    "Seedream, Dream/Video galleries, Generate Texture, and Settings. When the user "
-    "wants an image, offer to hand an optimized prompt to 'Dream'.\n\n"
+    "HOW TO USE THE PLUGIN (the BYTEPLUS menu, current build). Recommend the right "
+    "item + the steps:\n"
+    "- Render with Seedance 2.0: your ANIMATED 3D scene -> AI video (renders keyframes "
+    "for look + a playblast for motion). Faithful motion needs hosting (see below).\n"
+    "- Dream with Seedreams 5.0: current VIEWPORT + prompt -> image (image-to-image). "
+    "Modes: 'Dream AROUND' (finish the scene) or 'Layout only' (keep composition, look "
+    "from text). Optional Extra reference to inject a subject.\n"
+    "- Text to Image: pure PROMPT -> image, NO viewport. Uses Seedream 5.0 Pro "
+    "(face-safe, Seedance-trusted) -> its AI human faces are animatable. Use it for "
+    "characters/portraits you'll animate.\n"
+    "- Image to Image: 1-14 REFERENCE images + prompt -> one composited render (a "
+    "layout + materials + products). Reference them as 'Image 1, Image 2...'. Also the "
+    "way to LOCK a character: add an approved clean view as a reference.\n"
+    "- Layout -> Still: the VIEWPORT locks composition AND each pose; describe only the "
+    "LOOK in text; don't add a competing reference. Best to match a blocked scene.\n"
+    "- Seed Character: describe a character (or auto-fill from a photo) -> grey "
+    "character sheets (2x2 = 4 angles / 2x3 = 4 + 2 close-ups), a 'Game A-pose "
+    "turnaround' for 3D, and item sheets (clothes/props). The photo is only DESCRIBED, "
+    "never copied.\n"
+    "- Seed 3D: text or image -> 3D asset imported into Maya. Image->3D wants 1-5 "
+    "SEPARATE clean views (NOT a composited sheet). Tick 'Game-ready' for TAPose+PBR+"
+    "Quad (riggable).\n"
+    "- Blockout from image: rough primitive layout from a reference image, to guide "
+    "Dream/animation.\n"
+    "- Seed Assistant: an agent that inspects/automates the Maya scene; it runs code "
+    "ONLY after the user approves it.\n"
+    "- Generate Texture: prompt -> texture wired into a new OpenPBR shader.\n"
+    "- Open Dream/Video Gallery: browse; Refine/Regenerate/Compare/Animate; arrow keys "
+    "navigate; Ctrl/Shift-click to multi-select then Delete.\n"
+    "- Set up motion hosting: one-time Cloudflare R2 wizard so Render/Animate send the "
+    "playblast as a faithful motion reference.\n"
+    "- Settings / Usage / Report a Bug / About / Diagnostics.\n\n"
+    "KEY WORKFLOWS:\n"
+    "- Game character for 3D: Seed Character -> 'Game A-pose turnaround' -> right-click "
+    "it in the Dream Gallery -> 'Send to Seed 3D - split turnaround' -> game-ready mesh. "
+    "Never feed a whole sheet to Seed 3D (it models the flat sheet).\n"
+    "- Animate an AI person: make the still with Text to Image (face-safe), then Dream "
+    "Gallery -> Animate within ~24h. Viewport/Refine/imported faces are rejected unless "
+    "the account has KYC HIGH.\n"
+    "- Keep the SAME character across generations (Seedream 5.0 has NO seed): reuse an "
+    "approved clean view as a reference in Image to Image.\n"
+    "When the user wants an image, offer to hand an optimized prompt to Text to Image "
+    "(or Dream for a viewport shot).\n\n"
     "STYLE: be concise and practical. Reply in the user's language (they may write "
     "Spanish), BUT any prompt you produce for Seedream/Seedance must be in ENGLISH. "
     "If you are unsure of an exact ID, parameter, price or limit, say so rather "
@@ -7309,13 +9991,15 @@ def _extract_3d_archive(out: str, fmt: str) -> str:
 
 
 def _seed3d_generate(prompt, fmt="usdz", material="PBR", mesh_mode="Quad",
-                     quality="", hd=False, images=None) -> bytes:
+                     quality="", hd=False, images=None, tapose=False) -> bytes:
     """Submit a text->3D or image->3D job and poll until done; return the model-file
     bytes. NETWORK ONLY -- call from a _Worker, never the Maya UI thread.
 
     `images` (0-5 local paths or http URLs) switches on Image->3D: each is attached
     as an image_url part (local files -> base64, http URLs pass through). Output
-    params are appended to the text as `--flags` (the API's loose-validation form)."""
+    params are appended to the text as `--flags` (the API's loose-validation form).
+    `tapose` -> `--TAPose true`: enforces standard T/A-pose binding for humanoids
+    (game-ready, riggable)."""
     text = prompt.strip()
     text += " --material {} --mesh_mode {} --fileformat {}".format(
         material, mesh_mode, fmt)
@@ -7323,6 +10007,8 @@ def _seed3d_generate(prompt, fmt="usdz", material="PBR", mesh_mode="Quad",
         text += " --subdivisionlevel {}".format(quality)
     if hd:
         text += " --addons HighPack --hd_texture true"
+    if tapose:
+        text += " --TAPose true"
 
     content = [{"type": "text", "text": text}]
     for src in (images or [])[:5]:                # Image->3D accepts 1-5 images
@@ -7445,7 +10131,8 @@ def _enhance_3d_prompt(text: str) -> str:
 class Seed3DDialog(QtWidgets.QDialog):
     """Collects a Text->3D or Image->3D request (prompt/image + output params)."""
 
-    def __init__(self, parent=None, initial_prompt=None):
+    def __init__(self, parent=None, initial_prompt=None, initial_images=None,
+                 game_ready=False):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Seed 3D")
         self.setMinimumSize(560, 560)
@@ -7526,6 +10213,10 @@ class Seed3DDialog(QtWidgets.QDialog):
         form.addRow("Detail", self.quality)
         self.hd = QtWidgets.QCheckBox("4K textures (HighPack)")
         form.addRow("", self.hd)
+        self.tapose = QtWidgets.QCheckBox("Game-ready: T/A-pose binding (humanoids)")
+        self.tapose.setToolTip("Adds --TAPose true so a humanoid mesh is bound in a "
+                               "standard T/A-pose (riggable). Best with PBR + Quad.")
+        form.addRow("", self.tapose)
         v.addLayout(form)
 
         hint = QtWidgets.QLabel(
@@ -7545,6 +10236,16 @@ class Seed3DDialog(QtWidgets.QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
+
+        # Pre-load (e.g. from Seed Character's game turnaround -> split views).
+        if initial_images:
+            self.mode_image.setChecked(True)
+            self._images = list(initial_images)[:5]
+            self._refresh_img()
+        if game_ready:
+            self.tapose.setChecked(True)
+            self.material.setCurrentText("PBR")
+            self.mesh.setCurrentText("Quad")
         self._sync_mode()                     # hide the image row in Text mode
 
     def prompt_text(self):
@@ -7644,15 +10345,19 @@ class Seed3DDialog(QtWidgets.QDialog):
             "fmt": self.fmt.currentText(),
             "quality": "" if q.startswith("(") else q,
             "hd": self.hd.isChecked(),
+            "tapose": self.tapose.isChecked(),
         }
 
 
-def open_seed_3d(initial_prompt=None):
+def open_seed_3d(initial_prompt=None, initial_images=None, game_ready=False):
     """Open Seed 3D (Text->3D or Image->3D): collect intent, then generate +
-    import async. `initial_prompt` pre-fills the prompt (used by Seed Chat)."""
+    import async. `initial_prompt` pre-fills the prompt (used by Seed Chat).
+    `initial_images` pre-loads Image->3D references (e.g. Seed Character's split
+    game turnaround); `game_ready` pre-ticks TAPose + PBR + Quad."""
     if not _scene_ok_to_proceed():
         return
-    d = Seed3DDialog(initial_prompt=initial_prompt)
+    d = Seed3DDialog(initial_prompt=initial_prompt, initial_images=initial_images,
+                     game_ready=game_ready)
     if not d.exec():
         return
     p = d.params()
@@ -7671,7 +10376,7 @@ def open_seed_3d(initial_prompt=None):
     worker = _Worker(
         lambda: _seed3d_generate(prompt, fmt=fmt, material=p["material"],
                                  mesh_mode=p["mesh_mode"], quality=p["quality"],
-                                 hd=p["hd"], images=images),
+                                 hd=p["hd"], images=images, tapose=p["tapose"]),
         parent=_main_window())
     worker.done.connect(lambda data: (dlg.close(),
                                       _save_and_import_3d(data, fmt, prompt or "image-to-3d")))
@@ -8035,6 +10740,373 @@ def open_seed_assistant():
 
 
 # =============================================================================
+# Blockout from image -- rough primitive layout from a reference image
+# -----------------------------------------------------------------------------
+# Seed 2.0 (visual grounding) returns the main objects + normalized boxes + a depth
+# tier + a suggested primitive. We place base primitives on a floor at 2-3 depth
+# tiers so the viewport composition approximates the image -- a controllable GUIDE
+# the artist tweaks, then feeds to Dream (image-to-image). It is 2.5D (depth is
+# estimated, not measured); boxes are approximate. Deterministic geometry (no code
+# execution), wrapped in one undo chunk.
+# =============================================================================
+
+_BLOCKOUT_SYSTEM = (
+    "You are a layout analyzer for a 3D blockout tool. List EVERY distinct object "
+    "SEPARATELY for a primitive blockout: each furniture piece, each plant, EACH "
+    "framed picture/artwork, each lamp, the TV, each window, the rug, and notable "
+    "props. Do NOT merge or group items (list each frame, not 'wall art'; list each "
+    "sofa section if clearly separate). Aim for 10-25 objects when the scene is busy. "
+    "Output ONLY: "
+    '{"objects":[{"label":str,"box":[x0,y0,x1,y1],"depth":"foreground|mid|background",'
+    '"primitive":"box|plane|cylinder|capsule|sphere|cone","on_wall":true|false}]}. '
+    "box NORMALIZED 0..1, origin TOP-LEFT (x right, y down). primitive: sofa/table/"
+    "cabinet=box, person/plant-stem=cylinder, pot/ball=sphere, tv/picture/window/"
+    "poster=plane with on_wall=true. Include the floor as ONE plane. No prose, no "
+    "markdown fences.")
+
+
+def _blockout_analyze(image_uri: str) -> list:
+    """Ask Seed 2.0 for the image's object layout (boxes + depth + primitive).
+    Returns a list of object dicts. NETWORK ONLY -- call from a _Worker."""
+    txt = _chat([{"role": "user", "content": [
+        {"type": "text", "text": "Analyze this image for a 3D primitive blockout."},
+        {"type": "image_url", "image_url": {"url": image_uri}}]}],
+        system=_BLOCKOUT_SYSTEM)
+    s = (txt or "").strip()
+    if s.startswith("```"):                          # strip accidental markdown fences
+        s = s.strip("`")
+    a, b = s.find("{"), s.rfind("}")
+    if a < 0 or b < 0:
+        raise RuntimeError("Model did not return a JSON layout:\n" + txt)
+    data = json.loads(s[a:b + 1])
+    return [o for o in (data.get("objects") or [])
+            if isinstance(o.get("box"), (list, tuple)) and len(o["box"]) == 4]
+
+
+class _BlockoutPreviewDialog(QtWidgets.QDialog):
+    """Checkable list of detected objects -- uncheck any to skip before building."""
+
+    def __init__(self, objects, parent=None):
+        super().__init__(parent or _main_window())
+        self.setWindowTitle("BYTEPLUS - Blockout preview")
+        self.setMinimumSize(420, 380)
+        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self._objects = objects
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(QtWidgets.QLabel(
+            "Detected {} objects. Uncheck any to skip, then create the "
+            "blockout:".format(len(objects))))
+        self.listw = QtWidgets.QListWidget()
+        for o in objects:
+            it = QtWidgets.QListWidgetItem("{}   ·   {}   ·   {}".format(
+                o.get("label", "?"), o.get("primitive", "box"), o.get("depth", "mid")))
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Checked)
+            self.listw.addItem(it)
+        v.addWidget(self.listw, 1)
+        mrow = QtWidgets.QHBoxLayout()
+        mrow.addWidget(QtWidgets.QLabel("Placement:"))
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItem("Camera-matched (looks like the photo)", "camera")
+        self.mode_combo.addItem("Floor layout (3D stage)", "floor")
+        self.mode_combo.setToolTip(
+            "Camera-matched: cards placed so the blockout camera frames them like the "
+            "photo — best to guide animation / a Dream reference.\nFloor layout: "
+            "objects stood on a floor + back wall (a 3D diorama).")
+        mrow.addWidget(self.mode_combo, 1)
+        v.addLayout(mrow)
+        self.cb_project = QtWidgets.QCheckBox("Project the photo onto the blocks (2.5D matte)")
+        self.cb_project.setToolTip(
+            "Camera-project the reference image onto the geometry from blockout_cam, "
+            "so the blocks show the photo (press 6 for textured view). Great for "
+            "parallax / animation guides. Best with 'Camera-matched'.")
+        v.addWidget(self.cb_project)
+        tip = QtWidgets.QLabel(
+            "Rough guide (estimated depth). Adjust blocks/camera, then Dream / animate "
+            "through 'blockout_cam'.")
+        tip.setWordWrap(True); tip.setStyleSheet("color:#888;")
+        v.addWidget(tip)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.button(QtWidgets.QDialogButtonBox.Ok).setText("Create blockout")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def selected(self):
+        return [o for i, o in enumerate(self._objects)
+                if self.listw.item(i).checkState() == QtCore.Qt.Checked]
+
+    def mode(self):
+        return self.mode_combo.currentData()
+
+    def project(self):
+        return self.cb_project.isChecked()
+
+
+_GROUND_WORDS = ("ground", "floor", "water", "river", "sea", "ocean", "sky", "grass",
+                 "road", "sand", "shore", "lake", "wall", "ceiling", "backdrop")
+
+
+def _build_blockout(objects):
+    """MAIN THREAD: create a floor + back wall, then one primitive per object.
+    Wall-mounted items (on_wall) become vertical cards on the back wall placed by
+    image Y; everything else stands on the floor placed by image X + depth tier.
+    Adds a framing camera. Returns the group node."""
+    STAGE_W, SCENE_H, DEPTH = 20.0, 8.0, 18.0
+    tier_z = {"foreground": -0.12 * DEPTH, "mid": -0.5 * DEPTH,
+              "background": -0.85 * DEPTH}
+    WALL_Z = -DEPTH + 0.25
+    grp = cmds.group(empty=True, name="blockout_grp")
+
+    floor = cmds.polyPlane(w=STAGE_W * 1.8, h=DEPTH * 1.4, sx=1, sy=1, name="bo_floor")[0]
+    cmds.move(0, 0, -DEPTH * 0.5, floor)
+    cmds.parent(floor, grp)
+    wall = cmds.polyPlane(w=STAGE_W * 1.8, h=SCENE_H * 1.5, sx=1, sy=1, name="bo_backwall")[0]
+    cmds.setAttr(wall + ".rotateX", 90)
+    cmds.move(0, SCENE_H * 0.5, -DEPTH, wall)
+    cmds.parent(wall, grp)
+
+    for o in objects:
+        try:
+            label = _safe_name(str(o.get("label") or "obj"))
+            prim = str(o.get("primitive") or "box").lower()
+            low = str(o.get("label") or "").lower()
+            x0, y0, x1, y1 = [float(v) for v in o.get("box")]
+        except Exception:
+            continue
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        bw, bh = max(0.02, x1 - x0), max(0.02, y1 - y0)
+        depth = str(o.get("depth") or "mid").lower()
+        wx = (cx - 0.5) * STAGE_W
+        w = max(0.3, bw * STAGE_W)
+        h = max(0.3, bh * SCENE_H)
+        on_wall = bool(o.get("on_wall")) or (
+            prim == "plane" and depth == "background" and cy < 0.55)
+
+        # environment planes (floor/ground/water/sky/wall) are covered by floor+wall
+        if prim == "plane" and not on_wall and any(k in low for k in _GROUND_WORDS):
+            continue
+
+        if on_wall:                                   # TV / framed art / window / curtains
+            node = cmds.polyPlane(w=w, h=h, sx=1, sy=1, name=label)[0]
+            cmds.setAttr(node + ".rotateX", 90)
+            cmds.move(wx, (1.0 - cy) * SCENE_H, WALL_Z, node)   # image-Y -> wall height
+            cmds.parent(node, grp)
+            continue
+
+        ty = h / 2.0
+        wz = tier_z.get(depth, tier_z["mid"])
+        if prim in ("capsule", "cylinder"):
+            node = cmds.polyCylinder(r=max(0.15, w / 2.0), h=h, name=label)[0]
+        elif prim == "sphere":
+            r = max(0.12, max(w, h) / 2.0)
+            node = cmds.polySphere(r=r, name=label)[0]
+            ty = r
+        elif prim == "cone":
+            node = cmds.polyCone(r=max(0.15, w / 2.0), h=h, name=label)[0]
+        elif prim == "plane":                         # a flat item on the floor (a rug)
+            node = cmds.polyCube(w=w, h=0.05, d=max(0.5, bh * DEPTH), name=label)[0]
+            ty = 0.03
+        else:                                         # box (sofa, table, cabinet)
+            node = cmds.polyCube(w=w, h=h, d=max(0.4, w * 0.6), name=label)[0]
+        cmds.move(wx, ty, wz, node)
+        cmds.parent(node, grp)
+
+    cam = cmds.camera(name="blockout_cam")[0]
+    cmds.move(0, SCENE_H * 0.55, DEPTH * 0.6, cam)
+    cmds.rotate(-10, 0, 0, cam)
+    cmds.parent(cam, grp)
+    try:
+        cmds.lookThru(cam)                            # frame the viewport on the blockout
+    except Exception:
+        pass
+    cmds.select(grp)
+    return grp
+
+
+def _build_blockout_camera(objects, aspect):
+    """MAIN THREAD: CAMERA-MATCHED 2.5D. Each object is placed as a card/block so
+    that THROUGH the blockout camera it sits where it is in the image (same
+    composition), at 2-3 depth tiers for parallax. Best for guiding animation / a
+    Dream reference that matches the shot. Returns the group node."""
+    import math
+    fov_y = math.radians(45.0)
+    ty2 = math.tan(fov_y / 2.0)
+    tx2 = aspect * ty2                                # square pixels: hfov from aspect
+    tiers = {"foreground": 10.0, "mid": 15.0, "background": 22.0}
+    grp = cmds.group(empty=True, name="blockout_grp")
+
+    for o in objects:
+        try:
+            label = _safe_name(str(o.get("label") or "obj"))
+            prim = str(o.get("primitive") or "box").lower()
+            low = str(o.get("label") or "").lower()
+            x0, y0, x1, y1 = [float(v) for v in o.get("box")]
+        except Exception:
+            continue
+        # skip full-frame environment planes -- they'd blanket the whole shot
+        if prim == "plane" and not bool(o.get("on_wall")) and \
+                any(k in low for k in _GROUND_WORDS):
+            continue
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        bw, bh = max(0.01, x1 - x0), max(0.01, y1 - y0)
+        d = tiers.get(str(o.get("depth") or "mid").lower(), tiers["mid"])
+        hx, hy = d * tx2, d * ty2
+        wx = (cx * 2.0 - 1.0) * hx                    # image center -> world, at depth d
+        wy = (1.0 - cy * 2.0) * hy                    # flip Y (image y is down)
+        w = max(0.1, bw * 2.0 * hx)
+        h = max(0.1, bh * 2.0 * hy)
+        if prim == "plane" or bool(o.get("on_wall")):
+            node = cmds.polyPlane(w=w, h=h, sx=1, sy=1, name=label)[0]
+            cmds.setAttr(node + ".rotateX", 90)       # stand the card up, facing +Z
+        elif prim in ("cylinder", "capsule"):
+            node = cmds.polyCylinder(r=max(0.05, w / 2.0), h=h, name=label)[0]
+        elif prim == "sphere":
+            node = cmds.polySphere(r=max(0.05, max(w, h) / 2.0), name=label)[0]
+        elif prim == "cone":
+            node = cmds.polyCone(r=max(0.05, w / 2.0), h=h, name=label)[0]
+        else:
+            node = cmds.polyCube(w=w, h=h, d=max(0.3, min(w, h) * 0.8), name=label)[0]
+        cmds.move(wx, wy, -d, node)
+        cmds.parent(node, grp)
+
+    cam_t, cam_s = cmds.camera(name="blockout_cam")   # at origin, looking -Z
+    vfa = 1.0
+    cmds.setAttr(cam_s + ".verticalFilmAperture", vfa)
+    cmds.setAttr(cam_s + ".horizontalFilmAperture", vfa * aspect)
+    cmds.setAttr(cam_s + ".focalLength", (vfa * 25.4) / (2.0 * ty2))
+    cmds.setAttr(cam_s + ".displayResolution", 1)     # show the frame in the viewport
+    cmds.xform(cam_t, worldSpace=True, translation=(0, 0, 0), rotation=(0, 0, 0))
+    cmds.parent(cam_t, grp)
+    try:
+        cmds.setAttr("defaultResolution.width", 1920)
+        cmds.setAttr("defaultResolution.height", int(round(1920 / max(0.1, aspect))))
+        cmds.setAttr("defaultResolution.deviceAspectRatio", aspect)
+    except Exception:
+        pass
+    try:
+        cmds.lookThru(cam_t)
+    except Exception:
+        pass
+    cmds.select(grp)
+    return grp
+
+
+def _project_image_on_blockout(mesh_shapes, image_path, cam_transform):
+    """Camera-project the reference image onto the blockout meshes FROM blockout_cam,
+    so the grey blocks show the photo (press 6 for textured view). A flat
+    surfaceShader shows the image unlit, like a 2.5D matte painting. Best-effort --
+    the caller wraps this in try/except so a failure leaves the geometry intact."""
+    cam_shape = (cmds.listRelatives(cam_transform, shapes=True, type="camera")
+                 or [None])[0]
+    f = cmds.shadingNode("file", asTexture=True, name="blockout_ref_file")
+    cmds.setAttr(f + ".fileTextureName", image_path.replace(os.sep, "/"), type="string")
+    proj = cmds.shadingNode("projection", asTexture=True, name="blockout_projection")
+    cmds.connectAttr(f + ".outColor", proj + ".image", force=True)
+    cmds.setAttr(proj + ".projType", 8)               # 8 = Perspective
+    place = cmds.shadingNode("place3dTexture", asUtility=True, name="blockout_proj_place")
+    cmds.connectAttr(place + ".worldInverseMatrix[0]", proj + ".placementMatrix",
+                     force=True)
+    try:
+        cmds.matchTransform(place, cam_transform)     # projection frustum = the camera
+    except Exception:
+        pass
+    if cam_shape:                                     # perspective FOV comes from the cam
+        try:
+            cmds.connectAttr(cam_shape + ".message", proj + ".linkedCamera", force=True)
+        except Exception:
+            pass
+    sh = cmds.shadingNode("surfaceShader", asShader=True, name="blockout_proj_mat")
+    cmds.connectAttr(proj + ".outColor", sh + ".outColor", force=True)
+    sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True,
+                   name="blockout_proj_SG")
+    cmds.connectAttr(sh + ".outColor", sg + ".surfaceShader", force=True)
+    cmds.sets(mesh_shapes, forceElement=sg)
+    return sh
+
+
+def blockout_from_image(src):
+    """Analyze an image (local path or http URL) and build a primitive blockout in
+    the scene. Entry point for the menu item and the gallery right-click."""
+    if not _scene_ok_to_proceed():
+        return
+    uri = src if (isinstance(src, str) and src.startswith("http")) \
+        else _data_uri(src, _image_mime(src))
+    aspect = 16.0 / 9.0                               # image aspect (camera-matched mode)
+    image_path = src if (isinstance(src, str) and os.path.isfile(src)) else None
+    try:
+        if image_path:
+            pm = QtGui.QPixmap(image_path)
+            if pm.width() and pm.height():
+                aspect = pm.width() / float(pm.height())
+    except Exception:
+        pass
+    dlg = _progress("Analyzing image for blockout...")
+    worker = _Worker(lambda: _blockout_analyze(uri), parent=_main_window())
+
+    def done(objects):
+        dlg.close()
+        if not objects:
+            _error("No objects were detected in the image.")
+            return
+        prev = _BlockoutPreviewDialog(objects)
+        if not prev.exec():
+            return
+        sel = prev.selected()
+        if not sel:
+            return
+        mode = prev.mode()
+        project_on = prev.project()
+        cmds.undoInfo(openChunk=True)
+        try:
+            grp = (_build_blockout_camera(sel, aspect) if mode == "camera"
+                   else _build_blockout(sel))
+            if project_on:                            # camera-project the photo onto it
+                try:
+                    ip = image_path
+                    if not ip and isinstance(src, str) and src.startswith("http"):
+                        import tempfile
+                        ip = os.path.join(tempfile.gettempdir(),
+                                          "byteplus_blockout_ref.png")
+                        with open(ip, "wb") as fh:
+                            fh.write(_get_bytes(src))
+                    cams = cmds.listRelatives(grp, allDescendents=True,
+                                              type="camera") or []
+                    cam_t = cmds.listRelatives(cams[0], parent=True)[0] if cams else None
+                    meshes = cmds.listRelatives(grp, allDescendents=True,
+                                                type="mesh") or []
+                    if ip and cam_t and meshes:
+                        _project_image_on_blockout(meshes, ip, cam_t)
+                except Exception:
+                    sys.stderr.write("[BYTEPLUS] blockout projection failed (geometry "
+                                     "kept):\n" + traceback.format_exc() + "\n")
+        except Exception:
+            _error("Could not build the blockout:\n\n" + traceback.format_exc())
+            return
+        finally:
+            cmds.undoInfo(closeChunk=True)
+        cmds.inViewMessage(
+            amg="BYTEPLUS: blockout created — press 6 for textured view; adjust, then "
+                "Dream / animate through 'blockout_cam'.",
+            pos="midCenter", fade=True)
+
+    worker.done.connect(done)
+    worker.failed.connect(lambda tb: (dlg.close(), _error(tb)))
+    worker.start()
+    blockout_from_image._w = worker                  # keep the QThread referenced
+
+
+def open_blockout():
+    """Pick an external image, then build a blockout (BYTEPLUS menu entry)."""
+    path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        _main_window(), "Pick an image to block out", "",
+        "Images (*.png *.jpg *.jpeg *.webp)")
+    if path:
+        blockout_from_image(path)
+
+
+# =============================================================================
 # Menu construction
 # =============================================================================
 def _safe(fn):
@@ -8064,8 +11136,24 @@ def install():
                   command=_safe(render_with_seedance))
     cmds.menuItem(label="Dream with Seedreams 5.0", parent=CONFIG.MENU_NAME,
                   image="out_imagePlane.png",
-                  annotation="Viewport snapshot + prompt -> generated image",
+                  annotation="Viewport snapshot + prompt -> generated image "
+                             "(image-to-image)",
                   command=_safe(dream_with_seedream))
+    cmds.menuItem(label="Text to Image", parent=CONFIG.MENU_NAME,
+                  image="out_imagePlane.png",
+                  annotation="Pure prompt -> image (no viewport). Face-safe Seedream "
+                             "Lite -> AI faces are animatable",
+                  command=_safe(dream_text_to_image))
+    cmds.menuItem(label="Image to Image", parent=CONFIG.MENU_NAME,
+                  image="out_imagePlane.png",
+                  annotation="1-14 reference images + prompt -> one composited render "
+                             "(image-to-image, no viewport)",
+                  command=_safe(compose_scene))
+    cmds.menuItem(label="Layout → Still", parent=CONFIG.MENU_NAME,
+                  image="out_imagePlane.png",
+                  annotation="Viewport locks the composition; describe the look -> "
+                             "matched photoreal still (A/B-verified layout lock)",
+                  command=_safe(layout_to_still))
     cmds.menuItem(label="Open Dream Gallery", parent=CONFIG.MENU_NAME,
                   image="fileOpen.png",
                   annotation="Browse / refine / animate previously generated images",
@@ -8084,6 +11172,21 @@ def install():
                   image="polyCube.png",
                   annotation="Generate a 3D asset from text or an image and import it",
                   command=_safe(open_seed_3d))
+    cmds.menuItem(label="Seed Character", parent=CONFIG.MENU_NAME,
+                  image="out_imagePlane.png",
+                  annotation="Character Generator: describe a character (person / creature "
+                             "/ robot) or a photo -> grey character sheets (2x2/2x3), a "
+                             "game A-pose turnaround for 3D, + prop/clothing sheets",
+                  command=_safe(open_seed_character))
+    cmds.menuItem(label="Trusted Characters", parent=CONFIG.MENU_NAME,
+                  image="out_imagePlane.png",
+                  annotation="Upload an AI character once → a permanent asset:// that "
+                             "Seedance trusts forever (no 24h expiry). Reuse it in Animate.",
+                  command=_safe(open_trusted_characters))
+    cmds.menuItem(label="Blockout from image", parent=CONFIG.MENU_NAME,
+                  image="polyPlane.png",
+                  annotation="Rough primitive layout from a reference image (a guide for Dream)",
+                  command=_safe(open_blockout))
     cmds.menuItem(label="Seed Assistant", parent=CONFIG.MENU_NAME,
                   image="commandButton.png",
                   annotation="Agent that inspects/automates your Maya scene "
