@@ -56,16 +56,20 @@ optionally share your details, or click **Stay anonymous**. It won't ask again.
 | Menu item | What it does |
 |---|---|
 | **Render with Seedance 2.0** | Renders your animated scene → 1080p AI video |
+| **Video GEN** | Full Seedance 2.0: Text→Video / Image→Video / First+Last frame / Multimodal, + model/resolution/ratio/duration/audio |
 | **Dream with Seedreams 5.0** | Viewport + prompt → generated concept image (image-to-image) |
 | **Text to Image** | Pure prompt → image, no viewport. Best for **AI people / faces** |
 | **Image to Image** | Combine 1–14 reference images (layout + materials + products) → one render |
 | **Layout → Still** | Viewport locks the composition; text describes the look → matched still |
 | **Open Dream Gallery** | Browse / refine / interactive-edit / compare / animate / blockout your images |
 | **Open Video Gallery** | Browse / open / edit / save your videos |
+| **Open Audio Gallery** | Browse / play / save your generated audio (voice / music / SFX) |
 | **Seed Chat** | Chat with Seed 2.0 — prompt help, describe images, ask Model Genius, how-to |
 | **Seed 3D** | Text or image → a 3D asset, imported into your scene |
+| **Seed Audio** | Generate voice / music / SFX (Seed Audio 1.0) — TTS, described voices, cloning |
 | **Seed Character** | Character generator — character sheets, a game A-pose turnaround, prop/clothing sheets |
-| **Trusted Characters** | Upload an AI character once → a **permanent** `asset://` you can animate forever |
+| **Trusted Characters** | Upload an AI character once → a **permanent** `asset://` you can animate forever (+ a reusable voice) |
+| **Dialogue Scene** | Multi-character spoken dialogue → Seedance video with synced voices (EN/ES/JA/ID/PT) |
 | **Blockout from image** | Rough primitive layout from a reference image (a guide for Dream) |
 | **Seed Assistant** | Agent that inspects/automates your scene (runs code only after you approve) |
 | **Generate Texture** | Prompt → texture wired into a new OpenPBR shader |
@@ -122,6 +126,29 @@ ones.*
 > hosting** once (see below) so the playblast can be sent as a reference. Keep the
 > **playblast length matched to a whole-second output duration** — otherwise
 > Seedance time-warps the motion.
+
+### 🎥 Video GEN
+The full **Seedance 2.0** generator in one window — every modality and parameter.
+1. **BYTEPLUS > Video GEN**.
+2. Pick a **Mode**:
+   - **Text → Video** — pure prompt.
+   - **Image → Video** — animate a start frame (from the gallery or a file).
+   - **First + Last frame** — a start **and** an end frame.
+   - **Multimodal** — 1–9 reference images (look / identity / props) + up to 3
+     reference videos (motion) + up to 3 character voices.
+3. Choose the **Model** (Base = 1080p/4k · Fast / Mini = 480/720, cheaper), plus
+   **Resolution**, **Aspect ratio**, **Duration** (or *Auto*), **Generate audio**,
+   **Watermark** and **Priority**.
+4. *(Optional)* tick **🎥 Use the scene's animation (playblast)** so the clip follows
+   your Maya camera/motion (Text→Video or Multimodal; needs motion hosting).
+5. Write the prompt (✦ Enhance; put spoken lines in "double quotes") and
+   **Generate** → the clip lands in the Video Gallery.
+
+![Video GEN](images/Video_Gen.jpg)
+
+> **Best practice:** prototype at 480p/720p (or Fast / Mini), lock the prompt, then
+> re-render at 1080p/4k on Base. External human faces are rejected — use trusted
+> images (Text to Image / Trusted Characters) for faces.
 
 ### 🌅 Dream with Seedreams 5.0
 Generate a concept image from your **viewport** + a text prompt (image-to-image).
@@ -332,6 +359,25 @@ Generate a **3D asset** from text or an image and import it into your scene.
 
 ![Seed 3D](images/Seed-3D.jpg)
 
+### 🔊 Seed Audio
+Generate **voice, music and sound effects** with **Seed Audio 1.0**, then reuse them
+in your videos.
+1. **BYTEPLUS > Seed Audio** (first paste your **Seed Audio API key** in
+   Settings > API & Models — it's a *separate* key from the Voice console).
+2. Pick a **mode**: 🎙️ **Voice / TTS**, 🎵 **Music & SFX**, or 👤 **Clone voice**
+   (from a reference clip).
+3. **Describe the voice in the prompt** — Seed Audio's strength, e.g. *"A warm
+   confident male narrator says: 'Welcome to the show.'"* Multi-character scripts in
+   one prompt are supported. Or pick a **preset voice** (optional) and **🔊 Preview**.
+4. Set format / pitch / speed / length and **Generate** → it plays and lands in the
+   **Audio Gallery**.
+
+![Seed Audio](images/Seed-Audio.jpg)
+
+> **Language:** Seed Audio currently generates **English & Chinese** (more coming).
+> Seedance video **dialogue** also speaks **Spanish / Japanese / Indonesian /
+> Portuguese** — see **Dialogue Scene** below.
+
 ### 🧍 Seed Character
 A dedicated **character generator** — people, creatures or robots — plus their
 props and clothing, on clean grey studio backgrounds.
@@ -378,12 +424,28 @@ Creation Rights** on your BytePlus account.)*
    permanent.
 4. In **Animate**, press **🎭 Trusted character** and pick it — it becomes the main
    image, permanently animatable.
+5. *(Optional)* give the character a **🎙️ voice** — **Generate voice…** (from its
+   image, a description, or a preset). The voice is reused for consistent dialogue.
 
 ![Trusted Characters](images/Trusted_Characters.jpg)
 
 > Real human faces are never allowed (AI-generated characters only). Uploading a
 > local image needs motion hosting (R2/TOS) configured; gallery images with a
 > fresh Seedream URL upload without it.
+
+### 🎭 Dialogue Scene
+Multi-character **spoken dialogue**, generated by Seedance 2.0 with synced lips.
+1. **BYTEPLUS > Dialogue Scene**.
+2. Build a **cast** (up to 3): **+ Add character** picks a **Trusted Character**
+   (its image + its voice, if it has one).
+3. Write the **script**, one line per character:
+   `@Ana: ¡Hola Danny! ¿Cómo estás?`  /  `@Danny: Muy bien, ¿y tú?`
+4. Optionally add a **Scene** line (setting / mood / camera), pick the duration, and
+   **Generate scene** → the clip lands in the Video Gallery.
+
+> **Works in Spanish** (and English / Japanese / Indonesian / Portuguese) — Seedance
+> speaks the lines directly. Give each character a voice in **Trusted Characters**
+> for a consistent timbre.
 
 ### 🧱 Blockout from image
 Turn a reference image into a **rough 3D primitive layout** — a controllable guide
