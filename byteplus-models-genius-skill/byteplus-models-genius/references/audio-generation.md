@@ -56,7 +56,7 @@ Use only one mode per request — do not mix.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `model` | string | Yes | `seed-audio-1.0` |
-| `text_prompt` | string | Yes | Prompt / text to synthesize. **Max 2048 characters.** |
+| `text_prompt` | string | Yes | Prompt / text to synthesize. **Max 3000 characters.** |
 | `references` | array | No | Reference resources. **Omit for text-only generation.** |
 | `audio_config` | object | No | Output audio configuration (see §6) |
 | `watermark` | object | No | Watermark config; an **empty object `{}` is accepted**. |
@@ -171,10 +171,44 @@ if "audio" in data:
 ## 9. Constraints & gotchas
 
 - **Wrong host** — must use `voice.ap-southeast-1.bytepluses.com`, not the ARK host.
-- **≤ 2048 characters** in `text_prompt`; for long scripts/audiobooks, split into chunks and stitch outputs.
+- **≤ 3000 characters** in `text_prompt`; for long scripts/audiobooks, split into chunks and stitch outputs.
 - **`@AudioN` ordering** must match the order of items in `references` — mis-ordering swaps voices.
 - **Never mix** image references with audio references in one request.
 - The returned `url` is **temporary (2 h)** — persist the Base64-decoded audio if you need long-term storage.
 - **Voiceprint safety:** if the API returns a sensitive voiceprint / voice-clone error, simplify the voice description and avoid references to real or distinctive real-person voices.
 - **Never hard-code API keys**; log request/response metadata for troubleshooting but **redact auth headers**.
 - Set client timeout to ~120 s (matches the max output length).
+
+---
+
+## 10. T2A & TA2A — prompt-driven audio + multi-role conversation (Audio 1.0's killer features)
+
+Beyond plain TTS and voice cloning, Audio 1.0 adds two **prompt-driven** modes no normal TTS has — the reason to use it for **audiobooks, video dubbing and games**.
+
+| Mode | You pass | You get |
+|---|---|---|
+| **T2A** (Text-prompt → Audio) | a rich `text_prompt` describing voices + environment + background music + SFX + the lines — **no references** | the model generates **voice(s) + music + sound effects together**, in one shot |
+| **TA2A** (Text-prompt + Audio → Audio) | the same rich prompt **plus up to 3 reference clips** (≤30 s each) for voice identity/emotion | same, but specific characters use the **referenced voices** |
+
+**Multi-role conversation in ONE prompt.** Write the whole script inline with a short voice description before each character's line; the model performs **all roles** with distinct voices and accurate emotion — no need to synthesize each line separately. This is what makes it ideal for dialogue/dubbing.
+
+### T2A prompt structure (include all five)
+1. **Environment** — weather / location / context ("after-school hallway, distant footsteps, locker clacks, reverb").
+2. **Background music / SFX** — genre + instruments + ambient sounds ("gentle jazz piano, brushed drums, accordion").
+3. **Character action / appearance** — (waving hands, playing soccer…).
+4. **Character voice** — gender / age / accent / emotion / tone / speed ("teenage male, American accent, bright, cocky").
+5. **The lines** — what each character says.
+
+> **Language rule:** keep the **prompt language == script language**. Prompt-driven generation (T2A/TA2A) currently supports **English & Chinese** (more languages by end of July 2026). The preset **TTS2.0 `speaker` voices** (see the voicelist) cover many more languages (ES/MX, FR, DE, JA, KR, ID, PT…) — use `speaker` for those.
+
+### TA2A — binding a reference clip to a character
+Tag which reference each character uses with either **`@Audio1` / `@Audio2` / `@Audio3`** (in upload order) or the **`<<TGT_SPK1>>` / `<<TGT_SPK2>>` / `<<TGT_SPK3>>`** token inside the line, e.g. *"Marcus (smooth confident broadcaster, the actor is `<<TGT_SPK1>>`) says: …"*. Reference clips can be **uploaded per request OR pulled from the asset library** (`asset://…` audio assets).
+
+### Example — short multi-role T2A (voice + SFX in one prompt)
+> School bell "ring-a-ling" fading, after-school hallway with distant chatter and locker "clack". **Jake** (teenage male, American accent, bright, cocky) says playfully: "Hey, Emma—you free Saturday? My treat, that new amusement park!" A backpack zipper "zzzip." **Emma** (teenage female, sweet soft airy, shy) lowers her voice, flustered: "Uh… I still haven't finished my homework." Jake coaxes: "You can do it Sunday~ it's just half a day!" … Ends with both footsteps fading away.
+
+## 11. Ideal use cases
+- **Audiobook** — T2A/TA2A generate narration + character voices + SFX, no human recording (~1/10 the cost).
+- **Video dubbing** — describe the voice OR upload a **character image** (image-reference) to derive the voice; generate voice + SFX + music together. Pairs with Seedance `reference_audio` (`asset://`).
+- **Gaming** — character lines and environmental SFX for immersive scenes.
+- **Pricing:** $0.15/min of generated audio (billed per second).
