@@ -136,6 +136,10 @@ class CONFIG:
     # OUTPUT audio (OutputAudioSensitiveContentDetected) and fail the whole job.
     # We disable audio by default -- the reference workflow doesn't need it.
     GENERATE_AUDIO = False
+    # Ask Seedance for the final frame (watermark-free PNG, TRUSTED output) so any
+    # clip can be EXTENDED (feed last_frame -> next clip's first_frame) without
+    # tripping the face filter. Free; on by default.
+    RETURN_LAST_FRAME = True
 
     # --- Seedance defaults ----------------------------------------------------
     VIDEO_RESOLUTION = "1080p"
@@ -245,6 +249,11 @@ class CONFIG:
     ASSET_AK = ""
     ASSET_SK = ""
     ASSET_STORE_PATH = os.path.join(os.path.expanduser("~"), ".byteplus_maya_assets.json")
+    # Auto-permanence: with Advanced Creation Rights + AK/SK, register faces you
+    # actually use (Extend / Make-permanent) as permanent asset:// so the 24h
+    # trusted-link limit disappears. On-demand (not every image) to respect quota.
+    AUTO_TRUST_ASSETS = True
+    AUTO_TRUST_GROUP_ID = ""                             # the plugin's default auto group (persisted)
 
     # --- Webhook (optional; polling stays the default fallback) ---------------
     # A desktop plugin cannot receive an inbound POST directly. Only set this if
@@ -253,7 +262,7 @@ class CONFIG:
     CALLBACK_URL = ""
 
     # --- App / preview --------------------------------------------------------
-    VERSION = "1.09 (Technology Preview)"
+    VERSION = "2.01 (Technology Preview)"
     BUG_EMAIL = "john.giancarlo@bytedance.com"          # temporary bug reports
 
     # --- Color management (Arnold/OCIO) ---------------------------------------
@@ -301,6 +310,10 @@ class CONFIG:
     # --- Persisted prefs ------------------------------------------------------
     PREFS_PATH = os.path.join(os.path.expanduser("~"), ".byteplus_maya.json")
     USAGE_PATH = os.path.join(os.path.expanduser("~"), ".byteplus_maya_usage.json")
+    # In-flight Seedance tasks. The job runs (and is BILLED) on BytePlus, so if the
+    # poll dies (PC sleeps, Maya closed, network drops) the finished clip would be
+    # stranded. Journalled here and auto-recovered on the next load.
+    TASKS_PATH = os.path.join(os.path.expanduser("~"), ".byteplus_maya_tasks.json")
 
     MENU_NAME = "byteplusMenu"
     MENU_LABEL = "BYTEPLUS"
@@ -314,11 +327,12 @@ _PERSISTED = (
     "SSL_VERIFY", "BASE_URL", "SEEDREAM_MODEL", "SEEDREAM_FACE_MODEL",
     "SEEDREAM_PRO_MODEL", "SEEDREAM_LITE_MODEL", "SEEDREAM_OUTPUT_FORMAT",
     "SEEDANCE_MODEL", "SEEDANCE_FAST_MODEL", "SEEDANCE_MINI_MODEL",
-    "SEEDANCE_MAX_CONCURRENT", "LLM_MODEL",
+    "SEEDANCE_MAX_CONCURRENT", "RETURN_LAST_FRAME", "LLM_MODEL",
     "AUDIO_MODEL", "AUDIO_HOST", "AUDIO_API_PATH", "AUDIO_FORMAT",
     "SEED_CHAT_MODEL", "THREE_D_MODEL",
     "MOTION_HOST", "R2_ACCOUNT_ID", "R2_BUCKET", "BUMP_DEPTH",
     "ASSET_API_HOST", "ASSET_REGION", "ASSET_SERVICE", "ASSET_API_VERSION", "ASSET_PROJECT",
+    "AUTO_TRUST_ASSETS", "AUTO_TRUST_GROUP_ID",
     "SHOW_COST", "COST_CONFIRM_USD", "IMAGE_RATIO",
     "COLOR_MANAGE", "USAGE_VIEW", "INSTALL_ID", "TELEMETRY_PREFIX", "TELEMETRY_BUCKET",
     "TELEMETRY_BACKEND", "POSTHOG_HOST", "POSTHOG_API_KEY", "CUSTOMER_ID",
@@ -486,6 +500,18 @@ def _ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
+class _NetworkError(RuntimeError):
+    """A connection / DNS / timeout failure reaching a host (no HTTP response).
+    Kept distinct from other RuntimeErrors so (a) the poll loop can ride out a
+    transient blip WITHOUT re-submitting the job (which would create a second,
+    billed task), and (b) the UI can show a clean 'check your connection' message
+    instead of a raw urllib traceback."""
+
+
+_POLL_NET_RETRIES = 12        # consecutive poll blips tolerated (task stays running)
+_NET_DOWNLOAD_RETRIES = 3     # retries to download a finished (already-paid) result
+
+
 def _open(req_or_url):
     try:
         return urllib.request.urlopen(req_or_url, timeout=CONFIG.HTTP_TIMEOUT,
@@ -504,7 +530,13 @@ def _open(req_or_url):
                 "  2. Or open BYTEPLUS > Settings... and untick 'Verify SSL "
                 "certificates' (less secure)."
             )
-        raise
+        if isinstance(e, urllib.error.HTTPError):
+            raise                                # keep the HTTP response for _request
+        # Plain connection / DNS / timeout error (no HTTP response) -> a clean,
+        # retryable message instead of a urllib traceback.
+        raise _NetworkError(
+            "Network error -- couldn't reach BytePlus ({}). Check your internet / "
+            "VPN / DNS and try again.".format(reason))
 
 
 def _request(method: str, url: str, body: dict | None = None) -> dict:
@@ -524,12 +556,27 @@ def _request(method: str, url: str, body: dict | None = None) -> dict:
         # (the popup truncates and tracebacks hide the body).
         sys.stderr.write("\n[BYTEPLUS] " + msg + "\n")
         raise RuntimeError(msg)
+    except (ConnectionError, TimeoutError) as e:     # connection dropped mid-read
+        raise _NetworkError(
+            "Network error while reading BytePlus's response ({}). Check your "
+            "connection and try again.".format(e))
 
 
 def _get_bytes(url: str) -> bytes:
-    """Download a result asset (image/video) by URL."""
-    with _open(url) as resp:
-        return resp.read()
+    """Download a result asset (image/video) by URL. Retries transient network
+    blips so a momentary hiccup doesn't lose an already-generated (paid) result."""
+    last = None
+    for _i in range(_NET_DOWNLOAD_RETRIES + 1):
+        try:
+            with _open(url) as resp:
+                return resp.read()
+        except (_NetworkError, ConnectionError, TimeoutError) as e:
+            last = e
+            if _i < _NET_DOWNLOAD_RETRIES:
+                time.sleep(2 * (_i + 1))
+                continue
+            raise
+    raise last                                       # defensive (loop returns/raises)
 
 
 def _find_video_url(obj) -> str | None:
@@ -1112,8 +1159,8 @@ def diagnose_r2():
     print("  motion_host:", CONFIG.MOTION_HOST, " bucket:", CONFIG.R2_BUCKET,
           " account:", (CONFIG.R2_ACCOUNT_ID[:6] + "...") if CONFIG.R2_ACCOUNT_ID else "(unset)")
     if not _r2_available():
-        print("  R2 not configured/enabled. Set Motion host = r2 + account/keys/"
-              "bucket in Settings.")
+        print("  R2 not configured. Fill R2 account / access key / secret key / "
+              "bucket in Settings > Storage & Hosting.")
         print("=" * 60)
         return
     key = "maya/diag_{}.txt".format(int(time.time()))
@@ -1184,9 +1231,12 @@ def _tos_upload_presigned(path: str) -> str:
 # reference, then delete it when the job finishes. Opt-in (MOTION_HOST == "r2").
 # =============================================================================
 def _r2_available() -> bool:
-    return bool(CONFIG.MOTION_HOST == "r2" and CONFIG.R2_ACCOUNT_ID
-                and CONFIG.R2_ACCESS_KEY and CONFIG.R2_SECRET_KEY
-                and CONFIG.R2_BUCKET)
+    # Auto-detect, exactly like _tos_available(): COMPLETE R2 credentials == R2 is
+    # usable. Deliberately NOT gated on a separate MOTION_HOST on/off flag -- having
+    # the keys IS the intent. A stale "off" flag silently disabling a fully-configured
+    # R2 (so Edit video / motion refs failed with "configure hosting") was a footgun.
+    return bool(CONFIG.R2_ACCOUNT_ID and CONFIG.R2_ACCESS_KEY
+                and CONFIG.R2_SECRET_KEY and CONFIG.R2_BUCKET)
 
 
 def _r2_host() -> str:
@@ -1387,7 +1437,7 @@ def _ark_call(action: str, body: dict, method: str = "POST"):
         raise RuntimeError(
             "The Trusted Asset Library needs an Access Key + Secret Key (AK/SK) from "
             "your BytePlus console (IAM > Access Keys) -- not the Bearer API key.\n\n"
-            "Add them in BYTEPLUS > Settings > Secrets.")
+            "Add them in BYTEPLUS > Settings > Storage & Hosting.")
     host = (CONFIG.ASSET_API_HOST or "").strip()
     region, service = CONFIG.ASSET_REGION, CONFIG.ASSET_SERVICE
     body_str = json.dumps(body or {})
@@ -1614,6 +1664,67 @@ def _character_voice_dir() -> str:
     return d
 
 
+# --- Auto-permanence (make faces/last-frames permanent asset:// on demand) --------
+
+def _auto_trust_group():
+    """Get-or-create the plugin's default asset group for auto-registered assets;
+    persists its id. NETWORK ONLY. Raises a clear message if the one-time
+    authorization letter hasn't been signed."""
+    gid = (CONFIG.AUTO_TRUST_GROUP_ID or "").strip()
+    if gid:
+        return gid
+    try:                                              # reuse an existing BYTEPLUS group
+        for g in _asset_list_groups():
+            if (g.get("Name") or g.get("Title") or "").startswith("BYTEPLUS"):
+                gid = g.get("Id") or g.get("GroupId") or ""
+                if gid:
+                    break
+    except Exception:
+        gid = ""
+    if not gid:
+        try:
+            gid = _asset_create_group("BYTEPLUS Auto",
+                                      "Auto-registered trusted assets (BYTEPLUS for Maya)")
+        except RuntimeError as e:
+            if any(s in str(e).lower() for s in
+                   ("authoriz", "agreement", "sign", "letter", "portrait")):
+                raise RuntimeError(
+                    "First-time setup: sign the asset-library authorization letter in "
+                    "the BytePlus console (Model Playground > My assets > Virtual "
+                    "Portrait), then try again.")
+            raise
+    if gid:
+        CONFIG.AUTO_TRUST_GROUP_ID = gid
+        _save_prefs()
+    return gid
+
+
+def _auto_register_asset(src, name="", asset_type="Image"):
+    """Register `src` (local path or http url) as a PERMANENT trusted asset; return
+    'asset://<id>' or None on failure. An already-asset:// src is returned as-is.
+    NETWORK ONLY -- call from a _Worker."""
+    if isinstance(src, str) and src.startswith("asset://"):
+        return src
+    gid = _auto_trust_group()
+    if not gid:
+        return None
+    res = _asset_add_and_wait(gid, src, name=name or "auto", asset_type=asset_type)
+    if res.get("status") == "Active" and res.get("id"):
+        _asset_store_asset(gid, res["id"], name=name or "auto", status="Active")
+        return res["uri"]
+    return None
+
+
+def _read_asset_sidecar(path):
+    """The permanent asset://<id> registered for a local image (or None)."""
+    try:
+        with open(str(path) + ".asset") as f:
+            u = f.read().strip()
+        return u if u.startswith("asset://") else None
+    except OSError:
+        return None
+
+
 # =============================================================================
 # Usage counter + anonymous telemetry
 #   - Usage: in-memory counters persisted to USAGE_PATH, shown in 'Usage...'.
@@ -1631,6 +1742,11 @@ _USAGE_LOCK = threading.Lock()
 # MAIN thread (Maya cmds are not thread-safe); _track (worker thread) only reads
 # this cached string, never calls Maya.
 _ACTIVE_PROJECT = ""
+# The movies dir that owns the work being submitted. Same rule as _ACTIVE_PROJECT:
+# captured on the MAIN thread, only READ from workers (the task journal writes it
+# so a recovered clip lands in ITS OWN project, not whatever scene is open later).
+_ACTIVE_MOV_DIR = ""
+_TASKS_LOCK = threading.Lock()
 _TELE_BUF = []
 _TELE_LOCK = threading.Lock()
 _TELE_THREAD = None
@@ -1638,12 +1754,54 @@ _TELE_THREAD = None
 
 def _mark_active_project():
     """Cache the current Maya scene as the active project for usage attribution.
-    MAIN THREAD ONLY (reads Maya via _scene_tag)."""
-    global _ACTIVE_PROJECT
+    MAIN THREAD ONLY (reads Maya via _scene_tag / _scene_movies_dir)."""
+    global _ACTIVE_PROJECT, _ACTIVE_MOV_DIR
     try:
         _ACTIVE_PROJECT = _scene_tag() or "untitled"
     except Exception:
         pass
+    try:
+        _ACTIVE_MOV_DIR = _scene_movies_dir() or ""
+    except Exception:
+        pass
+
+
+# ---- in-flight task journal (survives a dead poll: sleep / close / network) ----
+def _tasks_load():
+    try:
+        with open(CONFIG.TASKS_PATH) as f:
+            d = json.load(f)
+        return d if isinstance(d, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _tasks_save(items):
+    try:
+        with open(CONFIG.TASKS_PATH, "w") as f:
+            json.dump(items, f, indent=2)
+    except OSError:
+        pass
+
+
+def _task_journal_add(task_id, prompt="", model="", mov_dir=""):
+    """Remember a submitted (billable) Seedance task. Worker-thread safe: pure file
+    I/O + a module global, never Maya."""
+    if not task_id:
+        return
+    with _TASKS_LOCK:
+        items = [t for t in _tasks_load() if t.get("task_id") != task_id]
+        items.append({"task_id": task_id, "ts": int(time.time()),
+                      "prompt": prompt or "", "model": model or "",
+                      "mov_dir": mov_dir or ""})
+        _tasks_save(items)
+
+
+def _task_journal_drop(task_id):
+    if not task_id:
+        return
+    with _TASKS_LOCK:
+        _tasks_save([t for t in _tasks_load() if t.get("task_id") != task_id])
 
 
 def _install_id() -> str:
@@ -1808,7 +1966,7 @@ def _seed_audio(text_prompt, speaker=None, ref_audio=None, ref_image=None,
         raise RuntimeError(
             "Seed Audio needs its OWN API key (X-Api-Key) from the BytePlus Voice "
             "console -- different from the Bearer API key.\n\nAdd it in "
-            "BYTEPLUS > Settings > Secrets > 'Seed Audio API key'.")
+            "BYTEPLUS > Settings > API & Models > 'Seed Audio API key'.")
     text = (text_prompt or "").strip()[:3000]
     if not text:
         raise RuntimeError("Type something to synthesize.")
@@ -1879,50 +2037,29 @@ def _fmt_cost(tokens, usd):
 
 
 def _msgbox(icon, title, text, buttons=None):
-    """A QMessageBox guaranteed to appear ABOVE everything. Our galleries/previews
-    are always-on-top, so a modal (even one with stay-on-top) can still open behind
-    a gallery that was raised more recently -- making Maya look frozen. So for the
-    duration of the dialog we DROP always-on-top from every other visible window
-    and restore it afterward. Returns the clicked StandardButton.
+    """A QMessageBox parented to whatever is in front -- the active modal if one is
+    running, else Maya's main window -- so it always shows above it. Returns the
+    clicked StandardButton.
 
-    RE-ENTRANCY (critical): toggling WindowStaysOnTopHint + show() RECREATES a
-    window's native handle. Doing that to a window that is CURRENTLY driving a
-    modal event loop (an open QDialog.exec() such as AnimateDialog, or an outer
-    _msgbox still in exec()) drops its modal grab and WEDGES Maya's UI (the
-    "Animate freeze"): a worker's queued failed()/done() callback can fire _msgbox
-    while such a modal loop is on the stack. So when a modal is already active we
-    SKIP the flag dance entirely (it's only needed at the TOP level to clear the
-    always-on-top galleries) and just parent/raise the box above that modal."""
-    active_modal = QtWidgets.QApplication.activeModalWidget()
-    lifted = []
-    if active_modal is None:                          # top-level only -- safe to lift
-        for w in QtWidgets.QApplication.topLevelWidgets():
-            try:
-                if (w.isVisible() and w.isWindow()
-                        and bool(w.windowFlags() & QtCore.Qt.WindowStaysOnTopHint)):
-                    w.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, False)
-                    w.show()                          # re-apply the cleared flag
-                    lifted.append(w)
-            except Exception:
-                pass
-    try:
-        box = QtWidgets.QMessageBox(active_modal or _main_window())
-        box.setIcon(icon)
-        box.setWindowTitle(title)
-        box.setText(text)
-        box.setStandardButtons(buttons if buttons is not None else QtWidgets.QMessageBox.Ok)
-        box.setWindowModality(QtCore.Qt.ApplicationModal)
-        box.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
-        box.raise_()
-        box.activateWindow()
-        return box.exec()
-    finally:
-        for w in lifted:                              # restore the galleries' flag
-            try:
-                w.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
-                w.show()
-            except Exception:
-                pass
+    NO window-flag juggling, deliberately. This used to DROP WindowStaysOnTopHint
+    from every visible window and restore it afterwards, because our own windows
+    forced always-on-top and a message box could open BEHIND a gallery (making Maya
+    look frozen). That workaround was the cause of a worse bug: toggling the flag
+    RECREATES a window's native handle, and doing that to a window driving a modal
+    exec() loop drops its modal grab and WEDGES Maya's UI (the "Animate freeze").
+    Now that nothing forces always-on-top (every window is parented to Maya
+    instead), the dance is unnecessary -- and removing it also stops us mutating
+    the flags of Maya's own / third-party windows. Parenting alone is correct."""
+    box = QtWidgets.QMessageBox(QtWidgets.QApplication.activeModalWidget()
+                                or _main_window())
+    box.setIcon(icon)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(buttons if buttons is not None else QtWidgets.QMessageBox.Ok)
+    box.setWindowModality(QtCore.Qt.ApplicationModal)
+    box.raise_()
+    box.activateWindow()
+    return box.exec()
 
 
 def _confirm_cost(usd, what):
@@ -3104,6 +3241,53 @@ def _mux_audio_from(video_bytes: bytes, source_path: str) -> bytes:
     return video_bytes
 
 
+def _extract_last_frame(video_path: str) -> str:
+    """Extract the LAST frame of a video as a PNG (LOCAL -> not a trusted output;
+    only safe for no-face content). Returns the PNG path. Raises on failure."""
+    import subprocess
+    ff = _ffmpeg_exe()
+    if not ff:
+        raise RuntimeError("ffmpeg not found — can't extract the last frame.")
+    out = os.path.splitext(video_path)[0] + "_lastframe.png"
+    kw = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    if sys.platform.startswith("win"):
+        kw["creationflags"] = 0x08000000
+    subprocess.run([ff, "-y", "-sseof", "-0.2", "-i", video_path,
+                    "-update", "1", "-frames:v", "1", out], **kw)
+    if not os.path.exists(out):
+        raise RuntimeError("last-frame extraction produced no file")
+    return out
+
+
+def _concat_videos(a: str, b: str, out: str) -> str:
+    """Best-effort join a+b -> out, re-encoded to a's size (the joined file is a
+    final deliverable, so re-encoding is fine). Raises on failure so the caller can
+    keep both source clips."""
+    import subprocess
+    ff = _ffmpeg_exe()
+    if not ff:
+        raise RuntimeError("ffmpeg not found — can't join clips.")
+    aw, ah = _probe_video_dims(a) or (1280, 720)
+    scale = ("scale={w}:{h}:force_original_aspect_ratio=decrease,"
+             "pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1").format(w=aw, h=ah)
+    if _has_audio_stream(a) and _has_audio_stream(b):
+        fc = ("[0:v]{s}[v0];[1:v]{s}[v1];[v0][0:a][v1][1:a]"
+              "concat=n=2:v=1:a=1[v][a]").format(s=scale)
+        maps = ["-map", "[v]", "-map", "[a]"]
+    else:
+        fc = "[0:v]{s}[v0];[1:v]{s}[v1];[v0][v1]concat=n=2:v=1:a=0[v]".format(s=scale)
+        maps = ["-map", "[v]"]
+    venc = (["-c:v", "libopenh264", "-b:v", "6M"]
+            if _ffmpeg_h264_encoder(ff) == "openh264"
+            else ["-c:v", "libx264", "-crf", "23", "-preset", "veryfast"])
+    kw = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    if sys.platform.startswith("win"):
+        kw["creationflags"] = 0x08000000
+    subprocess.run([ff, "-y", "-i", a, "-i", b, "-filter_complex", fc]
+                   + maps + venc + ["-pix_fmt", "yuv420p", out], **kw)
+    return out
+
+
 def _playblast_is_valid(path: str, expected_seconds: float) -> bool:
     """True if a captured playblast looks usable: a real, non-empty file whose
     duration is close to the animation length. Catches empty / truncated captures
@@ -3121,10 +3305,96 @@ def _playblast_is_valid(path: str, expected_seconds: float) -> bool:
         return True
 
 
-def _playblast_movie(start=None, end=None) -> str:
+# Last playblast per (scene, range, camera), so a second generation from an
+# unchanged scene doesn't re-capture (a real client complaint). Maya has no cheap
+# "did anything change?" signal -- file -q -modified flips on a mere selection -- so
+# reuse is never silent: the dialogs show a ticked "♻️ Reuse the last playblast
+# (captured N ago)" that the artist can untick. They know if they touched the anim.
+_PB_CACHE = {}
+_PB_AUTOTICK_SECS = 1800          # <=30 min -> offer it ticked; older -> offer unticked
+
+
+def _playblast_key(start, end):
+    """Cache identity. MAIN THREAD (reads Maya). None if it can't be determined."""
+    try:
+        return (_scene_tag(), int(start), int(end), _active_camera())
+    except Exception:
+        return None
+
+
+def _pb_meta_path(mp4):
+    return mp4 + ".pbmeta.json"
+
+
+def _pb_write_meta(mp4, start, end):
+    """Stamp a playblast with WHAT it is, so a later session can reuse it. Without
+    this the file name (a timestamp) tells us nothing and the clip is unusable to
+    us even though it's sitting right there. MAIN THREAD (reads Maya)."""
+    try:
+        with open(_pb_meta_path(mp4), "w") as f:
+            json.dump({"scene": _scene_tag(), "start": int(start), "end": int(end),
+                       "camera": _active_camera(), "ts": int(time.time())}, f)
+    except Exception:
+        pass
+
+
+def _playblast_cached(start=None, end=None):
+    """(path, age_seconds) of a reusable playblast for this scene/range/camera, or
+    None. Checks this session's memory first, then DISK -- playblasts persist, and
+    each carries a .pbmeta.json saying which scene/range/camera it was captured
+    for, so one from an earlier session can be matched safely. (Files captured
+    before that stamp existed are skipped: we can't know what they contain.)
+    MAIN THREAD -- decides whether to offer the reuse checkbox."""
+    try:
+        if start is None or end is None:
+            start, end = _anim_range()
+        key = _playblast_key(start, end)
+        c = _PB_CACHE.get(key)
+        if c and os.path.exists(c["path"]) and os.path.getsize(c["path"]) > 0:
+            return c["path"], max(0.0, time.time() - c["ts"])
+        if not key:
+            return None
+        import glob
+        best = None
+        for mp4 in glob.glob(os.path.join(_project_movies_dir(),
+                                          "byteplus_playblast_*.mp4")):
+            try:
+                with open(_pb_meta_path(mp4)) as f:
+                    m = json.load(f)
+            except (OSError, ValueError):
+                continue                             # unstamped -> unknown -> skip
+            if (m.get("scene"), int(m.get("start", -1)), int(m.get("end", -2)),
+                    m.get("camera")) != key:
+                continue
+            if not (os.path.exists(mp4) and os.path.getsize(mp4) > 0):
+                continue
+            ts = int(m.get("ts", 0))
+            if best is None or ts > best[1]:
+                best = (mp4, ts)                     # newest match wins
+        if best:
+            _PB_CACHE[key] = {"path": best[0], "ts": best[1]}
+            return best[0], max(0.0, time.time() - best[1])
+    except Exception:
+        pass
+    return None
+
+
+def _fmt_age(secs):
+    secs = int(secs or 0)
+    if secs < 60:
+        return "{}s ago".format(secs)
+    if secs < 3600:
+        return "{} min ago".format(secs // 60)
+    return "{}h ago".format(secs // 3600)
+
+
+def _playblast_movie(start=None, end=None, reuse=False) -> str:
     """Playblast the animation range to a movie used as Seedance's video reference.
     Saved into the project movies/ folder (persisted) and validated non-empty.
     Tries platform-appropriate formats and trusts playblast's return path.
+
+    `reuse=True` returns the last playblast captured for this same scene/range/
+    camera instead of re-capturing (opt-in, driven by the dialogs' checkbox).
 
     The range is captured EXPLICITLY via startTime/endTime (defaulting to
     _anim_range()) so it always matches the duration the caller computed from the
@@ -3135,6 +3405,13 @@ def _playblast_movie(start=None, end=None) -> str:
     glitch) and restores the artist's current frame afterwards."""
     if start is None or end is None:
         start, end = _anim_range()
+    key = _playblast_key(start, end)
+    if reuse:
+        hit = _playblast_cached(start, end)
+        if hit:
+            sys.stderr.write("[BYTEPLUS] reusing the playblast captured {} "
+                             "(same scene / range / camera).\n".format(_fmt_age(hit[1])))
+            return hit[0]
     out_dir = _project_movies_dir()
     base = os.path.join(out_dir, "byteplus_playblast_{}".format(int(time.time() * 1000)))
     panel = _active_model_panel()
@@ -3169,7 +3446,12 @@ def _playblast_movie(start=None, end=None) -> str:
                 continue
             for cand in ([result] if result else []) + [base + ext]:
                 if cand and os.path.exists(cand) and os.path.getsize(cand) > 0:
-                    return _ensure_seedance_video(cand)   # -> MP4 (H.264) for Seedance
+                    mp4 = _ensure_seedance_video(cand)    # -> MP4 (H.264) for Seedance
+                    if key:                               # cache the FINAL mp4, so a
+                        _PB_CACHE[key] = {"path": mp4,    # reuse skips the transcode too
+                                          "ts": time.time()}
+                        _pb_write_meta(mp4, start, end)   # survives reload / restart
+                    return mp4
     finally:
         _restore_panel(panel, saved)
         if _t0 is not None:                          # leave the artist's frame as it was
@@ -3181,6 +3463,72 @@ def _playblast_movie(start=None, end=None) -> str:
         "Playblast produced no usable movie (tried {}). Last error: {}. The "
         "image references will still work without it.".format(
             [f for f, _, _ in _playblast_formats()], last_err))
+
+
+def diagnose_playblast_cache():
+    """Explain exactly why the '♻️ Reuse the last playblast' checkbox is (not)
+    offered. _playblast_cached() swallows errors on purpose (it must never break a
+    dialog), so this is the way to see what it saw.
+
+        import byteplus_maya; byteplus_maya.diagnose_playblast_cache()
+    """
+    import glob
+    print("=" * 60)
+    print("BYTEPLUS diagnose_playblast_cache")
+    try:
+        start, end = _anim_range()
+    except Exception as e:
+        print("  anim range : FAILED ->", e); print("=" * 60); return
+    try:
+        key = _playblast_key(start, end)
+        print("  scene      :", _scene_tag())
+        print("  range      : {} -> {}".format(int(start), int(end)))
+        print("  camera     :", _active_camera())
+        print("  key        :", key)
+        d = _project_movies_dir()
+    except Exception as e:
+        print("  key        : FAILED ->", e); print("=" * 60); return
+    print("  movies dir :", d)
+    files = sorted(glob.glob(os.path.join(d, "byteplus_playblast_*.mp4")))
+    print("  playblasts :", len(files))
+    if not files:
+        print("  -> none captured yet. Generate once with the playblast ON.")
+    stamped = matches = 0
+    for f in files:
+        meta = _pb_meta_path(f)
+        if not os.path.exists(meta):
+            print("    - {}\n        NO STAMP -> captured before this build (or by an "
+                  "older plugin); we can't know what it holds, so it is skipped."
+                  .format(os.path.basename(f)))
+            continue
+        try:
+            with open(meta) as fh:
+                m = json.load(fh)
+        except Exception as e:
+            print("    - {}\n        BAD STAMP -> {}".format(os.path.basename(f), e))
+            continue
+        stamped += 1
+        fk = (m.get("scene"), int(m.get("start", -1)), int(m.get("end", -2)),
+              m.get("camera"))
+        ok = (fk == key)
+        matches += 1 if ok else 0
+        print("    - {}\n        stamp = {}\n        {}".format(
+            os.path.basename(f), fk,
+            "MATCH ({})".format(_fmt_age(time.time() - int(m.get("ts", 0))))
+            if ok else "no match (scene/range/camera differ from the key above)"))
+    print("  stamped    : {}   matching: {}".format(stamped, matches))
+    hit = _playblast_cached(start, end)
+    if hit:
+        print("  RESULT     : REUSABLE -> {}  ({})".format(
+            os.path.basename(hit[0]), _fmt_age(hit[1])))
+        print("               the checkbox WILL show, {}".format(
+            "ticked" if hit[1] <= _PB_AUTOTICK_SECS else "unticked (over 30 min old)"))
+    else:
+        print("  RESULT     : nothing reusable -> the checkbox stays hidden.")
+        if files and not stamped:
+            print("               CAUSE: no playblast carries a stamp yet. hard_reload "
+                  "FIRST, then generate once -- the stamp is written at capture time.")
+    print("=" * 60)
 
 
 def _viewport_snapshot() -> str:
@@ -3204,7 +3552,6 @@ class PreviewWindow(QtWidgets.QDialog):
         self._animate_arg = animate_arg  # what to hand the callback (a URL/path)
         self.setWindowTitle("BYTEPLUS  -  " + title)
         self.setMinimumSize(640, 520)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)  # stay above Maya
 
         layout = QtWidgets.QVBoxLayout(self)
         self._view = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
@@ -3303,7 +3650,6 @@ class _ActivityHUD(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowModality(QtCore.Qt.NonModal)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self.setWindowFlag(QtCore.Qt.FramelessWindowHint, True)
         self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
         self.setFixedWidth(360)
@@ -3450,6 +3796,14 @@ def _progress(title: str) -> "_ProgressHandle":
 
 
 def _error(msg: str):
+    # A worker surfaces a failure as traceback.format_exc() text. For a transient
+    # connection / DNS / timeout (our _NetworkError) collapse that raw traceback to
+    # its clean one-line message, so a momentary blip never dumps a urllib stack on
+    # the user. Every call site benefits with no per-callsite edits.
+    if isinstance(msg, str) and "_NetworkError:" in msg and "Traceback" in msg:
+        tail = msg.rsplit("_NetworkError:", 1)[1].strip().splitlines()
+        if tail:
+            msg = tail[0].strip()
     _msgbox(QtWidgets.QMessageBox.Critical, "BYTEPLUS error", msg,
             QtWidgets.QMessageBox.Ok)
 
@@ -3520,7 +3874,6 @@ def _show_prompt(parent, prompt: str):
     dlg = QtWidgets.QDialog(parent or _main_window())
     dlg.setWindowTitle("BYTEPLUS - Prompt used")
     dlg.setMinimumSize(560, 360)
-    dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
     v = QtWidgets.QVBoxLayout(dlg)
     v.addWidget(QtWidgets.QLabel("The prompt that generated this result:"))
     te = QtWidgets.QPlainTextEdit(prompt)
@@ -3721,7 +4074,6 @@ class ABCompareDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Compare A / B")
         self.setMinimumSize(720, 520)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._pa = _to_pixmap(src_a)
         self._pb = _to_pixmap(src_b)
         v = QtWidgets.QVBoxLayout(self)
@@ -3774,6 +4126,122 @@ def _save_video(video_bytes: bytes, poster_src, mov_dir: str, prompt=None):
     return vid, poster
 
 
+class _RefImagesWidget(QtWidgets.QWidget):
+    """Reusable 'reference images' picker (gallery / file / trusted character) so
+    Edit video and Extend can LOCK a character's identity & look. Each ref resolves
+    trusted-first via .sources() -> asset:// (permanent) > fresh Seedream URL >
+    local path. A FACE ref must be trusted or Seedance rejects it -- the hint says
+    so, and the 🎭 button is the robust way."""
+
+    def __init__(self, parent=None, maximum=9):
+        super().__init__(parent)
+        self._refs = []                              # [{"url","path","asset","name"}]
+        self._max = maximum
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(QtWidgets.QLabel("Reference images — lock the character / look "
+                                     "(optional):"))
+        self._list = QtWidgets.QListWidget()
+        self._list.setFixedHeight(58)
+        v.addWidget(self._list)
+        row = QtWidgets.QHBoxLayout()
+        b_gal = QtWidgets.QPushButton("+ Gallery"); b_gal.clicked.connect(self._add_gallery)
+        b_file = QtWidgets.QPushButton("+ File"); b_file.clicked.connect(self._add_file)
+        b_char = QtWidgets.QPushButton("🎭 Trusted character")
+        b_char.clicked.connect(self._add_char)
+        b_rm = QtWidgets.QPushButton("Remove"); b_rm.clicked.connect(self._remove)
+        for b in (b_gal, b_file, b_char):
+            row.addWidget(b)
+        row.addStretch(1); row.addWidget(b_rm)
+        v.addLayout(row)
+        hint = QtWidgets.QLabel(
+            "A FACE reference must be TRUSTED or Seedance rejects it: a fresh gallery "
+            "image or a 🎭 Trusted character (permanent). A face from a plain file is "
+            "usually rejected. One clean portrait works better than a pose sheet.")
+        hint.setWordWrap(True); hint.setStyleSheet("color:#888;")
+        v.addWidget(hint)
+
+    def _refresh(self):
+        self._list.clear()
+        for r in self._refs:
+            kind = "asset" if r.get("asset") else ("gallery" if r.get("url") else "file")
+            self._list.addItem("{} · {}".format(kind, r.get("name") or "ref"))
+
+    def _full(self):
+        if len(self._refs) >= self._max:
+            _error("Up to {} reference images.".format(self._max))
+            return True
+        return False
+
+    def _add_gallery(self):
+        if self._full():
+            return
+        items = _scene_dream_items()
+        if not items:
+            _error("No Dream Gallery images to reference — generate some first.")
+            return
+        picked = _pick_gallery_image(items, self)
+        if not picked:
+            return
+        self._refs.append({"url": picked.get("url"), "path": picked.get("path"),
+                           "name": os.path.basename(picked.get("path") or "gallery")})
+        self._refresh()
+
+    def _add_file(self):
+        if self._full():
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Add a reference image", "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tiff)")
+        if not path:
+            return
+        self._refs.append({"url": None, "path": path, "name": os.path.basename(path)})
+        self._refresh()
+
+    def _add_char(self):
+        if self._full():
+            return
+        c = _pick_trusted_character(self)
+        if not c:
+            return
+        self._refs.append({"asset": c.get("uri"), "name": c.get("name") or "character"})
+        self._refresh()
+
+    def _remove(self):
+        row = self._list.currentRow()
+        if row >= 0:
+            self._refs.pop(row)
+            self._refresh()
+
+    def sources(self):
+        """Trusted-first source string per ref: asset:// > fresh Seedream URL > path.
+        (_img_ref_uri passes http/asset:// through untouched; a local path is hosted
+        or base64'd downstream.)"""
+        out = []
+        for r in self._refs:
+            if r.get("asset"):
+                out.append(r["asset"])
+            elif r.get("url") and _url_is_fresh(r["url"]):
+                out.append(r["url"])
+            elif r.get("path"):
+                out.append(r["path"])
+            elif r.get("url"):
+                out.append(r["url"])
+        return out
+
+
+def _extend_multimodal(first_src, ref_srcs, prompt):
+    """Mode-3 assembly for Extend WITH character references. Seedance forbids mixing
+    `first_frame` with `reference_image`, so the trusted last frame becomes Image 1
+    and the refs Image 2+, described in the prompt as the exact starting frame (the
+    doc-recommended approximation). Returns (image_sources, prompt_text)."""
+    imgs = [first_src] + list(ref_srcs or [])
+    text = ("Continue seamlessly from Image 1 (the previous shot's final frame) as "
+            "the exact starting frame. Keep the character's identity, face, hair and "
+            "wardrobe consistent with the other reference image(s). " + (prompt or ""))
+    return imgs, text
+
+
 class VideoEditDialog(QtWidgets.QDialog):
     """Edit-instruction dialog for 'Edit video' (Seedance 2.0 video-to-video), with
     a ✦ Enhance that reads the clip and writes the full transform prompt."""
@@ -3782,7 +4250,6 @@ class VideoEditDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("Edit video — Seedance 2.0")
         self.setMinimumSize(560, 340)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._worker = None
         self._video_path = video_path
         self._poster = poster
@@ -3821,11 +4288,17 @@ class VideoEditDialog(QtWidgets.QDialog):
         opts.addStretch(1)
         v.addLayout(opts)
 
+        self.refs = _RefImagesWidget(self)           # lock identity/look (optional)
+        v.addWidget(self.refs)
+
         bb = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
+
+    def ref_sources(self):
+        return self.refs.sources()
 
     def text(self):
         return self.prompt.toPlainText().strip()
@@ -3870,11 +4343,11 @@ class VideoGallery(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle(_usage_title("BYTEPLUS - Video Gallery"))
         self.setMinimumSize(760, 660)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._mov_dir = mov_dir
         self._items = []
         self._current = None
         self._worker = None
+        self._pending = []                           # "generating" placeholder tiles
 
         v = QtWidgets.QVBoxLayout(self)
         self.view = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
@@ -3906,6 +4379,12 @@ class VideoGallery(QtWidgets.QDialog):
             "source subject, motion and camera and transforms only what you ask "
             "for. Press ✦ Enhance in the dialog to auto-write the full prompt.")
         b_refine.clicked.connect(self._regen)
+        b_extend = QtWidgets.QPushButton("⏭ Extend")
+        b_extend.setToolTip(
+            "Continue this clip past its length: its trusted last frame becomes the "
+            "first frame of a new clip (chain to go beyond 15s). Optionally join them "
+            "into one video.")
+        b_extend.clicked.connect(self._extend)
         b_save = QtWidgets.QPushButton("\U0001F4BE Save As...")
         b_save.clicked.connect(self._save)
         b_del = QtWidgets.QPushButton("\U0001F5D1 Delete")
@@ -3914,7 +4393,7 @@ class VideoGallery(QtWidgets.QDialog):
         b_clear.clicked.connect(self._clear_all)
         b_close = QtWidgets.QPushButton("Close")
         b_close.clicked.connect(self.accept)
-        for b in (b_open, b_refine, b_save, b_del, b_clear):
+        for b in (b_open, b_refine, b_extend, b_save, b_del, b_clear):
             row.addWidget(b)
         row.addStretch(1)
         row.addWidget(b_close)
@@ -4010,13 +4489,58 @@ class VideoGallery(QtWidgets.QDialog):
                 return
         self._add(video, poster, regen, select=True, prompt=prompt)
 
+    def _pending_icon(self):
+        ic = getattr(self, "_pending_pix", None)
+        if ic is None:
+            pm = QtGui.QPixmap(160, 90)
+            pm.fill(QtGui.QColor("#2b2b2b"))
+            p = QtGui.QPainter(pm)
+            p.setPen(QtGui.QColor("#d0d0d0"))
+            p.drawText(pm.rect(), QtCore.Qt.AlignCenter, "⏳  Generating…")
+            p.end()
+            ic = QtGui.QIcon(pm)
+            self._pending_pix = ic
+        return ic
+
+    def add_pending(self, worker, label="⏳ Generating…"):
+        """Show a placeholder tile in the strip while `worker` generates a clip.
+        It is removed automatically when that worker finishes (success, fail OR
+        cancel) via QThread.finished -- which fires AFTER the clip is added, so the
+        real thumbnail appears first. Kept OUT of self._items so nothing that
+        iterates real clips is affected."""
+        lw = QtWidgets.QListWidgetItem(self._pending_icon(), "")
+        lw.setToolTip(label)
+        lw.setData(QtCore.Qt.UserRole, {"pending": True})
+        lw.setFlags(QtCore.Qt.ItemIsEnabled)         # not selectable / never current
+        self.strip.addItem(lw)
+        self._pending.append(lw)
+        self.strip.scrollToItem(lw)
+        try:
+            worker.finished.connect(lambda: self._remove_pending_item(lw))
+        except Exception:
+            pass
+        return lw
+
+    def _remove_pending_item(self, lw):
+        try:
+            if lw in self._pending:
+                self._pending.remove(lw)
+            row = self.strip.row(lw)
+            if row >= 0:
+                self.strip.takeItem(row)
+        except RuntimeError:
+            pass                                     # strip/item already destroyed
+
     def _selected_items(self):
-        """Selected strip items (their dicts), in row order."""
+        """Selected strip items (their dicts), in row order. Placeholder tiles are
+        skipped (they carry no video)."""
         out = []
         for i in range(self.strip.count()):
             lw = self.strip.item(i)
             if lw and lw.isSelected():
-                out.append(lw.data(QtCore.Qt.UserRole))
+                it = lw.data(QtCore.Qt.UserRole)
+                if it and not it.get("pending"):
+                    out.append(it)
         return out
 
     def _compare(self):
@@ -4059,6 +4583,8 @@ class VideoGallery(QtWidgets.QDialog):
             _place_overlay(self.view, self._ov)
 
     def _show(self, item):
+        if not item or item.get("pending"):
+            return
         self._current = item
         if item.get("poster") and os.path.exists(item["poster"]):
             pix = QtGui.QPixmap(item["poster"])
@@ -4069,11 +4595,17 @@ class VideoGallery(QtWidgets.QDialog):
         self.view.setToolTip(item["video"])
 
     def _on_select(self, lw):
-        self._show(lw.data(QtCore.Qt.UserRole))
+        it = lw.data(QtCore.Qt.UserRole)
+        if it and it.get("pending"):
+            self.view.setText("⏳ Generating… this clip will appear here when ready.")
+            return
+        self._show(it)
 
     def _on_current(self, cur, _prev):
         if cur is not None:                          # arrow keys move current -> preview
-            self._show(cur.data(QtCore.Qt.UserRole))
+            it = cur.data(QtCore.Qt.UserRole)
+            if it and not it.get("pending"):
+                self._show(it)
 
     def _open(self):
         if self._current:
@@ -4091,20 +4623,223 @@ class VideoGallery(QtWidgets.QDialog):
             cmds.inViewMessage(amg="Saved <hl>{}</hl>".format(path),
                                pos="midCenter", fade=True)
 
+    def _extend(self):
+        """Continue the selected clip: its trusted last frame -> the first frame of a
+        new clip (chain past 15s). Optionally join A+B into one video."""
+        if not self._current:
+            return
+        vid = self._current["video"]
+        first_src, trusted = None, False
+        sc = vid + ".lastframe.json"
+        if os.path.exists(sc):
+            try:
+                with open(sc) as f:
+                    d = json.load(f)
+                u = d.get("url")
+                if u and u.startswith("asset://"):
+                    first_src, trusted = u, True             # PERMANENT, never expires
+                elif u and int(time.time()) - int(d.get("ts", 0)) < 86400:
+                    first_src, trusted = u, True             # fresh 24h trusted url
+            except Exception:
+                pass
+        if not first_src:
+            if _msgbox(QtWidgets.QMessageBox.Warning, "BYTEPLUS - Extend",
+                       "This clip has no fresh trusted last frame (kept only for ~24h, "
+                       "and only for clips made from this build onward).\n\nI can "
+                       "extract the last frame LOCALLY and continue from it — fine for "
+                       "scenes / objects, but a clip WITH A FACE will be rejected by "
+                       "Seedance.\n\nContinue with local extraction?",
+                       QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel
+                       ) != QtWidgets.QMessageBox.Ok:
+                return
+            try:
+                first_src = _extract_last_frame(vid)
+            except Exception as e:
+                _error("Could not extract the last frame:\n\n" + str(e))
+                return
+        if _video_jobs_active() >= _video_cap():
+            _msgbox(QtWidgets.QMessageBox.Information, "BYTEPLUS - Seedance is busy",
+                    "You already have {} Seedance job(s) running (max {}).".format(
+                        _video_jobs_active(), _video_cap()))
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Extend clip")
+        dlg.setMinimumWidth(460)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.addWidget(QtWidgets.QLabel(
+            "Continue the clip — its last frame becomes the first frame of a new one."))
+        pe = QtWidgets.QPlainTextEdit()
+        pe.setPlaceholderText("What happens next (camera / action). Blank = continue "
+                              "naturally.")
+        pe.setFixedHeight(80); lay.addWidget(pe)
+        erow = QtWidgets.QHBoxLayout(); erow.addStretch(1)
+        b_enh = QtWidgets.QPushButton("✦ Enhance")
+        b_enh.setToolTip("Rewrites your continuation into a fuller Seedance motion "
+                         "prompt (Ctrl+Z restores the original).")
+        erow.addWidget(b_enh); lay.addLayout(erow)
+
+        def _do_enhance():
+            txt = pe.toPlainText().strip()
+            if not txt:
+                cmds.inViewMessage(amg="Type what happens next first, then "
+                                   "<hl>✦ Enhance</hl>.", pos="midCenter", fade=True)
+                return
+            b_enh.setEnabled(False); b_enh.setText("Enhancing...")
+            # Worker parented to the MAIN window (never to this modal dialog, which
+            # the user can close mid-run -> QThread-destroyed crash). Callbacks are
+            # guarded in case the dialog is closed before enhance returns.
+            self._ext_enh_worker = _Worker(lambda: _enhance_prompt(txt),
+                                           parent=_main_window())
+
+            def edone(t):
+                try:
+                    if t:
+                        pe.setPlainText(t)
+                    b_enh.setEnabled(True); b_enh.setText("✦ Enhance")
+                except RuntimeError:
+                    pass                 # dialog closed while enhancing
+
+            def efail(tb):
+                try:
+                    b_enh.setEnabled(True); b_enh.setText("✦ Enhance")
+                except RuntimeError:
+                    pass
+                _error("Enhance failed:\n\n" + tb)
+
+            self._ext_enh_worker.done.connect(edone)
+            self._ext_enh_worker.failed.connect(efail)
+            self._ext_enh_worker.start()
+
+        b_enh.clicked.connect(_do_enhance)
+        drow = QtWidgets.QHBoxLayout()
+        drow.addWidget(QtWidgets.QLabel("Duration (s):"))
+        dur = QtWidgets.QComboBox(); dur.addItems([str(s) for s in range(4, 16)])
+        dur.setCurrentText("5"); drow.addWidget(dur)
+        cb_audio = QtWidgets.QCheckBox("🔊 Audio")
+        cb_audio.setChecked(CONFIG.GENERATE_AUDIO)
+        cb_audio.setToolTip("Generate audio for the new clip. For SPOKEN dialogue, "
+                            "put the line in \"double quotes\" in the prompt "
+                            "(e.g. she gets up and says \"let's go\").")
+        drow.addWidget(cb_audio)
+        join = QtWidgets.QCheckBox("Also join into one video (A+B)")
+        drow.addWidget(join); drow.addStretch(1); lay.addLayout(drow)
+        refw = _RefImagesWidget(dlg)                  # lock the character across the cut
+        lay.addWidget(refw)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok
+                                        | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if not dlg.exec():
+            return
+        prompt = (pe.toPlainText().strip()
+                  or "Continue the scene naturally, same look, subject and motion.")
+        duration = int(dur.currentText())
+        do_join = join.isChecked()
+        gen_audio = cb_audio.isChecked()
+        ref_srcs = refw.sources()
+        src_a = vid
+        _mark_active_project()
+        meta = {}
+        if ref_srcs:
+            # Character refs attached -> Seedance forbids first_frame + reference_image,
+            # so go multimodal (mode 3): last frame = Image 1, refs = Image 2+, start
+            # described in the prompt. Trusted input (last frame + trusted refs).
+            _imgs, _text = _extend_multimodal(first_src, ref_srcs, prompt)
+            worker = _Worker(lambda: _seedance_generate(
+                _text, _imgs, None, duration, out_meta=meta,
+                generate_audio=gen_audio, trusted_input=True), parent=_main_window())
+        else:
+            worker = _Worker(lambda: _seedance_generate(
+                prompt, [], None, duration, first_frame=first_src, out_meta=meta,
+                generate_audio=gen_audio, trusted_input=trusted), parent=_main_window())
+
+        def done(vb):
+            _discard_video_job(worker)
+            _add_video_result(vb, None, None, prompt="(extend) " + prompt,
+                              last_frame_url=meta.get("last_frame_url"),
+                              video_url=meta.get("video_url"))
+            if do_join and self._items:
+                b_path = self._items[-1]["video"]        # B just added = newest
+                out = _unique_path(_scene_movies_dir(), _scene_tag() + "_extended",
+                                   ext=".mp4")
+                cw = _Worker(lambda: _concat_videos(src_a, b_path, out),
+                             parent=_main_window())
+
+                def cdone(_r):
+                    poster = os.path.splitext(out)[0] + ".jpg"
+                    try:
+                        if not _extract_poster_frame(out, poster):
+                            poster = None
+                    except Exception:
+                        poster = None
+                    self.add_video(out, poster, None, prompt="(extended A+B)")
+                    cmds.inViewMessage(amg="Joined into one clip.",
+                                       pos="midCenter", fade=True)
+
+                def cfail(tb):
+                    sys.stderr.write("[BYTEPLUS] join failed:\n" + tb + "\n")
+                    cmds.inViewMessage(amg="Join failed — both clips are in the "
+                                       "gallery.", pos="midCenter", fade=True)
+
+                cw.done.connect(cdone); cw.failed.connect(cfail); cw.start()
+                self._cw = cw
+
+        def failed(tb):
+            _discard_video_job(worker)
+            if "Network error" in tb:
+                _error("Couldn't reach BytePlus -- a network / DNS hiccup interrupted "
+                       "the extend. Check your internet / VPN and try again.")
+            elif any(s in tb for s in ("SensitiveContent", "PrivacyInformation",
+                                       "real person")):
+                _error("Seedance blocked the continuation frame (face not trusted).\n\n"
+                       "Local last-frame extraction loses face-trust — extend a clip "
+                       "WITH A FACE only within ~24h of generating it (it keeps a "
+                       "trusted last frame).")
+            else:
+                _error("Extend failed:\n\n" + tb)
+
+        worker.done.connect(done); worker.failed.connect(failed)
+        _register_video_job(worker); worker.start()
+        self.add_pending(worker)                     # placeholder tile in the strip
+        cmds.inViewMessage(amg="Extending clip…", pos="midCenter", fade=True)
+        # Auto-permanence: upgrade the 24h last-frame to a PERMANENT asset:// in the
+        # background so future extends (and after 24h) never expire. Fire-and-forget.
+        if (CONFIG.AUTO_TRUST_ASSETS and _asset_api_ready() and trusted
+                and isinstance(first_src, str) and first_src.startswith("http")):
+            uw = _Worker(lambda: _auto_register_asset(first_src, name="lastframe"),
+                         parent=_main_window())
+
+            def _upg(uri):
+                if uri:
+                    try:
+                        with open(sc, "w") as f:
+                            json.dump({"url": uri, "ts": int(time.time())}, f)
+                    except OSError:
+                        pass
+
+            uw.done.connect(_upg)
+            uw.start()
+            self._uw = uw
+
     def _regen(self):
         """EDIT the selected video (video-to-video) with Seedance 2.0: attach the
         saved clip as the reference video and apply only the user's named change on
         top, keeping the source subject, motion and camera."""
         if not self._current:
             return
-        if not _motion_host_ready():
+        video_path = self._current["video"]
+        poster = self._current.get("poster")
+        # A clip generated here keeps its ORIGINAL trusted Seedance URL (< ~24h).
+        # Reuse it as the reference so an AI FACE stays trusted AND no re-upload /
+        # hosting is needed. Only when there's no fresh trusted URL do we re-host
+        # the local file (which needs R2/TOS and strips face-trust).
+        src_url = _read_srcurl_sidecar(video_path)
+        if not src_url and not _motion_host_ready():
             _error("Editing a clip with Seedance needs the source uploaded as a "
                    "public URL, which requires motion-video hosting (Cloudflare R2 "
                    "or BytePlus TOS).\n\nSet it up in  BYTEPLUS > Settings > Storage "
                    "& Hosting,  then try again.")
             return
-        video_path = self._current["video"]
-        poster = self._current.get("poster")
         dur0 = _video_duration(video_path)
         default_dur = max(4, min(15, int(round(dur0)) if dur0 else 5))
         d = VideoEditDialog(self, video_path=video_path, poster=poster,
@@ -4123,42 +4858,58 @@ class VideoGallery(QtWidgets.QDialog):
                 CONFIG.VIDEO_RESOLUTION, duration)):
             return
 
+        # Reference images the user attached to LOCK the character / look (trusted-
+        # first sources). reference_video + reference_image is Seedance's multimodal
+        # mode (allowed). We never auto-send the poster (an extracted frame = an
+        # untrusted real-looking face); only the user's explicit, trusted refs.
+        ref_srcs = d.ref_sources()
         # If the box already holds a full prompt (Enhance wrote one, or the user
         # pasted a Seedance prompt), send it as-is; otherwise wrap the bare
-        # instruction with a lock-down clause so the source is still preserved.
+        # instruction -- locking identity to the REFS when present, else to the video.
         full = ("Photoreal." in comment) or ("reference video" in comment.lower())
-        final_prompt = comment if full else _seedance_edit_wrap(comment)
-        # Do NOT send the poster as a reference_image: it's now a frame extracted
-        # from the video (a real-looking face) that Seedance flags as a non-trusted
-        # real face. The source VIDEO (reference_video) already carries the look and
-        # motion for a video-to-video edit, so it is the sole reference.
-        ref_img = None
+        final_prompt = comment if full else _seedance_edit_wrap(
+            comment, with_refs=bool(ref_srcs))
 
         prog = _progress("Editing video with Seedance 2.0 (keeping the source)...")
 
+        _emeta = {}                                  # edited clip's own trusted URL
         def done(vb):
             prog.close()
             edit_prompt = "Edit: " + comment
             vid, new_poster = _save_video(vb, poster, self._mov_dir, prompt=edit_prompt)
+            if _emeta.get("video_url"):               # let the EDIT be edited too (<24h)
+                try:
+                    with open(vid + ".srcurl.json", "w") as f:
+                        json.dump({"url": _emeta["video_url"],
+                                   "ts": int(time.time())}, f)
+                except OSError:
+                    pass
             self._add(vid, new_poster, None, select=True, prompt=edit_prompt)
 
         def failed(tb):
             prog.close()
-            if any(s in tb for s in ("SensitiveContent", "PrivacyInformation",
-                                     "real person")):
+            if "Network error" in tb:
+                _error("Couldn't reach BytePlus -- a network / DNS hiccup interrupted "
+                       "the edit. Check your internet / VPN and try Edit video again "
+                       "(your clip is untouched).")
+            elif any(s in tb for s in ("SensitiveContent", "PrivacyInformation",
+                                       "real person")):
                 _error(
-                    "Seedance blocked this clip: it detected a REAL HUMAN FACE.\n\n"
-                    "Seedance 2.0 rejects real-person faces as input references "
-                    "(privacy / biometric policy) — this is a platform rule, not a "
-                    "plugin bug. Editing clips WITHOUT real faces (environments, "
-                    "objects, rendered or stylized characters) works normally.\n\n"
-                    "Real-person footage needs enterprise verification / a contract "
-                    "with BytePlus (Trusted Outputs).")
+                    "Seedance blocked this clip: the face isn't a trusted input.\n\n"
+                    "An AI clip's face stays trusted only when the edit reuses its "
+                    "ORIGINAL Seedance output (kept ~24h). This clip is either older "
+                    "than ~24h (its trusted URL expired) or was made before this "
+                    "build, so it had to be re-hosted — which strips the face "
+                    "exemption.\n\nEdit AI-face clips within ~24h of generating them. "
+                    "Clips WITHOUT faces (environments, objects, stylized characters) "
+                    "always edit fine. Real-person footage is never accepted.")
             else:
                 _error(tb)
 
         self._worker = _Worker(
-            lambda: _seedance_edit(video_path, final_prompt, duration, ref_img),
+            lambda: _seedance_edit(video_path, final_prompt, duration,
+                                   ref_imgs=ref_srcs, source_url=src_url,
+                                   out_meta=_emeta),
             parent=self)
         self._worker.done.connect(done)
         self._worker.failed.connect(failed)
@@ -4228,6 +4979,7 @@ class VideoGallery(QtWidgets.QDialog):
         else:
             _hide_paths([it["video"] for it in self._items])   # stay cleared on reopen
         self._items = []
+        self._pending = []
         self.strip.clear()
         self.view.clear()
         self.view.setText("")
@@ -4244,13 +4996,148 @@ def _video_gallery() -> "VideoGallery":
     return g
 
 
-def _add_video_result(video_bytes: bytes, poster_src, regen, prompt=None):
-    """Save a finished Seedance video + poster and add it to the Video Gallery."""
+def _video_gallery_if_open():
+    """The Video Gallery singleton IF it already exists and is visible, else None.
+    Never creates it -- used to drop a 'generating' placeholder only when the user
+    is actually looking at the gallery."""
+    g = getattr(_video_gallery, "_inst", None)
+    try:
+        return g if (g is not None and g.isVisible()) else None
+    except RuntimeError:
+        return None
+
+
+def _add_video_result(video_bytes: bytes, poster_src, regen, prompt=None,
+                      last_frame_url=None, video_url=None):
+    """Save a finished Seedance video + poster and add it to the Video Gallery.
+    Trusted-URL sidecars (kept ~24h, same account):
+    - `last_frame_url` -> `<video>.lastframe.json`: EXTEND (its last frame -> the
+      next clip's first frame).
+    - `video_url` (the clip's ORIGINAL Seedance output URL) -> `<video>.srcurl.json`:
+      EDIT video, reusing it as the reference_video keeps the face exemption (a
+      re-hosted local copy would strip it)."""
     vid, poster = _save_video(video_bytes, poster_src, _scene_movies_dir(), prompt=prompt)
+    if last_frame_url:
+        try:
+            with open(vid + ".lastframe.json", "w") as f:
+                json.dump({"url": last_frame_url, "ts": int(time.time())}, f)
+        except OSError:
+            pass
+    if video_url:
+        try:
+            with open(vid + ".srcurl.json", "w") as f:
+                json.dump({"url": video_url, "ts": int(time.time())}, f)
+        except OSError:
+            pass
     g = _video_gallery()
     g.add_video(vid, poster, regen, prompt=prompt)
     g.show()
     g.raise_()
+
+
+def _recover_scan():
+    """NETWORK ONLY (call from a worker). Check every journalled task and return
+    (recovered, drop): `recovered` = payloads ready to save, `drop` = task ids to
+    forget. Drop rules are deliberately CONSERVATIVE -- only forget a task that is
+    truly unrecoverable (terminal status / gone / >48h). Anything else (offline,
+    auth not configured yet, download hiccup) is KEPT and retried on the next load,
+    because the clip was already paid for."""
+    out, drop = [], []
+    for t in _tasks_load():
+        tid = t.get("task_id")
+        if not tid:
+            continue
+        if time.time() - t.get("ts", 0) > 48 * 3600:
+            drop.append(tid); continue               # expired server-side
+        url = "{}{}/{}".format(CONFIG.BASE_URL, CONFIG.VIDEO_TASKS, tid)
+        try:
+            st = _request("GET", url)
+        except _NetworkError:
+            continue                                 # offline -> retry next load
+        except Exception as e:
+            if "NotFound" in str(e) or "404" in str(e):
+                drop.append(tid)                     # really gone
+            continue                                 # auth/other -> keep, retry later
+        status = (st.get("status") or st.get("state") or "").lower()
+        if status in ("succeeded", "success", "done", "completed"):
+            vu = _find_video_url(st)
+            if not vu:
+                drop.append(tid); continue
+            try:
+                vb = _get_bytes(vu)
+            except Exception:
+                continue                             # URL good ~24h -> retry next load
+            _c = st.get("content") or {}
+            out.append({"bytes": vb, "prompt": t.get("prompt") or "",
+                        "mov_dir": t.get("mov_dir") or "", "video_url": vu,
+                        "last_frame_url": (_c.get("last_frame_url")
+                                           if isinstance(_c, dict) else None)})
+            drop.append(tid)
+        elif status in ("failed", "error", "cancelled", "canceled", "expired"):
+            drop.append(tid)
+        # queued / running -> leave it; the next load will pick it up
+    return out, drop
+
+
+def _recover_tasks():
+    """Auto-recover clips whose poll never finished (PC slept, Maya closed, network
+    died). The task ran -- and was BILLED -- on BytePlus; its result URL lives ~24h
+    and the task ~48h, so the clip is still there. Silent by design: it saves to the
+    clip's OWN project folder and only touches the Video Gallery if it's already
+    open (never pops a window on startup). MAIN THREAD entry; network in a worker."""
+    if not _tasks_load():
+        return                                       # nothing pending -> zero cost
+
+    def done(res):
+        out, drop = res
+        for tid in drop:
+            _task_journal_drop(tid)
+        n = 0
+        for r in out:                                # MAIN thread: _save_video uses cmds
+            try:
+                mov = r["mov_dir"] or _scene_movies_dir()
+                if not os.path.isdir(mov):
+                    os.makedirs(mov, exist_ok=True)
+                pr = "(recovered) " + r["prompt"]
+                vid, poster = _save_video(r["bytes"], None, mov, prompt=pr)
+                for name, u in ((".lastframe.json", r.get("last_frame_url")),
+                                (".srcurl.json", r.get("video_url"))):
+                    if u:
+                        try:
+                            with open(vid + name, "w") as f:
+                                json.dump({"url": u, "ts": int(time.time())}, f)
+                        except OSError:
+                            pass
+                g = _video_gallery_if_open()         # never force the gallery open
+                if g:
+                    g.add_video(vid, poster, None, prompt=pr)
+                n += 1
+            except Exception:
+                sys.stderr.write("[BYTEPLUS] recover: could not save a clip:\n"
+                                 + traceback.format_exc() + "\n")
+        if n:
+            cmds.inViewMessage(
+                amg="✓ Recovered <hl>{}</hl> unfinished clip(s) — see the Video "
+                    "Gallery.".format(n), pos="midCenterTop", fade=True)
+
+    _recover_tasks._w = _Worker(_recover_scan, parent=_main_window())
+    _recover_tasks._w.done.connect(done)
+    _recover_tasks._w.start()
+
+
+def _read_srcurl_sidecar(video_path, max_age=24 * 3600):
+    """The clip's ORIGINAL trusted Seedance video URL if it was saved and is still
+    fresh (< ~24h), else None. Reusing it as the reference_video for an EDIT keeps
+    the face exemption -- a re-hosted local copy would strip it (face rejected)."""
+    try:
+        with open(video_path + ".srcurl.json") as f:
+            d = json.load(f)
+        url = d.get("url")
+        if url and (time.time() - d.get("ts", 0)) < max_age:
+            return url
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def open_video_gallery():
@@ -4259,6 +5146,7 @@ def open_video_gallery():
     # Reset to the current scene (the gallery is a singleton that may hold
     # another scene's items from earlier in the session).
     g.strip.clear()
+    g._pending = []
     g._items = []
     g._current = None
     g._load_existing()
@@ -4314,8 +5202,9 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                        model: str | None = None,
                        watermark: bool | None = None,
                        last_frame: str | None = None,
-                       return_last_frame: bool = False,
+                       return_last_frame: bool | None = None,
                        priority: int | None = None,
+                       out_meta: dict | None = None,
                        fit_motion: bool = False,
                        trusted_input: bool = False) -> bytes:
     """Submit a Seedance job and poll until done. Returns the video bytes.
@@ -4340,12 +5229,19 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
     # Match the motion reference's length to the requested output duration, or
     # Seedance time-warps it and drifts from the animation (e.g. a 4.3s playblast
     # against a 4s output). Only for motion-driven flows (Animate/Render).
-    if movie and fit_motion:
+    # A trusted/public http URL (e.g. a clip's ORIGINAL Seedance output, reused as
+    # the reference for a video-to-video EDIT) is passed THROUGH untouched --
+    # re-hosting OR re-encoding it would strip Seedance's face exemption (invariant
+    # #3). Only a LOCAL path is fitted/hosted.
+    _movie_is_url = isinstance(movie, str) and movie.startswith("http")
+    if movie and fit_motion and not _movie_is_url:
         movie = _fit_video_seconds(movie, int(duration))
     # Host the motion video(s) once (public URLs, deleted when the job ends).
     cleanups = []
     movie_url = None
-    if movie:
+    if movie and _movie_is_url:
+        movie_url = movie                            # trusted URL passed through (no re-host)
+    elif movie:
         try:
             movie_url, _cu = _host_video(movie)
             cleanups.append(_cu)
@@ -4443,6 +5339,7 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
     _res = resolution or CONFIG.VIDEO_RESOLUTION
     _ratio = ratio or CONFIG.VIDEO_RATIO
     _wm = CONFIG.WATERMARK if watermark is None else bool(watermark)
+    _rlf = CONFIG.RETURN_LAST_FRAME if return_last_frame is None else bool(return_last_frame)
 
     def _submit(content, audio):
         body = {
@@ -4454,7 +5351,7 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
             "watermark": _wm,
             "generate_audio": audio,
         }
-        if return_last_frame:
+        if _rlf:
             body["return_last_frame"] = True
         if priority:
             body["priority"] = int(priority)
@@ -4467,6 +5364,8 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
         tid = created.get("id") or created.get("task_id")
         if not tid:
             raise RuntimeError("No task id in response: " + json.dumps(created))
+        # From here the job is BILLED even if this poll never finishes -> journal it.
+        _task_journal_add(tid, prompt, _model, _ACTIVE_MOV_DIR)
         return tid
 
     def _run(audio):
@@ -4481,6 +5380,7 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
             else:
                 raise
         url = "{}{}/{}".format(CONFIG.BASE_URL, CONFIG.VIDEO_TASKS, task_id)
+        net_fails = 0
         while True:                                  # poll (Seedance is async)
             time.sleep(CONFIG.POLL_SECONDS)
             if _cancel_requested():                  # user hit ✕ -> real abort
@@ -4491,8 +5391,19 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                 except Exception as ce:
                     sys.stderr.write("[BYTEPLUS] cancel: could not abort task "
                                      "{} -> {}\n".format(task_id, ce))
+                _task_journal_drop(task_id)          # aborted -> nothing to recover
                 raise _Cancelled()
-            st = _request("GET", url)
+            try:
+                st = _request("GET", url)
+            except _NetworkError as ne:              # transient blip: keep the task
+                net_fails += 1
+                if net_fails > _POLL_NET_RETRIES:
+                    raise
+                sys.stderr.write("[BYTEPLUS] poll network blip {}/{} ({}); the task "
+                                 "is still running -- retrying.\n".format(
+                                     net_fails, _POLL_NET_RETRIES, ne))
+                continue
+            net_fails = 0                            # any good poll resets the counter
             status = (st.get("status") or st.get("state") or "").lower()
             if status in ("succeeded", "success", "done", "completed"):
                 video_url = _find_video_url(st)
@@ -4500,6 +5411,11 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                     raise RuntimeError(
                         "Task succeeded but no video URL found. Raw response:\n"
                         + json.dumps(st, indent=2))
+                if out_meta is not None:                # trusted refs -> Extend / Edit
+                    out_meta["video_url"] = video_url    # original trusted clip URL
+                    _c = st.get("content") or {}
+                    out_meta["last_frame_url"] = (_c.get("last_frame_url")
+                                                  if isinstance(_c, dict) else None)
                 _track("videos", st, _model)
                 _u = (st.get("usage") or {})
                 sys.stderr.write("[BYTEPLUS] Seedance returned -> resolution={} "
@@ -4508,8 +5424,11 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                                      st.get("resolution"), st.get("duration"),
                                      st.get("frames"), _u.get("total_tokens"),
                                      int(duration)))
-                return _get_bytes(video_url)
+                data = _get_bytes(video_url)
+                _task_journal_drop(task_id)          # safely downloaded -> stop tracking
+                return data
             if status in ("failed", "error", "cancelled", "canceled"):
+                _task_journal_drop(task_id)          # nothing to recover
                 raise RuntimeError("Seedance task failed: " + json.dumps(st, indent=2))
 
     def _once(audio):
@@ -4533,6 +5452,11 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
             try:
                 return _once(_audio)
             except _Cancelled:
+                raise
+            except _NetworkError:
+                # A connection/DNS failure that survived the poll-loop's own retries.
+                # Do NOT re-submit -- that would create a second, billed task while
+                # the original may still be running. Surface the clean message.
                 raise
             except RuntimeError as e:
                 # Retry transient failures + face rejections on a TRUSTED fresh
@@ -4559,10 +5483,22 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                                  "{}\n".format(e))
 
 
-def _seedance_edit_wrap(instruction: str) -> str:
+def _seedance_edit_wrap(instruction: str, with_refs: bool = False) -> str:
     """Wrap a bare edit instruction with a lock-down clause so even an un-enhanced
     instruction preserves the source (identity, motion, camera) and changes only
-    the named element -- the deterministic fallback when the user skips Enhance."""
+    the named element -- the deterministic fallback when the user skips Enhance.
+
+    `with_refs`: reference IMAGES were attached -> lock the character's identity to
+    THEM (not to the video's own, possibly hidden/invented, face) while keeping the
+    video's motion & camera. This is the point of adding a reference on a clip whose
+    face isn't visible."""
+    if with_refs:
+        return ("Keep the reference VIDEO's motion, camera, framing, performance and "
+                "timing. Lock the character's identity, face, hair and wardrobe to "
+                "the reference IMAGE(S) so the person stays consistent with them. "
+                "Apply ONLY this change, integrating it photorealistically with "
+                "matching light, contact shadows, haze and grain: {}. Change nothing "
+                "else.".format(instruction.strip()))
     return ("Keep the reference video exactly as it is -- same subject, face and "
             "identity, wardrobe, performance, framing, lens, camera motion and "
             "timing -- and change ONLY the following, integrating it "
@@ -4573,27 +5509,38 @@ def _seedance_edit_wrap(instruction: str) -> str:
 
 
 def _seedance_edit(video_path: str, prompt: str, duration: int,
-                   ref_img_src=None) -> bytes:
-    """EDIT an existing clip with Seedance 2.0 (video-to-video): the saved video is
-    attached as the reference video (motion + composition), an optional frame as the
-    reference image (locks the look), and `prompt` names the single change with the
-    source locked. Returns the new video bytes. NETWORK ONLY -- call from a worker.
+                   ref_imgs=None, source_url=None, out_meta=None) -> bytes:
+    """EDIT an existing clip with Seedance 2.0 (video-to-video): the source video is
+    attached as the reference video (motion + composition), optional `ref_imgs` as
+    reference_image(s) that lock the character's identity/look, and `prompt` names
+    the change with the source locked. Returns the new video bytes. NETWORK ONLY.
 
-    Works on a COPY of the source so _ensure_seedance_video can never delete or
-    re-encode the user's gallery file in place."""
+    `ref_imgs`: trusted-first image sources (asset:// / fresh Seedream URL / path).
+    reference_video + reference_image is Seedance's multimodal mode (allowed).
+    `source_url`: the clip's ORIGINAL trusted Seedance URL (fresh, < ~24h). When
+    given it is passed THROUGH untouched as the reference_video, so an AI-face clip
+    keeps its face exemption (and no re-upload / hosting is needed). When absent, the
+    LOCAL file is copied + hosted -- which strips face-trust, so a clip WITH a face
+    is rejected by Seedance (environments/objects/stylized still edit fine)."""
+    imgs = list(ref_imgs or [])
+    if source_url:
+        # Trusted URL -> reference_video passed through untouched (face preserved).
+        out = _seedance_generate(prompt, imgs, source_url, int(duration),
+                                 require_motion_video=True, out_meta=out_meta,
+                                 trusted_input=True)
+        return _mux_audio_from(out, video_path)
     import tempfile, shutil
     tmp = tempfile.mkdtemp(prefix="byteplus_vedit_")
     local = os.path.join(tmp, os.path.basename(video_path))
     try:
         shutil.copyfile(video_path, local)
         mp4 = _ensure_seedance_video(local)          # MP4/H.264 <=200MB (on the copy)
-        imgs = [ref_img_src] if ref_img_src else []
         # No fit_motion: gallery clips are Seedance outputs with an integer duration,
         # so there's no drift to correct, and passing the clip byte-identical keeps
         # its TRUSTED-output status (re-encoding it would strip that and get the
         # face rejected).
         out = _seedance_generate(prompt, imgs, mp4, int(duration),
-                                 require_motion_video=True)
+                                 require_motion_video=True, out_meta=out_meta)
         # Seedance returns a SILENT edit -> restore the ORIGINAL clip's audio track
         # so the edited video keeps its soundtrack (best-effort; no-op if the
         # source has no audio or ffmpeg is missing). Uses the untouched source
@@ -4707,7 +5654,6 @@ def _pick_gallery_image(items, parent, warn_trust=True):
     face-trust hint (irrelevant when just picking an image to compare)."""
     dlg = QtWidgets.QDialog(parent)
     dlg.setWindowTitle("Pick a reference image")
-    dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
     dlg.setMinimumSize(600, 400)
     lay = QtWidgets.QVBoxLayout(dlg)
     lay.addWidget(QtWidgets.QLabel("Double-click an image to use it as a reference."))
@@ -4748,7 +5694,6 @@ def _pick_gallery_video(items, parent):
     None."""
     dlg = QtWidgets.QDialog(parent)
     dlg.setWindowTitle("Pick a reference video")
-    dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
     dlg.setMinimumSize(600, 400)
     lay = QtWidgets.QVBoxLayout(dlg)
     lay.addWidget(QtWidgets.QLabel(
@@ -4813,7 +5758,6 @@ def _pick_trusted_asset(parent):
         return None, None
     dlg = QtWidgets.QDialog(parent)
     dlg.setWindowTitle("Pick a trusted character")
-    dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
     dlg.setMinimumSize(620, 420)
     lay = QtWidgets.QVBoxLayout(dlg)
     lay.addWidget(QtWidgets.QLabel(
@@ -4858,7 +5802,6 @@ class AnimateDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("Animate with Seedance 2.0")
         self.setMinimumSize(500, 380)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._image_src = image_src
         self._worker = None
         self._dream_items = list(dream_items or [])
@@ -4956,8 +5899,39 @@ class AnimateDialog(QtWidgets.QDialog):
             "scene animation.")
         self.duration.currentIndexChanged.connect(self._update_cost)
         drow.addWidget(self.duration)
+        # Resolution on the fly (Video GEN has it; Settings is too far away when you
+        # just want a cheap 480p test before committing to 1080p/4k).
+        drow.addSpacing(12)
+        drow.addWidget(QtWidgets.QLabel("Resolution:"))
+        self.res = QtWidgets.QComboBox()
+        self.res.addItems(["480p", "720p", "1080p", "4k"])
+        self.res.setCurrentText(CONFIG.VIDEO_RESOLUTION)
+        self.res.setToolTip("Output resolution for this clip. Defaults to your "
+                            "Settings > Generation value; changing it here affects "
+                            "only this generation. 4k is Base-model only and slower.")
+        self.res.currentIndexChanged.connect(self._update_cost)
+        drow.addWidget(self.res)
         drow.addStretch(1)
         v.addLayout(drow)
+        # Offer to reuse the last playblast (only when one matches this scene/range/
+        # camera). Ticked by default: re-capturing an unchanged scene is pure waiting.
+        self.cb_reuse_pb = QtWidgets.QCheckBox()
+        _hit = _playblast_cached()
+        if _hit:
+            _fresh = _hit[1] <= _PB_AUTOTICK_SECS
+            self.cb_reuse_pb.setText(
+                "♻️ Reuse the last playblast (captured {})".format(_fmt_age(_hit[1])))
+            self.cb_reuse_pb.setChecked(_fresh)      # old one: offered, not assumed
+            self.cb_reuse_pb.setToolTip(
+                "Skips re-capturing the viewport (same scene, range and camera). "
+                "UNTICK if you've changed the animation, camera or scene since then "
+                "— Maya can't tell us reliably, so you decide."
+                + ("" if _fresh else "\n\nThis one is over 30 minutes old, so it's "
+                                     "left unticked — tick it if nothing has changed."))
+            v.addWidget(self.cb_reuse_pb)
+        else:
+            self.cb_reuse_pb.setChecked(False)
+            self.cb_reuse_pb.hide()                  # nothing to reuse yet
         self.cb_audio = QtWidgets.QCheckBox("Generate audio (Seedance)")
         self.cb_audio.setChecked(True)
         self.cb_audio.setToolTip("Let Seedance add a soundtrack / SFX. If the audio "
@@ -4990,10 +5964,16 @@ class AnimateDialog(QtWidgets.QDialog):
         else:
             dur = int(self.duration.currentText())
         has_video = self.use_anim.isChecked() and _motion_host_ready()
-        tok, usd = _est_video_cost(CONFIG.VIDEO_RESOLUTION, CONFIG.VIDEO_RATIO,
-                                   dur, has_video)
-        self.cost.setText("{}  ({}, {}s)".format(
-            _fmt_cost(tok, usd), CONFIG.VIDEO_RESOLUTION, dur))
+        res = self.resolution()
+        tok, usd = _est_video_cost(res, CONFIG.VIDEO_RATIO, dur, has_video)
+        self.cost.setText("{}  ({}, {}s)".format(_fmt_cost(tok, usd), res, dur))
+
+    def resolution(self):
+        """Resolution chosen for THIS clip (falls back to the CONFIG default)."""
+        return self.res.currentText() or CONFIG.VIDEO_RESOLUTION
+
+    def reuse_playblast(self):
+        return bool(self.cb_reuse_pb.isChecked())
 
     def _sync_mode(self, *_):
         """The text box's role depends on the playblast checkbox: when the
@@ -5384,10 +6364,10 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
 
     # Cost guard (only prompts if the estimate exceeds the threshold).
     has_video = bool(host) and (use_anim or bool(extra_movies))
-    _tok, _usd = _est_video_cost(CONFIG.VIDEO_RESOLUTION, CONFIG.VIDEO_RATIO,
-                                 duration, has_video)
-    if not _confirm_cost(_usd, "Animate -> {} video, {}s.".format(
-            CONFIG.VIDEO_RESOLUTION, duration)):
+    _res = d.resolution()                            # per-clip choice, not the global
+    _reuse_pb = d.reuse_playblast()                  # artist ticked "reuse the last"
+    _tok, _usd = _est_video_cost(_res, CONFIG.VIDEO_RATIO, duration, has_video)
+    if not _confirm_cost(_usd, "Animate -> {} video, {}s.".format(_res, duration)):
         return
 
     dlg = _progress("Preparing animation...")
@@ -5412,7 +6392,10 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
                             "" if _att == 0 else "  retry {}".format(_att)))
                         QtWidgets.QApplication.processEvents()
                         try:
-                            cand = _playblast_movie(*_rng)
+                            # reuse only on the FIRST attempt: if a retry is happening
+                            # the cached one is suspect, so re-capture for real.
+                            cand = _playblast_movie(*_rng,
+                                                    reuse=(_reuse_pb and _att == 0))
                         except Exception as e:
                             sys.stderr.write("[BYTEPLUS] playblast capture failed "
                                              "(attempt {}): {}\n".format(_att + 1, e))
@@ -5583,14 +6566,21 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
         return _seedance_generate(final, image_sources, movie, duration,
                                   require_motion_video=bool(movie),
                                   generate_audio=audio, extra_movies=ready_extras,
-                                  fit_motion=True, trusted_input=trusted_input)
+                                  fit_motion=True, trusted_input=trusted_input,
+                                  resolution=_res, out_meta=_meta)
 
+    _meta = {}                                        # trusted last-frame -> Extend
     worker = _Worker(lambda: make_video(prompt), parent=_main_window())
     worker.done.connect(lambda vb: (_discard_video_job(worker), dlg.close(),
-                        _add_video_result(vb, poster, make_video, prompt=prompt)))
+                        _add_video_result(vb, poster, make_video, prompt=prompt,
+                                          last_frame_url=_meta.get("last_frame_url"),
+                                          video_url=_meta.get("video_url"))))
     worker.failed.connect(lambda tb: (_discard_video_job(worker), failed(tb)))
     _register_video_job(worker)                       # count against the concurrency cap
     worker.start()
+    _g = _video_gallery_if_open()
+    if _g:
+        _g.add_pending(worker)                        # placeholder if gallery is open
 
 
 # =============================================================================
@@ -5683,6 +6673,7 @@ def render_with_seedance():
 
     poster = ref_paths[0] if ref_paths else None     # first Arnold frame = poster
 
+    _meta = {}                                       # trusted URLs -> Extend / Edit
     def make_video(p):                               # re-runnable with a new prompt
         # The playblast is mandatory and attached. Reference it DIRECTLY (the
         # API's reference_video role); require_motion_video makes a failed upload
@@ -5691,11 +6682,13 @@ def render_with_seedance():
                  "timing of the reference video; the reference video provides "
                  "ONLY the motion, not the look.  " + p)
         return _seedance_generate(final, ref_paths, movie, duration,
-                                  require_motion_video=True, fit_motion=True)
+                                  require_motion_video=True, fit_motion=True,
+                                  out_meta=_meta)
 
     worker = _Worker(lambda: make_video(prompt), parent=_main_window())
     worker.done.connect(lambda vb: (dlg.close(),
-                        _add_video_result(vb, poster, make_video, prompt=prompt)))
+                        _add_video_result(vb, poster, make_video, prompt=prompt,
+                                          video_url=_meta.get("video_url"))))
     worker.failed.connect(lambda tb: (dlg.close(), _error(tb)))
     worker.start()
     render_with_seedance._w = worker  # keep ref alive
@@ -5961,7 +6954,6 @@ class DreamDialog(QtWidgets.QDialog):
         self.setWindowTitle("BYTEPLUS - Text to Image" if text_only_mode
                             else "BYTEPLUS - Dream with Seedream 5.0")
         self.setMinimumSize(580, 640)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._snap = snapshot_path
         self._extra = None
         self._cap_worker = None
@@ -6028,13 +7020,25 @@ class DreamDialog(QtWidgets.QDialog):
             "Dream AROUND the reference  (keep subjects + layout, just finish it)")
         self.mode_around.setChecked(True)
         self.mode_layout = QtWidgets.QRadioButton(
-            "Use the LAYOUT only  (same composition, describe the look in the prompt)")
+            "Follow the LAYOUT  (guide the composition, describe the look in the prompt)")
         self.mode_layout.setToolTip(
-            "The viewport gives the LAYOUT (positions, facing, camera); the LOOK "
+            "The viewport GUIDES the layout (positions, facing, camera); the LOOK "
             "comes from your Prompt below. For this, DON'T add an Extra reference — a "
-            "second image competes with the layout and usually wins (A/B-verified).")
+            "second image competes with the layout and usually wins (A/B-verified).\n\n"
+            "Honest limit: Seedream has no structural conditioning (no depth/pose "
+            "input), so the layout is a STRONG GUIDE, not an exact constraint — "
+            "expect it to drift. When you need tighter adherence, generate once and "
+            "then use Image to Image on that result: the image carries more weight "
+            "than any wording.")
         v.addWidget(self.mode_around)
         v.addWidget(self.mode_layout)
+        _hint = QtWidgets.QLabel(
+            "The layout guides the composition — it isn't an exact constraint; for "
+            "tighter adherence, follow up with Image to Image. In LAYOUT mode don't "
+            "add an Extra reference: a second image competes with the layout and "
+            "usually wins.")
+        _hint.setWordWrap(True); _hint.setStyleSheet("color:#888;")
+        v.addWidget(_hint)
 
         # --- prompt ----------------------------------------------------------
         ph = QtWidgets.QHBoxLayout()
@@ -6231,7 +7235,6 @@ class RefineDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("Refine image")
         self.setMinimumSize(480, 280)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._worker = None
         v = QtWidgets.QVBoxLayout(self)
         v.addWidget(QtWidgets.QLabel(
@@ -6452,7 +7455,6 @@ class _AnnotateCanvas(QtWidgets.QGraphicsView):
         dlg.setInputMode(QtWidgets.QInputDialog.TextInput)
         dlg.setWindowTitle("Text label")
         dlg.setLabelText("Label:")
-        dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         dlg.raise_()
         dlg.activateWindow()
         ok = bool(dlg.exec())
@@ -6525,7 +7527,6 @@ class InteractiveEditDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Interactive Edit (Seedream 5.0 Pro)")
         self.setMinimumSize(760, 780)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._enh_worker = None
         self._refs = []                       # extra reference images (glasses, hat...)
         v = QtWidgets.QVBoxLayout(self)
@@ -6763,7 +7764,6 @@ class DreamGallery(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle(_usage_title("BYTEPLUS - Dream Gallery"))
         self.setMinimumSize(760, 660)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._regen = regen           # callable -> {"bytes","path","url"}
         self._img_dir = img_dir
         self._variations = max(1, int(variations))   # initial-batch size
@@ -6823,11 +7823,17 @@ class DreamGallery(QtWidgets.QDialog):
         b_cmp.clicked.connect(self._compare)
         b_clear = QtWidgets.QPushButton("Clear all")
         b_clear.clicked.connect(self._clear_all)
+        b_perm = QtWidgets.QPushButton("🎭 Make permanent")
+        b_perm.setToolTip("Register this AI character as a PERMANENT trusted asset:// "
+                          "(Advanced Creation Rights). It then animates forever with no "
+                          "24h expiry and no face rejection.")
+        b_perm.clicked.connect(self._make_permanent)
         b_anim = QtWidgets.QPushButton("Animate with Seedance →")
         b_anim.clicked.connect(self._on_animate)
         b_close = QtWidgets.QPushButton("Close")
         b_close.clicked.connect(self.accept)
-        for b in (b_regen, b_refine, b_edit, b_import, b_save, b_cmp, b_del, b_clear, b_anim):
+        for b in (b_regen, b_refine, b_edit, b_import, b_save, b_cmp, b_del, b_clear,
+                  b_perm, b_anim):
             row.addWidget(b)
         row.addStretch(1)
         row.addWidget(b_close)
@@ -7061,7 +8067,7 @@ class DreamGallery(QtWidgets.QDialog):
             return
         menu = QtWidgets.QMenu(self)
         act_edit = menu.addAction("Interactive Edit (draw marks → Pro)")
-        act_blockout = menu.addAction("Blockout from image")
+        act_blockout = menu.addAction("Blockout from image  (experimental)")
         act_3d_turn = menu.addAction("Send to Seed 3D — split A-pose turnaround (3 views)")
         act_3d_one = menu.addAction("Send to Seed 3D — this image")
         chosen = menu.exec(self.strip.mapToGlobal(pos))
@@ -7171,8 +8177,68 @@ class DreamGallery(QtWidgets.QDialog):
         b_src = b.get("bytes") or b.get("path")
         ABCompareDialog(a_src, b_src, "A", "B", parent=self).exec()
 
+    def _make_permanent(self):
+        """Register the selected AI character as a PERMANENT trusted asset:// so it
+        animates forever (no 24h expiry, no face rejection). Needs Advanced Creation
+        Rights + AK/SK."""
+        if not self._current:
+            return
+        if not _asset_api_ready():
+            _error("Add your Asset Library Access Key + Secret Key in\nBYTEPLUS > "
+                   "Settings > Storage & Hosting first (needs Advanced Creation Rights).")
+            return
+        path = self._current.get("path")
+        if _read_asset_sidecar(path):
+            cmds.inViewMessage(amg="Already a permanent trusted character.",
+                               pos="midCenter", fade=True)
+            return
+        url = self._current.get("url")
+        src = url if (url and _url_is_fresh(url)) else path
+        if not src:
+            _error("This image has no fresh URL or local file to register.")
+            return
+        name = os.path.splitext(os.path.basename(path or "character"))[0][:40]
+        cmds.inViewMessage(amg="Registering permanent trusted character…",
+                           pos="midCenter", fade=True)
+        w = _Worker(lambda: _auto_register_asset(src, name=name), parent=_main_window())
+
+        def done(uri):
+            if uri and path:
+                try:
+                    with open(path + ".asset", "w") as f:
+                        f.write(uri)
+                except OSError:
+                    pass
+                cmds.inViewMessage(amg="✅ Now a <hl>permanent trusted character</hl> "
+                                   "— animate forever, no 24h.", pos="midCenter", fade=True)
+            else:
+                _error("Could not make it permanent — the asset library wants a valid "
+                       "virtual-human portrait, or preprocessing failed (Status "
+                       "Failed). Real human faces are never allowed.")
+
+        def fail(tb):
+            if any(s in tb.lower() for s in ("authoriz", "letter", "sign", "portrait")):
+                _error("First time: sign the asset-library authorization letter in the "
+                       "BytePlus console (Model Playground > My assets > Virtual "
+                       "Portrait), then try again.")
+            else:
+                _error("Make-permanent failed:\n\n" + tb)
+
+        w.done.connect(done); w.failed.connect(fail); w.start()
+        self._perm_worker = w
+
     def _on_animate(self):
         if not self._current:
+            return
+        # A PERMANENT trusted asset (Make permanent) wins: no 24h expiry, no face
+        # rejection -- animate it directly.
+        perm = _read_asset_sidecar(self._current.get("path") or "")
+        if perm:
+            vg = getattr(_video_gallery, "_inst", None)
+            animate_with_seedance(
+                perm, poster_path=self._current.get("path"),
+                dream_items=list(self._items),
+                video_items=list(vg._items) if vg is not None else [])
             return
         # Prefer the platform URL (keeps the face trust chain) -- but ONLY while
         # it's still fresh; a pre-signed Seedream URL expires in ~24h and would
@@ -7385,7 +8451,6 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Trusted Characters")
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self.resize(840, 540)
         self._group_id = None
         self._workers = []
@@ -7466,7 +8531,7 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
 
         if not _asset_api_ready():
             self._set_status("⚠ Add your Access Key + Secret Key (AK/SK) in "
-                             "BYTEPLUS > Settings > Secrets, then reopen this window.")
+                             "BYTEPLUS > Settings > Storage & Hosting, then reopen this window.")
         else:
             self._refresh_groups()
 
@@ -7503,7 +8568,6 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
         dlg.setWindowTitle(title)
         dlg.setLabelText(label)
         dlg.setTextValue(default)
-        dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         dlg.raise_()
         dlg.activateWindow()
         return dlg.textValue().strip() if dlg.exec() else ""
@@ -7692,7 +8756,7 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
                 "from your BytePlus console — these are DIFFERENT from the Bearer API "
                 "key.\n\n"
                 "1.  BytePlus console  >  IAM  >  Access Keys  >  create an AK/SK.\n"
-                "2.  BYTEPLUS > Settings > Secrets > 'Trusted Asset Library'  >  paste "
+                "2.  BYTEPLUS > Settings > Storage & Hosting > 'Trusted Asset Library'  >  paste "
                 "the Access Key + Secret Key\n"
                 "     (or leave them blank to reuse your TOS keys — same account).\n"
                 "3.  Save, then reopen this window.\n\n"
@@ -7739,7 +8803,6 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
         dlg = QtWidgets.QInputDialog(self)
         dlg.setComboBoxItems(items)
         dlg.setWindowTitle(title); dlg.setLabelText(label)
-        dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         dlg.raise_(); dlg.activateWindow()
         return dlg.textValue() if dlg.exec() else ""
 
@@ -7847,7 +8910,6 @@ class AudioGallery(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Audio Gallery")
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self.resize(560, 460)
         self._items = []
         v = QtWidgets.QVBoxLayout(self)
@@ -7963,7 +9025,6 @@ class SeedAudioDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Seed Audio")
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self.setMinimumSize(520, 460)
         self._worker = None
         v = QtWidgets.QVBoxLayout(self)
@@ -8252,7 +9313,6 @@ def _pick_trusted_character(parent, exclude=()):
         return None
     dlg = QtWidgets.QDialog(parent)
     dlg.setWindowTitle("Add a character to the cast")
-    dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
     dlg.setMinimumSize(560, 380)
     lay = QtWidgets.QVBoxLayout(dlg)
     lay.addWidget(QtWidgets.QLabel("Double-click a trusted character (🎙️ = has a voice)."))
@@ -8286,7 +9346,6 @@ class DialogueSceneDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Dialogue Scene")
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self.setMinimumSize(560, 620)
         self._cast = []
         self._worker = None
@@ -8434,15 +9493,19 @@ class DialogueSceneDialog(QtWidgets.QDialog):
         _mark_active_project()
         self.b_gen.setEnabled(False); self.b_gen.setText("Generating…")
         self.status.setText("Submitting dialogue scene to Seedance…")
+        meta = {}
         worker = _Worker(lambda: _seedance_generate(
             prompt, image_sources, None, duration, generate_audio=True,
-            audio_sources=audio_sources, trusted_input=True), parent=_main_window())
+            audio_sources=audio_sources, out_meta=meta, trusted_input=True),
+            parent=_main_window())
 
         def done(vb):
             _discard_video_job(worker)
             self.b_gen.setEnabled(True); self.b_gen.setText("Generate scene")
             self.status.setText("✅ done — see the Video Gallery.")
-            _add_video_result(vb, poster, None, prompt=prompt)
+            _add_video_result(vb, poster, None, prompt=prompt,
+                              last_frame_url=meta.get("last_frame_url"),
+                              video_url=meta.get("video_url"))
 
         def failed(tb):
             _discard_video_job(worker)
@@ -8461,6 +9524,9 @@ class DialogueSceneDialog(QtWidgets.QDialog):
         worker.failed.connect(failed)
         _register_video_job(worker)
         worker.start()
+        _g = _video_gallery_if_open()
+        if _g:
+            _g.add_pending(worker)                    # placeholder if gallery is open
 
 
 def open_dialogue_scene():
@@ -8515,7 +9581,6 @@ class VideoGenDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Video GEN")
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self.resize(600, 720)
         self._first = None                            # {url, path} or None
         self._last = None
@@ -8568,6 +9633,23 @@ class VideoGenDialog(QtWidgets.QDialog):
                                      "it to Seedance as a reference video, so the "
                                      "generated clip follows your camera/motion.")
         v.addWidget(self.cb_playblast)
+        self.cb_reuse_pb = QtWidgets.QCheckBox()     # only shown when one is reusable
+        _hit = _playblast_cached()
+        if _hit:
+            _fresh = _hit[1] <= _PB_AUTOTICK_SECS
+            self.cb_reuse_pb.setText(
+                "♻️ Reuse the last playblast (captured {})".format(_fmt_age(_hit[1])))
+            self.cb_reuse_pb.setChecked(_fresh)      # old one: offered, not assumed
+            self.cb_reuse_pb.setToolTip(
+                "Skips re-capturing the viewport (same scene, range and camera). "
+                "UNTICK if you've changed the animation, camera or scene since then "
+                "— Maya can't tell us reliably, so you decide."
+                + ("" if _fresh else "\n\nThis one is over 30 minutes old, so it's "
+                                     "left unticked — tick it if nothing has changed."))
+            v.addWidget(self.cb_reuse_pb)
+        else:
+            self.cb_reuse_pb.setChecked(False)
+            self.cb_reuse_pb.hide()
 
         self.prompt = QtWidgets.QPlainTextEdit()
         self.prompt.setPlaceholderText(
@@ -8743,6 +9825,20 @@ class VideoGenDialog(QtWidgets.QDialog):
         self.grp_first.setVisible(m in ("i2v", "flf"))
         self.grp_last.setVisible(m == "flf")
         self.grp_mm.setVisible(m == "mm")
+        # Seedance's 3 content modes are MUTUALLY EXCLUSIVE: first+last (mode 2)
+        # cannot carry a reference_video (mode 3), and unlike plain first_frame
+        # there is no first_frame->reference_image fallback to rescue it -- the
+        # request just fails. So make the impossible visibly impossible.
+        flf = (m == "flf")
+        if flf:
+            self.cb_playblast.setChecked(False)
+        self.cb_playblast.setEnabled(not flf)
+        self.cb_playblast.setToolTip(
+            "Seedance can't combine First + Last frame with a reference video — "
+            "they are mutually exclusive modes. Use Text → Video, Image → Video or "
+            "Multimodal to drive motion from your playblast." if flf else
+            "Captures the current scene's animation and sends it to Seedance as a "
+            "reference video, so the generated clip follows your camera/motion.")
 
     def _refresh_cost(self):
         d = self.duration.currentData()
@@ -8830,7 +9926,8 @@ class VideoGenDialog(QtWidgets.QDialog):
             self.status.setText("Capturing scene playblast…")
             QtWidgets.QApplication.processEvents()
             try:
-                movie = _playblast_movie(*_anim_range())
+                movie = _playblast_movie(*_anim_range(),
+                                         reuse=self.cb_reuse_pb.isChecked())
             except Exception as e:
                 sys.stderr.write("[BYTEPLUS] Video GEN playblast failed: {}\n".format(e))
                 cmds.inViewMessage(amg="Playblast capture failed — continuing without "
@@ -8849,19 +9946,22 @@ class VideoGenDialog(QtWidgets.QDialog):
         _mark_active_project()
         self.b_gen.setEnabled(False); self.b_gen.setText("Generating…")
         self.status.setText("Submitting to Seedance ({})…".format(m))
+        meta = {}
         worker = _Worker(lambda: _seedance_generate(
             text or "cinematic video", image_sources, movie, duration,
             first_frame=first, last_frame=last, generate_audio=audio,
             extra_movies=video_srcs, audio_sources=audio_srcs, model=model_id,
             resolution=resolution, ratio=ratio, watermark=watermark,
-            priority=priority, fit_motion=bool(movie), trusted_input=trusted),
-            parent=_main_window())
+            priority=priority, out_meta=meta, fit_motion=bool(movie),
+            trusted_input=trusted), parent=_main_window())
 
         def done(vb):
             _discard_video_job(worker)
             self.b_gen.setEnabled(True); self.b_gen.setText("Generate")
             self.status.setText("✅ done — see the Video Gallery.")
-            _add_video_result(vb, poster, None, prompt=text)
+            _add_video_result(vb, poster, None, prompt=text,
+                              last_frame_url=meta.get("last_frame_url"),
+                              video_url=meta.get("video_url"))
 
         def failed(tb):
             _discard_video_job(worker)
@@ -8881,6 +9981,9 @@ class VideoGenDialog(QtWidgets.QDialog):
         worker.failed.connect(failed)
         _register_video_job(worker)
         worker.start()
+        _g = _video_gallery_if_open()
+        if _g:
+            _g.add_pending(worker)                    # placeholder if gallery is open
 
 
 def open_video_gen():
@@ -8897,7 +10000,7 @@ def open_video_gen():
 
 
 # =============================================================================
-# Layout -> Still  (guided): viewport locks the composition, you describe the look
+# Layout -> Still  (guided): the viewport GUIDES the composition, you describe the look
 # -----------------------------------------------------------------------------
 # A streamlined front-end for the A/B-verified layout workflow: send ONLY the
 # viewport (LAYOUT) + describe the LOOK in text + the strong MODE_LAYOUT directive,
@@ -8905,14 +10008,14 @@ def open_video_gen():
 # =============================================================================
 
 class LayoutStillDialog(QtWidgets.QDialog):
-    """Just: your viewport (locked composition) + a LOOK description. No mode /
-    extra-reference choices to get wrong."""
+    """Just: your viewport (guides the composition) + a LOOK description. No mode /
+    extra-reference choices to get wrong -- so no reference-image warning belongs
+    here; that one lives in Dream, which does offer an Extra reference."""
 
     def __init__(self, snapshot_path, parent=None):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Layout → Still")
         self.setMinimumSize(560, 520)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._enh_worker = None
         v = QtWidgets.QVBoxLayout(self)
 
@@ -8940,9 +10043,10 @@ class LayoutStillDialog(QtWidgets.QDialog):
             "golden-hour cinematic light, photoreal")
         v.addWidget(self.prompt, 1)
         note = QtWidgets.QLabel(
-            "The composition is locked to your viewport; the look comes from this "
-            "text. No reference image needed (a second image competes with the "
-            "layout and usually wins).")
+            "Your viewport guides the composition; the look comes from this text. "
+            "The layout is a strong guide, not an exact constraint — expect some "
+            "drift. For tighter adherence, follow up with Image to Image on the "
+            "result: an image carries more weight than any wording.")
         note.setWordWrap(True); note.setStyleSheet("color:#888;")
         v.addWidget(note)
         self.mp = _ModelPicker(self)             # per-window model choice + note
@@ -9115,7 +10219,6 @@ class ComposeSceneDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Image to Image")
         self.setMinimumSize(620, 640)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._sources = []
         self._enh_worker = None
         self._auto_worker = None
@@ -9472,7 +10575,6 @@ class SeedCharacterDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Seed Character Generator")
         self.setMinimumSize(600, 720)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._photo = None
         self._action = None
         self._workers = []
@@ -9845,7 +10947,6 @@ class TextureDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Generate Texture")
         self.setMinimumSize(520, 320)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         v = QtWidgets.QVBoxLayout(self)
         v.addWidget(QtWidgets.QLabel(
             "Describe the texture for '{}':".format(target_label)))
@@ -10319,7 +11420,7 @@ class SettingsDialog(QtWidgets.QDialog):
         form.addRow(QtWidgets.QLabel("<b>Motion video hosting (Cloudflare R2)</b>"))
         self.motion_host = QtWidgets.QComboBox()
         self.motion_host.addItems(["off", "r2"])
-        self.motion_host.setCurrentText(CONFIG.MOTION_HOST)
+        self.motion_host.setCurrentText("r2" if _r2_available() else CONFIG.MOTION_HOST)
         form.addRow("Motion host", self.motion_host)
         self.r2_account = QtWidgets.QLineEdit(CONFIG.R2_ACCOUNT_ID)
         self.r2_account.setPlaceholderText("R2 account ID")
@@ -10378,6 +11479,14 @@ class SettingsDialog(QtWidgets.QDialog):
             "AK/SK blank to reuse the TOS keys above (same account).")
         ashint.setWordWrap(True); ashint.setStyleSheet("color:#888;")
         form.addRow("", ashint)
+        self.auto_trust = QtWidgets.QCheckBox(
+            "Auto-make faces I use permanent (Extend upgrades the last frame → asset://)")
+        self.auto_trust.setChecked(CONFIG.AUTO_TRUST_ASSETS)
+        self.auto_trust.setToolTip("With Advanced Creation Rights, register faces you "
+                                   "Extend as permanent asset:// (no 24h expiry). "
+                                   "On-demand only, to respect your capacity quota. The "
+                                   "🎭 Make permanent button always works regardless.")
+        form.addRow("", self.auto_trust)
 
         form = _tab("Analytics && Webhook")
         form.addRow(QtWidgets.QLabel("<b>Usage analytics</b>"))
@@ -10469,9 +11578,12 @@ class SettingsDialog(QtWidgets.QDialog):
         CONFIG.R2_ACCESS_KEY = self.r2_ak.text().strip()
         CONFIG.R2_SECRET_KEY = self.r2_sk.text().strip()
         CONFIG.R2_BUCKET = self.r2_bucket.text().strip()
+        if _r2_available():                          # complete R2 keys -> keep coherent
+            CONFIG.MOTION_HOST = "r2"
         CONFIG.ASSET_AK = self.asset_ak.text().strip()
         CONFIG.ASSET_SK = self.asset_sk.text().strip()
         CONFIG.ASSET_API_HOST = self.asset_host.text().strip() or CONFIG.ASSET_API_HOST
+        CONFIG.AUTO_TRUST_ASSETS = self.auto_trust.isChecked()
         CONFIG.AUDIO_API_KEY = self.audio_key.text().strip()
         # Telemetry is always on (CONFIG.TELEMETRY) and the analytics backend
         # (PostHog host/key/bucket/callback) is a build-time constant -- not
@@ -10535,7 +11647,6 @@ class MotionHostWizard(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Motion video hosting setup")
         self.setMinimumWidth(580)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._worker = None
         v = QtWidgets.QVBoxLayout(self)
 
@@ -10727,7 +11838,6 @@ def show_usage():
     dlg = QtWidgets.QDialog(_main_window())
     dlg.setWindowTitle("BYTEPLUS - Usage")
     dlg.setMinimumSize(560, 440)
-    dlg.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
     v = QtWidgets.QVBoxLayout(dlg)
 
     # --- view selector: Global / Per-project / Both (persisted client choice) --
@@ -11003,8 +12113,10 @@ _SEED_CHAT_SYSTEM = (
     "- Image to Image: 1-14 REFERENCE images + prompt -> one composited render (a "
     "layout + materials + products). Reference them as 'Image 1, Image 2...'. Also the "
     "way to LOCK a character: add an approved clean view as a reference.\n"
-    "- Layout -> Still: the VIEWPORT locks composition AND each pose; describe only the "
-    "LOOK in text; don't add a competing reference. Best to match a blocked scene.\n"
+    "- Layout -> Still: the VIEWPORT guides composition and pose; describe only the "
+    "LOOK in text. It's a strong guide, not an exact constraint (Seedream has no "
+    "depth/pose conditioning) -- for tighter adherence, follow up with Image to "
+    "Image on the result. Best to match a blocked scene.\n"
     "- Seed Character: describe a character (or auto-fill from a photo) -> grey "
     "character sheets (2x2 = 4 angles / 2x3 = 4 + 2 close-ups), a 'Game A-pose "
     "turnaround' for 3D, and item sheets (clothes/props). The photo is only DESCRIBED, "
@@ -11012,8 +12124,9 @@ _SEED_CHAT_SYSTEM = (
     "- Seed 3D: text or image -> 3D asset imported into Maya. Image->3D wants 1-5 "
     "SEPARATE clean views (NOT a composited sheet). Tick 'Game-ready' for TAPose+PBR+"
     "Quad (riggable).\n"
-    "- Blockout from image: rough primitive layout from a reference image, to guide "
-    "Dream/animation.\n"
+    "- Blockout from image (EXPERIMENTAL): a rough primitive massing from a reference "
+    "image, as a starting point to tweak. Depth is a coarse 3-tier estimate, not a "
+    "measurement, so it approximates composition -- not an accurate reconstruction.\n"
     "- Seed Assistant: an agent that inspects/automates the Maya scene; it runs code "
     "ONLY after the user approves it.\n"
     "- Generate Texture: prompt -> texture wired into a new OpenPBR shader.\n"
@@ -11065,7 +12178,6 @@ class SeedChatDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Seed Chat")
         self.setMinimumSize(560, 680)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._history = []            # API messages (no system); grows per turn
         self._attachments = []        # local image paths for the NEXT user turn
         self._last_assistant = ""     # last reply text, for "Send to Dream"
@@ -11568,7 +12680,6 @@ class Seed3DDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Seed 3D")
         self.setMinimumSize(560, 560)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._images = []                     # local paths / http URLs for Image->3D
         self._enh_worker = None
         v = QtWidgets.QVBoxLayout(self)
@@ -11935,7 +13046,6 @@ class _CodeApprovalDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Seed Assistant wants to run code")
         self.setMinimumSize(660, 470)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         v = QtWidgets.QVBoxLayout(self)
         v.addWidget(QtWidgets.QLabel(
             "<b>The assistant proposes running this Python in Maya.</b><br>"
@@ -11973,7 +13083,6 @@ class SeedAssistantDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Seed Assistant")
         self.setMinimumSize(600, 700)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._history = []
         self._busy = False
         self._trust_session = False
@@ -12183,17 +13292,21 @@ def open_seed_assistant():
 # =============================================================================
 
 _BLOCKOUT_SYSTEM = (
-    "You are a layout analyzer for a 3D blockout tool. List EVERY distinct object "
-    "SEPARATELY for a primitive blockout: each furniture piece, each plant, EACH "
-    "framed picture/artwork, each lamp, the TV, each window, the rug, and notable "
-    "props. Do NOT merge or group items (list each frame, not 'wall art'; list each "
-    "sofa section if clearly separate). Aim for 10-25 objects when the scene is busy. "
+    "You are a layout analyzer for a 3D blockout tool. Work for ANY scene -- an "
+    "interior, an exterior, a landscape, a sci-fi set, a street. List EVERY distinct "
+    "physical MASS separately (a building, a rock, a vehicle, a tree, a dome, a piece "
+    "of furniture, a person, a prop). Do NOT merge or group them, and do NOT invent "
+    "objects that are not visible. Aim for 8-25 objects when the scene is busy. "
     "Output ONLY: "
     '{"objects":[{"label":str,"box":[x0,y0,x1,y1],"depth":"foreground|mid|background",'
     '"primitive":"box|plane|cylinder|capsule|sphere|cone","on_wall":true|false}]}. '
-    "box NORMALIZED 0..1, origin TOP-LEFT (x right, y down). primitive: sofa/table/"
-    "cabinet=box, person/plant-stem=cylinder, pot/ball=sphere, tv/picture/window/"
-    "poster=plane with on_wall=true. Include the floor as ONE plane. No prose, no "
+    "box NORMALIZED 0..1, origin TOP-LEFT (x right, y down). Choose the primitive "
+    "that best matches each mass's silhouette: blocky/rectilinear (building, "
+    "furniture, vehicle, crate) = box; tall round (tree trunk, column, tower, pipe, "
+    "person) = cylinder; domed/round (dome, boulder, canopy, ball) = sphere; tapered "
+    "(cone roof, hill, spire) = cone; flat/vertical surface stuck to a wall (picture, "
+    "window, screen, poster, sign) = plane with on_wall=true. Include the ground/floor "
+    "as ONE plane. depth is a coarse 3-tier estimate, not a measurement. No prose, no "
     "markdown fences.")
 
 
@@ -12222,7 +13335,6 @@ class _BlockoutPreviewDialog(QtWidgets.QDialog):
         super().__init__(parent or _main_window())
         self.setWindowTitle("BYTEPLUS - Blockout preview")
         self.setMinimumSize(420, 380)
-        self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
         self._objects = objects
         v = QtWidgets.QVBoxLayout(self)
         v.addWidget(QtWidgets.QLabel(
@@ -12588,8 +13700,9 @@ def install():
                   command=_safe(compose_scene))
     cmds.menuItem(label="Layout → Still", parent=CONFIG.MENU_NAME,
                   image="out_imagePlane.png",
-                  annotation="Viewport locks the composition; describe the look -> "
-                             "matched photoreal still (A/B-verified layout lock)",
+                  annotation="Viewport guides the composition; describe the look -> "
+                             "a matched photoreal still (strong guide, not an exact "
+                             "constraint)",
                   command=_safe(layout_to_still))
     cmds.menuItem(label="Open Dream Gallery", parent=CONFIG.MENU_NAME,
                   image="fileOpen.png",
@@ -12634,7 +13747,7 @@ def install():
                   annotation="Multi-character spoken dialogue: cast trusted characters "
                              "+ a script → Seedance video with synced voices (EN/ES/JA/ID/PT)",
                   command=_safe(open_dialogue_scene))
-    cmds.menuItem(label="Blockout from image", parent=CONFIG.MENU_NAME,
+    cmds.menuItem(label="Blockout from image  (experimental)", parent=CONFIG.MENU_NAME,
                   image="polyPlane.png",
                   annotation="Rough primitive layout from a reference image (a guide for Dream)",
                   command=_safe(open_blockout))
@@ -12704,6 +13817,9 @@ def install():
 
     # First-run, consent-based identity prompt (deferred so the menu shows first).
     maya.utils.executeDeferred(_maybe_identify)
+    # Silently recover any clip whose poll died (PC slept / Maya closed / network):
+    # the job was already billed, so never let it be lost. No-op when nothing pends.
+    maya.utils.executeDeferred(_recover_tasks)
     return CONFIG.MENU_NAME
 
 

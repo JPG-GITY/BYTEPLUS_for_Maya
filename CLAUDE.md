@@ -24,10 +24,17 @@ integrating BytePlus ModelArk AI (Seedream image, Seedance video, Seed 3D, Seed
    crash Maya off-thread. Only NETWORK runs in `_Worker` (QThread). Resolve any
    scene paths/queries (`_scene_*_dir`, `_scene_tag`, playblast, `_anim_range`) on
    the MAIN thread and pass the result into the worker — never call cmds inside one.
-2. **Modal re-entrancy.** Keep `_msgbox` re-entrancy-safe (skips the stay-on-top
-   flag dance when `activeModalWidget()` is set). Never toggle `WindowStaysOnTopHint`
-   +`show()` on a window that's inside a modal `exec()` loop → it recreates the HWND
-   and FREEZES Maya. Don't pop modals from worker callbacks over another open modal.
+2. **NEVER force `WindowStaysOnTopHint`. Parent to Maya instead.** Every window is
+   built as `QDialog(parent or _main_window())` — a parented child already stays
+   above Maya, so the flag only hijacks the whole OS (a real client complaint) and
+   it caused a bug chain: on-top windows made message boxes open *behind* a gallery
+   ("Maya looks frozen") → `_msgbox` grew a workaround that toggled the flag on
+   every window → toggling `WindowStaysOnTopHint`+`show()` RECREATES the native
+   handle, which on a window driving a modal `exec()` loop drops its modal grab and
+   **FREEZES Maya** (the "Animate freeze"). All 40 flags and the dance are gone
+   (v2.0); `_msgbox` now just parents to `activeModalWidget() or _main_window()`.
+   Don't reintroduce either. Still true: don't pop modals from worker callbacks
+   over another open modal.
 3. **Trusted-output chain (faces).** Never re-encode/re-host a trusted image/clip —
    it strips Seedance's face exemption. `_img_ref_uri` passes `http`/`asset://`
    THROUGH untouched. Real external faces are always rejected; use Text to Image /

@@ -60,7 +60,7 @@ optionally share your details, or click **Stay anonymous**. It won't ask again.
 | **Dream with Seedreams 5.0** | Viewport + prompt → generated concept image (image-to-image) |
 | **Text to Image** | Pure prompt → image, no viewport. Best for **AI people / faces** |
 | **Image to Image** | Combine 1–14 reference images (layout + materials + products) → one render |
-| **Layout → Still** | Viewport locks the composition; text describes the look → matched still |
+| **Layout → Still** | Viewport guides the composition; text describes the look → matched still |
 | **Open Dream Gallery** | Browse / refine / interactive-edit / compare / animate / blockout your images |
 | **Open Video Gallery** | Browse / open / edit / save your videos |
 | **Open Audio Gallery** | Browse / play / save your generated audio (voice / music / SFX) |
@@ -70,7 +70,7 @@ optionally share your details, or click **Stay anonymous**. It won't ask again.
 | **Seed Character** | Character generator — character sheets, a game A-pose turnaround, prop/clothing sheets |
 | **Trusted Characters** | Upload an AI character once → a **permanent** `asset://` you can animate forever (+ a reusable voice) |
 | **Dialogue Scene** | Multi-character spoken dialogue → Seedance video with synced voices (EN/ES/JA/ID/PT) |
-| **Blockout from image** | Rough primitive layout from a reference image (a guide for Dream) |
+| **Blockout from image** *(experimental)* | Rough primitive massing from a reference image (a starting point to tweak) |
 | **Seed Assistant** | Agent that inspects/automates your scene (runs code only after you approve) |
 | **Generate Texture** | Prompt → texture wired into a new OpenPBR shader |
 | **Settings…** | API key, models, resolution, hosting, analytics |
@@ -140,9 +140,16 @@ The full **Seedance 2.0** generator in one window — every modality and paramet
    **Resolution**, **Aspect ratio**, **Duration** (or *Auto*), **Generate audio**,
    **Watermark** and **Priority**.
 4. *(Optional)* tick **🎥 Use the scene's animation (playblast)** so the clip follows
-   your Maya camera/motion (Text→Video or Multimodal; needs motion hosting).
+   your Maya camera/motion (needs motion hosting). If a playblast already exists for
+   this scene/range/camera, **♻️ Reuse the last playblast** appears — see *Animate*.
 5. Write the prompt (✦ Enhance; put spoken lines in "double quotes") and
    **Generate** → the clip lands in the Video Gallery.
+
+> **Why the playblast greys out on First + Last frame:** Seedance's three input
+> modes are **mutually exclusive** — a start+end pair can't be combined with a
+> reference video. It's a platform rule, not a plugin limit, so the option disables
+> itself instead of failing later. Use **Text → Video**, **Image → Video** or
+> **Multimodal** to drive motion from your playblast.
 
 ![Video GEN](images/Video_Gen.jpg)
 
@@ -212,16 +219,22 @@ references (Lite) / **10** (Pro).
 
 ### 🧭 Layout → Still
 When you want your **viewport composition** but a completely different **look**,
-this is the dedicated tool (A/B-verified to lock the layout).
-1. Frame the shot — positions, facing and camera are what get locked.
+this is the dedicated tool.
+1. Frame the shot — positions, facing and camera are what guide the result.
 2. **BYTEPLUS > Layout → Still**.
 3. **Describe the LOOK** (subjects, style, materials, lighting, scene) and press
    **✦ Enhance** if you want the wording tightened.
 4. Pick a **Model** and how many **Variations**, then Generate.
 
-> **Best practice:** do **not** add a reference image here. The composition is
-> locked to your viewport and the look comes from the *text* — a second image
-> competes with the layout and usually wins.
+> **What to expect (honest):** the viewport is a **strong guide, not an exact
+> constraint**. Seedream has no structural conditioning (no depth/pose input), so
+> the composition will drift somewhat — it is not a ControlNet. **For tighter
+> adherence, generate once and then run Image to Image on that result:** an image
+> carries far more weight than any wording.
+
+> **Best practice:** don't add a reference image *here* — this window doesn't offer
+> one on purpose. (In **Dream with Seedream**, which does, a second image competes
+> with the layout and usually wins.)
 
 ![Layout → Still](images/Layout_to_Still.jpg)
 
@@ -274,9 +287,27 @@ Make a still image move.
    and no face rejection (see **Trusted Characters**).
 4. Optionally tick **use playblast** so the motion follows your 3D scene's
    animation while the image defines the look.
-5. Generate → the video appears in the Video Gallery.
+5. Pick the **Resolution** for this clip (480p / 720p / 1080p / 4k). It overrides
+   the Settings default for this generation only, and the **estimated cost updates
+   live** — prototype at 480p, commit at 4k.
+6. **♻️ Reuse the last playblast** *(appears only when there's one to reuse)* —
+   skips re-capturing the viewport when nothing has changed. See below.
+7. Generate → the video appears in the Video Gallery.
 
 > The image is the **look reference**; the playblast is the **motion reference**.
+
+![Animate — resolution and reuse-playblast](images/Animate_Reuse_Playblast.jpg)
+
+> **♻️ Reusing a playblast.** Capturing the viewport takes real time, and doing it
+> again for an unchanged scene is pure waiting. When a playblast already exists for
+> **this same scene, frame range and camera**, the checkbox appears and says how old
+> it is — *"captured 2 min ago"*. It survives reloading the plugin and restarting
+> Maya (each capture is stamped with what it holds), and it's never offered across
+> scenes, ranges or cameras.
+>
+> It's **ticked automatically only when the capture is recent (under 30 minutes)**;
+> an older one is offered **unticked**. Maya can't reliably tell us whether you
+> changed the animation, so **you** decide: untick it if you have.
 
 > **Multiple videos at once:** you can queue several Animate jobs in parallel (up
 > to your account's Seedance limit — **3** on individual accounts, **10** on
@@ -314,12 +345,19 @@ description** (approximate) instead of the playblast.
 ### 🎞️ Video Gallery
 All your videos, persistent and sorted by date. Each thumbnail is a **real frame**
 of the clip (the first non-black frame), so posters are stable — not random.
-Select a clip and:
+A **⏳ Generating…** tile appears in the strip while a new clip renders. Select a clip and:
 - **▶ Open** — play it in your default player.
 - **✎ Edit video** — Seedance 2.0 video-to-video: keeps the source clip
   (subject, motion, camera) and transforms only the change you describe (e.g.
   "set his hair on fire", "make it night"). Press **✦ Enhance** to auto-write the
   full prompt. *Keeps the clip's original audio.*
+- **⏭ Extend** — continue a clip past the length cap: its trusted last frame becomes
+  the first frame of a new one. Add a continuation prompt, a duration, optional
+  **🔊 Audio**, and optionally **join A+B** into one video. Chain B→C→… for longer shots.
+- **🖼 Reference images (Edit video & Extend)** — attach a **gallery image**, a **file**,
+  or a **🎭 Trusted character** to lock the character's identity and look when the face
+  isn't visible in the frame, so Seedance doesn't invent it. *A face reference must be
+  trusted — a fresh gallery image or a Trusted character — or Seedance rejects it.*
 - **Save As** / **🗑 Delete** / **Clear all**.
 
 ![Video Gallery](images/Vieo_Gallery.jpg)
@@ -327,6 +365,10 @@ Select a clip and:
 *Edit video — describe a change; Seedance keeps the source clip and transforms it:*
 
 ![Edit video](images/Edit_Video.jpg)
+
+*Extend — continue a clip; add reference images to keep the character consistent:*
+
+![Extend a clip](images/Extend_Video.jpg)
 
 ### 💬 Seed Chat
 A chat window backed by **Seed 2.0** (multimodal). Use it to plan shots, learn
@@ -447,10 +489,15 @@ Multi-character **spoken dialogue**, generated by Seedance 2.0 with synced lips.
 > speaks the lines directly. Give each character a voice in **Trusted Characters**
 > for a consistent timbre.
 
-### 🧱 Blockout from image
-Turn a reference image into a **rough 3D primitive layout** — a controllable guide
-you tweak, then feed back to Dream or use to guide animation. Available from the
-menu **and** from the Dream Gallery right-click.
+### 🧱 Blockout from image *(experimental)*
+Turn a reference image into a **rough 3D primitive massing** — a starting point you
+tweak, then feed back to Dream or use to guide animation. Available from the menu
+**and** from the Dream Gallery right-click.
+
+> **What to expect (honest):** depth is a **coarse 3-tier estimate, not a
+> measurement**, so this approximates *composition* — it is **not a
+> reconstruction**. It reads busy, object-rich scenes best; wide landscapes and
+> abstract sets give poor results. Treat it as a sketch to push around.
 1. **BYTEPLUS > Blockout from image** (or right-click an image in the Dream
    Gallery → **Blockout from image**).
 2. Seed 2.0 detects the main objects (boxes + depth + a suggested primitive) and
@@ -557,6 +604,12 @@ Tabs in **Settings…**:
 
 - **Menu didn't appear?** Restart Maya once; if still missing, re-drag
   `install.py` and check the Script Editor for a `[BYTEPLUS]` error.
+- **PC went to sleep (or Maya closed) while a video was generating?** You don't
+  lose it. The clip renders on BytePlus's servers, not your machine — a brief
+  network hiccup is ridden out automatically, and if the connection dies for good,
+  the clip is **recovered automatically the next time you load the plugin** and
+  saved into its own project folder. *Tip: for long 4K jobs, set Windows to never
+  sleep — a screensaver or turning the display off is perfectly safe.*
 - **Maya crashed during generation?** The installer disables Autodesk ADP (a
   known Windows crash) — make sure you **restarted Maya** after installing.
 - **"model or endpoint does not exist" / HTTP 404?** Your key is reaching the
