@@ -91,6 +91,22 @@ class CONFIG:
 
     # --- Model IDs ------------------------------------------------------------
     SEEDANCE_MODEL = "dreamina-seedance-2-0-260128"      # video (base: 480/720/1080/4k)
+    SEEDANCE_MODEL_25 = "dreamina-seedance-2-5-260628"   # video 2.5 (480/720 only, up to 30s)
+    # IMMUTABLE id for 2.0. SEEDANCE_MODEL is the user's *current selection* and is
+    # persisted, so a picker must never use it as the "2.0" row's value -- once 2.5
+    # was saved, both rows would carry 2.5 and there would be no way back.
+    SEEDANCE_MODEL_20 = "dreamina-seedance-2-0-260128"
+    # Per-model capability envelope. 2.5 is NOT a drop-in for 2.0: it tops out at
+    # 720p (1080p/4k are rejected outright -- verified against the live API) but
+    # doubles the take to 30 s, adds mov output, honours integer-second timestamps
+    # in the prompt, and takes far more references. Keys are matched as substrings
+    # of the model id, so a custom endpoint id ("ep-...") falls back to 2.0.
+    SEEDANCE_CAPS = {
+        "2-5": {"resolutions": ("480p", "720p"), "duration": (4, 30),
+                "formats": ("mp4", "mov"), "refs": (30, 10, 10), "timestamps": True},
+        "2-0": {"resolutions": ("480p", "720p", "1080p", "4k"), "duration": (4, 15),
+                "formats": ("mp4",), "refs": (9, 3, 3), "timestamps": False},
+    }
     SEEDANCE_FAST_MODEL = "dreamina-seedance-2-0-fast-260128"  # 480/720, faster/cheaper
     SEEDANCE_MINI_MODEL = "dreamina-seedance-2-0-mini-260615"  # 480/720, cheapest
     # Seedream 5.0 Pro (dola-seedream-5-0-pro-260628): best quality + precise editing +
@@ -162,6 +178,11 @@ class CONFIG:
         "480p": (7.0, 4.3), "720p": (7.0, 4.3),
         "1080p": (7.7, 4.7), "4k": (4.0, 2.4),
     }
+    # Seedance 2.5 bills on the same token formula but at its own (higher) unit
+    # price, and only 480p/720p exist. Same shape as COST_VIDEO_RATES.
+    COST_VIDEO_RATES_25 = {
+        "480p": (10.7, 6.4), "720p": (10.7, 6.4),
+    }
     COST_DIMS = {                                         # width x height per resolution+ratio (Seedance 2.0)
         "480p": {"16:9": (864, 496), "4:3": (752, 560), "1:1": (640, 640),
                  "3:4": (560, 752), "9:16": (496, 864), "21:9": (992, 432)},
@@ -171,6 +192,13 @@ class CONFIG:
                   "3:4": (1248, 1664), "9:16": (1080, 1920), "21:9": (2206, 946)},
         "4k": {"16:9": (3840, 2160), "4:3": (3326, 2494), "1:1": (2880, 2880),
                "3:4": (2494, 3326), "9:16": (2160, 3840), "21:9": (4398, 1886)},
+    }
+    # 2.5 uses slightly different 480p pixel dimensions than 2.0 (854x480 vs
+    # 864x496), which changes the token count. 720p is identical, so only the
+    # differing tier is overridden here; anything missing falls back to COST_DIMS.
+    COST_DIMS_25 = {
+        "480p": {"16:9": (854, 480), "4:3": (752, 560), "1:1": (640, 640),
+                 "3:4": (560, 752), "9:16": (480, 854), "21:9": (992, 432)},
     }
 
     # --- Seedream image aspect ------------------------------------------------
@@ -1030,7 +1058,7 @@ def _seedance_edit_prompt_auto(video_path, poster, instruction, duration=None):
         frames += _extract_video_frames(video_path, tmp, n=3)
         frames = frames[:4]
         dur = duration or _video_duration(video_path)
-        dur_txt = ("{}s".format(max(4, min(15, int(round(dur))))) if dur
+        dur_txt = ("{}s".format(_fit_duration(int(round(dur)))) if dur
                    else "match the source clip")
         user = [{"type": "text", "text":
                  "The one change I want: {}\n\nSource clip duration: {}. Write the "
@@ -1958,19 +1986,85 @@ def _fmt_compact(n: int) -> str:
     return str(n)
 
 
-def _video_dims(resolution, ratio):
-    r = CONFIG.COST_DIMS.get(resolution, {})
-    return r.get(ratio) or r.get("16:9") or (1280, 720)
+def _seedance_caps(model=None) -> dict:
+    """Capability envelope for a Seedance model id (resolutions, duration window,
+    output formats, reference caps, timestamp support). Unknown ids -- including
+    custom `ep-...` endpoints -- fall back to the conservative 2.0 envelope."""
+    m = str(model or CONFIG.SEEDANCE_MODEL or "")
+    for key, caps in CONFIG.SEEDANCE_CAPS.items():
+        if key in m:
+            return caps
+    return CONFIG.SEEDANCE_CAPS["2-0"]
 
 
-def _est_video_cost(resolution, ratio, duration, has_video):
+def _is_seedance_25(model=None) -> bool:
+    return "2-5" in str(model or CONFIG.SEEDANCE_MODEL or "")
+
+
+def _seedance_name(model=None) -> str:
+    """Friendly name for the selected video model, for window titles and labels
+    (so nothing says 'Seedance 2.0' while the user is actually on 2.5)."""
+    m = str(model or CONFIG.SEEDANCE_MODEL or "")
+    if "2-5" in m:
+        return "Seedance 2.5"
+    if "fast" in m:
+        return "Seedance 2.0 fast"
+    if "mini" in m:
+        return "Seedance 2.0 mini"
+    if "2-0" in m:
+        return "Seedance 2.0"
+    return "Seedance"
+
+
+def _seedance_dur_text(model=None) -> str:
+    """'4-15 s' / '4-30 s' for the selected model -- for tooltips and hints."""
+    lo, hi = _seedance_caps(model)["duration"]
+    return "{}-{} s".format(lo, hi)
+
+
+def _fit_resolution(resolution, model=None) -> str:
+    """Snap a resolution into what the model actually supports. Seedance 2.5
+    rejects 1080p/4k outright ('resolution ... not valid for model'), so asking
+    for one must step DOWN to its best tier rather than fail the job."""
+    allowed = _seedance_caps(model)["resolutions"]
+    return resolution if resolution in allowed else allowed[-1]
+
+
+def _fit_duration(duration, model=None) -> int:
+    """Clamp seconds into the model's window (2.0: 4-15, 2.5: 4-30). `-1` means
+    'the model picks' and is passed through untouched (2.5 only)."""
+    try:
+        secs = int(round(float(duration)))
+    except (TypeError, ValueError):
+        secs = 5
+    if secs == -1:
+        return -1
+    lo, hi = _seedance_caps(model)["duration"]
+    return max(lo, min(hi, secs))
+
+
+def _video_dims(resolution, ratio, model=None):
+    tables = ([CONFIG.COST_DIMS_25, CONFIG.COST_DIMS] if _is_seedance_25(model)
+              else [CONFIG.COST_DIMS])
+    for t in tables:
+        r = t.get(resolution, {})
+        if r.get(ratio) or r.get("16:9"):
+            return r.get(ratio) or r.get("16:9")
+    return (1280, 720)
+
+
+def _est_video_cost(resolution, ratio, duration, has_video, model=None):
     """Approx (tokens, USD) for a Seedance video. has_video = a reference video
-    (playblast) is attached -> cheaper rate but counts input duration too."""
-    w, h = _video_dims(resolution, ratio)
+    (playblast) is attached -> cheaper rate but counts input duration too.
+    Rates are per-model: 2.5 bills on the same formula at a higher unit price."""
+    resolution = _fit_resolution(resolution, model)
+    w, h = _video_dims(resolution, ratio, model)
     out_dur = max(1, int(round(duration)))
     in_dur = out_dur if has_video else 0
     tokens = (in_dur + out_dur) * w * h * CONFIG.VIDEO_FPS / 1024.0
-    rate_no, rate_yes = CONFIG.COST_VIDEO_RATES.get(resolution, (7.0, 4.3))
+    rates = (CONFIG.COST_VIDEO_RATES_25 if _is_seedance_25(model)
+             else CONFIG.COST_VIDEO_RATES)
+    rate_no, rate_yes = rates.get(resolution, (7.0, 4.3))
     usd = tokens / 1_000_000.0 * (rate_yes if has_video else rate_no)
     return tokens, usd
 
@@ -2808,6 +2902,17 @@ def _isolate_polys(panel):
             continue
         try:
             cmds.modelEditor(panel, e=True, **{flag: (flag == "polymeshes")})
+        except Exception:
+            saved.pop(flag, None)
+    # Show assigned textures in the capture. A bare default-grey humanoid reads as
+    # a NUDE BODY to Seedance's content filter and the job is rejected outright
+    # (confirmed with BytePlus support: untextured humanoid meshes get
+    # misclassified); any colour/texture on the mesh clears it. Textures also give
+    # the model more to work with. Restored afterwards like every other flag.
+    for flag in ("displayTextures",):
+        try:
+            saved[flag] = cmds.modelEditor(panel, q=True, **{flag: True})
+            cmds.modelEditor(panel, e=True, **{flag: True})
         except Exception:
             saved.pop(flag, None)
     return saved
@@ -4335,7 +4440,7 @@ class VideoEditDialog(QtWidgets.QDialog):
 
     def __init__(self, parent=None, video_path=None, poster=None, default_duration=5):
         super().__init__(parent or _main_window())
-        self.setWindowTitle("Edit video — Seedance 2.0")
+        self.setWindowTitle("Edit video — " + _seedance_name())
         self.setMinimumSize(560, 340)
         self._worker = None
         self._video_path = video_path
@@ -4365,12 +4470,13 @@ class VideoEditDialog(QtWidgets.QDialog):
         opts = QtWidgets.QHBoxLayout()
         opts.addWidget(QtWidgets.QLabel("Duration:"))
         self.sp_duration = QtWidgets.QSpinBox()
-        self.sp_duration.setRange(4, 15)
+        self.sp_duration.setRange(*_seedance_caps()["duration"])
         self.sp_duration.setSuffix(" s")
-        self.sp_duration.setValue(max(4, min(15, int(default_duration or 5))))
-        self.sp_duration.setToolTip("Length of the generated clip (Seedance 2.0 "
-                                    "supports 4–15s). Defaults to the source clip's "
-                                    "length so the edit matches it.")
+        self.sp_duration.setValue(_fit_duration(int(default_duration or 5)))
+        self.sp_duration.setToolTip("Length of the generated clip ({} supports {})."
+                                    " Defaults to the source clip's length so the "
+                                    "edit matches it.".format(_seedance_name(),
+                                                              _seedance_dur_text()))
         opts.addWidget(self.sp_duration)
         opts.addStretch(1)
         v.addLayout(opts)
@@ -4819,7 +4925,9 @@ class VideoGallery(QtWidgets.QDialog):
         b_enh.clicked.connect(_do_enhance)
         drow = QtWidgets.QHBoxLayout()
         drow.addWidget(QtWidgets.QLabel("Duration (s):"))
-        dur = QtWidgets.QComboBox(); dur.addItems([str(s) for s in range(4, 16)])
+        _elo, _ehi = _seedance_caps()["duration"]
+        dur = QtWidgets.QComboBox()
+        dur.addItems([str(s) for s in range(_elo, _ehi + 1)])
         dur.setCurrentText("5"); drow.addWidget(dur)
         cb_audio = QtWidgets.QCheckBox("🔊 Audio")
         cb_audio.setChecked(CONFIG.GENERATE_AUDIO)
@@ -4947,7 +5055,7 @@ class VideoGallery(QtWidgets.QDialog):
                    "& Hosting,  then try again.")
             return
         dur0 = _video_duration(video_path)
-        default_dur = max(4, min(15, int(round(dur0)) if dur0 else 5))
+        default_dur = _fit_duration(int(round(dur0)) if dur0 else 5)
         d = VideoEditDialog(self, video_path=video_path, poster=poster,
                             default_duration=default_dur)
         if not d.exec():
@@ -5297,6 +5405,140 @@ def _should_retry_failure(msg: str, trusted_input: bool) -> bool:
     return True
 
 
+def _basemesh_clause(video_labels: list, has_look_ref: bool, model=None) -> str:
+    """Opening clause for a shot driven by a Maya playblast.
+
+    Seedance 2.5 has a first-class BASE-MESH (white-model) task type: an
+    untextured blockmesh clip whose camera, motion, blocking and timing it
+    renders the finished shot on top of. A Maya playblast is exactly that input,
+    and `_isolate_polys()` already strips everything except the polymeshes --
+    which is the clean mesh 2.5 requires, since stray trajectory lines,
+    coordinate lines and camera cones leak into the output.
+
+    Seedance 2.0 has no such task type (its video reference only extracts
+    temporal dynamics), so it keeps the plain 'follow the reference video'
+    phrasing that was tuned for it."""
+    if len(video_labels) == 1:
+        vlist, verb = video_labels[0], "It provides"
+    else:
+        vlist = ", ".join(video_labels[:-1]) + " and " + video_labels[-1]
+        verb = "They provide"
+    if not _is_seedance_25(model):
+        return ("Strictly follow the exact motion, movement path, camera work "
+                "and timing of {} throughout. {} ONLY the motion and camera, "
+                "not the look{}.  ".format(
+                    vlist, verb,
+                    " -- keep the subject's exact appearance from Image 1"
+                    if has_look_ref else ""))
+    look = (" Map the subject of Image 1 onto the mesh figure: keep Image 1's "
+            "exact appearance, materials and colours." if has_look_ref else "")
+    return ("{} is an untextured 3D blockmesh (white-model) previsualisation, "
+            "not the final look. Reference it strictly for camera movement, "
+            "subject motion, blocking and timing, and render the finished shot "
+            "on top of it, frame for frame.{} Ignore the mesh's flat grey "
+            "shading, its background and any on-screen guides entirely.  "
+            .format(vlist, look))
+
+
+_MODERATION_MARK = "Seedance's content moderation blocked"
+
+
+def _explain_moderation(err_text: str, labels=None) -> str:
+    """Turn a Seedance moderation rejection into advice that matches WHAT was
+    actually rejected.
+
+    The API names the offending item only by index ("content[4]") and its code
+    says whether it was an image or a video. The plugin used to answer every
+    rejection with "blocked this image", which sent artists off to regenerate a
+    picture when the real blocker was the PLAYBLAST -- and a playblast can never
+    carry a trusted-output exemption, because that chain only covers assets the
+    platform itself generated."""
+    import re as _re
+    txt = str(err_text or "")
+    m = _re.search(r"content\[(\d+)\]", txt)
+    idx = int(m.group(1)) if m else None
+    asset = None
+    if idx is not None and labels and 0 <= idx < len(labels):
+        asset = labels[idx]
+    low = (asset or "").lower()
+    is_video = ("InputVideoSensitive" in txt or "input video" in txt.lower()
+                or "video" in low or "playblast" in low)
+    # The biometric/face check carries the .PrivacyInformation suffix. Without it
+    # the rejection came from the GENERAL sensitive-content filter -- on a Maya
+    # playblast that is usually an untextured character reading as a nude figure,
+    # not a face at all, and the advice is completely different.
+    is_face = "PrivacyInformation" in txt or "real person" in txt.lower()
+    what = asset or ("the input video" if is_video else "one of the images")
+    head = "{} {}.\n\n".format(_MODERATION_MARK, what)
+    if is_video and not is_face:
+        v25 = _is_seedance_25()
+        body = (
+            "It was the input VIDEO, not an image — so regenerating a picture "
+            "will NOT help. The code has NO '.PrivacyInformation' suffix, so this "
+            "is the GENERAL sensitive-content filter, not the face/biometric one, "
+            "and the trusted-output chain is not involved.\n\n")
+        if v25:
+            body += (
+                "MEASURED on this account: Seedance 2.5's moderation of input "
+                "videos is STRICTER than 2.0's. The very same playblast that 2.5 "
+                "rejects here was accepted by 2.0 — identical file, identical "
+                "payload. So this is not something wrong with your scene.\n\n"
+                "What works:\n"
+                "• Switch to Seedance 2.0 for this shot (Settings > Seedance "
+                "(video) model). Note 2.0 also caps the INPUT video at ~15 s, so "
+                "a longer take has to be shortened.\n")
+        else:
+            body += "What works:\n"
+        body += (
+            "THE FIX (confirmed working): give the character SOME COLOUR OR "
+            "TEXTURE in Maya. A bare default-grey humanoid reads as a nude body; "
+            "assign even a plain coloured shader and it passes — the same take "
+            "then generated a full 30 s clip on 2.5. Un-hiding the clothing "
+            "meshes (hoody, pants, shoes…) works for the same reason, and a "
+            "shaded mesh is still a perfectly good base-mesh previs.\n\n"
+            "What does NOT work: post-processing the video afterwards (tint, "
+            "grain, cropping) — measured, all still rejected. The colour has to "
+            "be in the SCENE, on the mesh, before the playblast is taken.\n\n"
+            "Also fine: untick 'Use the scene's animation (playblast)' to take "
+            "the motion from your text description instead (approximate).\n\n")
+    elif is_video:
+        body = (
+            "It was the input VIDEO, not an image — so regenerating a picture "
+            "will NOT help.\n\n"
+            "The rule only bans REAL human faces; stylised 3D / cartoon "
+            "characters are explicitly exempt. But the filter judges PIXELS, not "
+            "provenance — it cannot know your character is CG, so a "
+            "photorealistic 3D human still reads as a real person. And a "
+            "playblast can never carry a trusted-output exemption either: that "
+            "chain only covers assets the platform itself generated, while a "
+            "playblast is a fresh render of your Maya viewport.\n\n"
+            "What works:\n"
+            "• Make the playblast read as clearly NON-photoreal — flat/untextured "
+            "shading, no skin/eye detail. Stylised characters are exempt by the "
+            "rule, and this is exactly the base-mesh previs Seedance 2.5 is built "
+            "to render on top of.\n"
+            "• Hide or simplify the face just for the playblast (hide the head, "
+            "or frame the camera off it) — the body motion still drives the shot.\n"
+            "• Use Trusted Characters (a preset digital character, asset://…), "
+            "which is compliant by construction.\n"
+            "• Untick 'Use the scene's animation (playblast)' — the motion then "
+            "comes from your text description (approximate, but it generates).\n\n")
+    else:
+        body = (
+            "This is USUALLY a human face that isn't a trusted input — but it "
+            "can also be a FALSE POSITIVE: mirrors/reflections read as a person, "
+            "busy patterns, or an image over ~24 h old that lost its "
+            "trusted-output exemption.\n\n"
+            "• If it HAS a face: make it with  BYTEPLUS > Text to Image  (or use "
+            "Trusted Characters), then animate within ~24 h — the trusted link is "
+            "passed automatically.\n"
+            "• If it has NO face (a room, product, scene): regenerate it FRESH so "
+            "it carries a trusted link and animate it right away. A mirror-heavy "
+            "shot can trip the filter, so a slightly different frame often "
+            "passes.\n\n")
+    return head + body + "Exact API error:\n" + txt
+
+
 def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                        duration: int, first_frame: str | None = None,
                        require_motion_video: bool = False,
@@ -5312,6 +5554,7 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                        priority: int | None = None,
                        out_meta: dict | None = None,
                        fit_motion: bool = False,
+                       output_format: str | None = None,
                        trusted_input: bool = False) -> bytes:
     """Submit a Seedance job and poll until done. Returns the video bytes.
     NETWORK ONLY -- call from a worker.
@@ -5439,11 +5682,55 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                       "audio_url": {"url": _au}})
         return c
 
+    def _content_labels():
+        """Human names for each content[] slot, in the SAME order as _content().
+
+        Seedance's moderation errors name the offending item only by index
+        ('content[4]'), which is useless on its own -- and the previous message
+        always blamed 'this image' even when the API had flagged a VIDEO. With
+        this we can tell the artist exactly which asset was rejected."""
+        def _base(x):
+            try:
+                return os.path.basename(str(x))
+            except Exception:
+                return str(x)
+        lab = ["the prompt text"]
+        if first_frame:
+            lab.append("the first-frame image ({})".format(_base(first_frame)))
+        if last_frame:
+            lab.append("the last-frame image ({})".format(_base(last_frame)))
+        for _i, src in enumerate(image_sources, 1):
+            lab.append("reference image {} ({})".format(_i, _base(src)))
+        if movie_url:
+            lab.append("the scene playblast used as the motion reference ({})"
+                       .format(_base(movie)))
+        for _i, _u in enumerate(extra_urls, 1):
+            lab.append("extra reference video {}".format(_i))
+        for _i, _au in enumerate(audio_urls, 1):
+            lab.append("reference audio {}".format(_i))
+        return lab
+
     _audio = CONFIG.GENERATE_AUDIO if generate_audio is None else bool(generate_audio)
 
     _model = model or CONFIG.SEEDANCE_MODEL
-    _res = resolution or CONFIG.VIDEO_RESOLUTION
+    # Fit the request to what THIS model actually supports before sending it:
+    # 2.5 has no 1080p/4k (it rejects them outright) and a 4-30 s window, while
+    # 2.0 has 4k and 4-15 s. Doing it here means EVERY caller -- Animate, Render,
+    # Edit, Extend, the batch queue -- is model-safe without its own clamp.
+    _req_res = resolution or CONFIG.VIDEO_RESOLUTION
+    _res = _fit_resolution(_req_res, _model)
+    if _res != _req_res:
+        sys.stderr.write("[BYTEPLUS] {} does not support {}; using {}.\n".format(
+            _model, _req_res, _res))
     _ratio = ratio or CONFIG.VIDEO_RATIO
+    _req_dur = duration
+    duration = _fit_duration(duration, _model)
+    if duration != _req_dur:
+        sys.stderr.write("[BYTEPLUS] duration {}s -> {}s (model window {}).\n".format(
+            _req_dur, duration, _seedance_caps(_model)["duration"]))
+    # mov = H.264 + yuv444p + PCM: better colour/luma and A/V sync, which is what
+    # the 2.5 guide recommends for edit/extend. Only 2.5 offers it.
+    _fmt = output_format if output_format in _seedance_caps(_model)["formats"] else None
     _wm = CONFIG.WATERMARK if watermark is None else bool(watermark)
     _rlf = CONFIG.RETURN_LAST_FRAME if return_last_frame is None else bool(return_last_frame)
 
@@ -5457,6 +5744,8 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
             "watermark": _wm,
             "generate_audio": audio,
         }
+        if _fmt:
+            body["output_format"] = _fmt
         if _rlf:
             body["return_last_frame"] = True
         if priority:
@@ -5476,15 +5765,23 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
 
     def _run(audio):
         try:
-            task_id = _submit(_content("first_frame" if first_frame else None), audio)
+            try:
+                task_id = _submit(_content("first_frame" if first_frame else None), audio)
+            except RuntimeError as e:
+                if (first_frame and not last_frame and any(s in str(e) for s in
+                        ("first_frame", "InvalidParameter", "role"))):
+                    sys.stderr.write("[BYTEPLUS] 'first_frame' not accepted; retrying "
+                                     "with reference_image.\n")
+                    task_id = _submit(_content("reference_image"), audio)
+                else:
+                    raise
         except RuntimeError as e:
-            if (first_frame and not last_frame and any(s in str(e) for s in
-                    ("first_frame", "InvalidParameter", "role"))):
-                sys.stderr.write("[BYTEPLUS] 'first_frame' not accepted; retrying "
-                                 "with reference_image.\n")
-                task_id = _submit(_content("reference_image"), audio)
-            else:
-                raise
+            # Name the rejected asset while we still know what went in which slot.
+            if any(s in str(e) for s in ("SensitiveContent", "PrivacyInformation",
+                                         "ContentModeration", "biometric",
+                                         "real person")):
+                raise RuntimeError(_explain_moderation(str(e), _content_labels()))
+            raise
         url = "{}{}/{}".format(CONFIG.BASE_URL, CONFIG.VIDEO_TASKS, task_id)
         net_fails = 0
         while True:                                  # poll (Seedance is async)
@@ -5906,7 +6203,7 @@ class AnimateDialog(QtWidgets.QDialog):
     def __init__(self, image_src, has_anim, parent=None, dream_items=None,
                  video_items=None):
         super().__init__(parent or _main_window())
-        self.setWindowTitle("Animate with Seedance 2.0")
+        self.setWindowTitle("Animate with " + _seedance_name())
         self.setMinimumSize(500, 380)
         self._image_src = image_src
         self._worker = None
@@ -5990,19 +6287,20 @@ class AnimateDialog(QtWidgets.QDialog):
                 "Use the scene's animation  (none detected — motion from prompt)")
         self.use_anim.toggled.connect(self._sync_mode)
         v.addWidget(self.use_anim)
-        # Clip length. Seedance 2.0 allows 4-15 s (verified). With the playblast ON
-        # the length follows the scene animation (this is disabled); with it OFF the
-        # user picks it here.
+        # Clip length. The window comes from the SELECTED model (2.0: 4-15 s,
+        # 2.5: 4-30 s). With the playblast ON the length follows the scene
+        # animation (this is disabled); with it OFF the user picks it here.
+        _dlo, _dhi = _seedance_caps()["duration"]
         drow = QtWidgets.QHBoxLayout()
         drow.addWidget(QtWidgets.QLabel("Clip length (s):"))
         self.duration = QtWidgets.QComboBox()
-        self.duration.addItems([str(s) for s in range(4, 16)])   # 4..15
+        self.duration.addItems([str(s) for s in range(_dlo, _dhi + 1)])
         self.duration.setCurrentText(
-            str(max(4, min(15, int(round(_anim_seconds())) or 5))))
+            str(_fit_duration(int(round(_anim_seconds())) or 5)))
         self.duration.setToolTip(
-            "Length of the generated clip (Seedance 2.0: 4-15 s). Enabled only when "
-            "the playblast is OFF; with the playblast ON the length matches your "
-            "scene animation.")
+            "Length of the generated clip ({}: {}). Enabled only when the "
+            "playblast is OFF; with the playblast ON the length matches your "
+            "scene animation.".format(_seedance_name(), _seedance_dur_text()))
         self.duration.currentIndexChanged.connect(self._update_cost)
         drow.addWidget(self.duration)
         # Resolution on the fly (Video GEN has it; Settings is too far away when you
@@ -6010,11 +6308,16 @@ class AnimateDialog(QtWidgets.QDialog):
         drow.addSpacing(12)
         drow.addWidget(QtWidgets.QLabel("Resolution:"))
         self.res = QtWidgets.QComboBox()
-        self.res.addItems(["480p", "720p", "1080p", "4k"])
-        self.res.setCurrentText(CONFIG.VIDEO_RESOLUTION)
+        # Only what THIS model supports, and seeded with a value that exists in
+        # the list -- setCurrentText is a silent no-op for an absent entry, which
+        # would otherwise leave the dialog showing 480p.
+        self.res.addItems(list(_seedance_caps()["resolutions"]))
+        self.res.setCurrentText(_fit_resolution(CONFIG.VIDEO_RESOLUTION))
         self.res.setToolTip("Output resolution for this clip. Defaults to your "
                             "Settings > Generation value; changing it here affects "
-                            "only this generation. 4k is Base-model only and slower.")
+                            "only this generation. {} offers {}.".format(
+                                _seedance_name(),
+                                ", ".join(_seedance_caps()["resolutions"])))
         self.res.currentIndexChanged.connect(self._update_cost)
         drow.addWidget(self.res)
         drow.addStretch(1)
@@ -6066,11 +6369,14 @@ class AnimateDialog(QtWidgets.QDialog):
             self.cost.setText("")
             return
         if self.use_anim.isChecked():
-            dur = max(4, min(15, int(round(_anim_seconds())) or 4))
+            dur = _fit_duration(int(round(_anim_seconds())) or 4)
         else:
             dur = int(self.duration.currentText())
         has_video = self.use_anim.isChecked() and _motion_host_ready()
-        res = self.resolution()
+        # Price and label must agree: _est_video_cost fits the resolution to the
+        # model, so show the FITTED one (a 2.5 user picking 4k saw "(4k, 15s)"
+        # next to a 720p price).
+        res = _fit_resolution(self.resolution())
         tok, usd = _est_video_cost(res, CONFIG.VIDEO_RATIO, dur, has_video)
         self.cost.setText("{}  ({}, {}s)".format(_fmt_cost(tok, usd), res, dur))
 
@@ -6445,7 +6751,7 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
     # choice from the dialog (Seedance 2.0: 4-15 s, verified).
     if use_anim:
         seconds = _anim_seconds()
-        duration = max(4, min(15, int(round(seconds)) or 4))
+        duration = _fit_duration(int(round(seconds)) or 4)
     else:
         duration = d.duration_choice()
         seconds = duration
@@ -6614,22 +6920,12 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
         dlg.close()
         detail = next((l.strip() for l in reversed(str(tb).splitlines())
                        if l.strip()), str(tb))
-        if any(s in tb for s in ("SensitiveContent", "PrivacyInformation",
-                                 "real person", "ContentModeration", "biometric")):
-            _error(
-                "Seedance's content moderation blocked this image.\n\n"
-                "This is USUALLY a human face that isn't a trusted input — but it can "
-                "also be a FALSE POSITIVE: mirrors/reflections read as a person, busy "
-                "patterns, or an image that's over ~24h old and lost its trusted-output "
-                "exemption.\n\n"
-                "• If it HAS a face: make it with  BYTEPLUS > Text to Image  (or use "
-                "Trusted Characters), then animate within ~24h — the trusted link is "
-                "passed automatically (KYC HIGH also allows viewport-guided faces).\n"
-                "• If it has NO face (a room, product, scene — like a bathroom): "
-                "regenerate it FRESH so it carries a trusted link and animate it right "
-                "away. A mirror-heavy shot can trip the filter, so a slightly different "
-                "frame often passes.\n\n"
-                "Exact API error:\n" + detail)
+        _mi = tb.find(_MODERATION_MARK)
+        if _mi >= 0:                       # already explained + asset named
+            _error(tb[_mi:])
+        elif any(s in tb for s in ("SensitiveContent", "PrivacyInformation",
+                                   "real person", "ContentModeration", "biometric")):
+            _error(_explain_moderation(detail))
         else:
             _error(tb)
 
@@ -6649,15 +6945,10 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
             # -> tell Seedance to FOLLOW their motion, by their numbered labels (the
             # role the API uses). Content order: playblast is Video 1, extras follow.
             labels = ["Video {}".format(i + 1) for i in range(n_vid)]
-            if len(labels) == 1:
-                vlist, verb = labels[0], "It provides"
-            else:
-                vlist = ", ".join(labels[:-1]) + " and " + labels[-1]
-                verb = "They provide"
-            final = ("Strictly follow the exact motion, movement path, camera work "
-                     "and timing of {} throughout. {} ONLY the motion and camera, "
-                     "not the look — keep the subject's exact appearance from "
-                     "Image 1.  ".format(vlist, verb) + p)
+            # On 2.5 the playblast is framed as a BASE-MESH previs (its native
+            # task type); on 2.0 this returns the previous motion-reference
+            # wording unchanged.
+            final = _basemesh_clause(labels, bool(image_sources)) + p
         elif motion_frames:
             # No video at all -> text-only FALLBACK from sampled scene frames.
             try:
@@ -6724,7 +7015,7 @@ def render_with_seedance():
     seconds = _anim_seconds()
     n_refs = _ref_count(seconds, CONFIG.MAX_IMAGE_REFS)
     frames = _frame_samples(n_refs)
-    duration = max(4, min(15, int(round(seconds)) or 4))
+    duration = _fit_duration(int(round(seconds)) or 4)
     renderer = cmds.getAttr("defaultRenderGlobals.currentRenderer")
 
     # Cost guard (Render always sends a playblast as the motion video).
@@ -6781,12 +7072,12 @@ def render_with_seedance():
 
     _meta = {}                                       # trusted URLs -> Extend / Edit
     def make_video(p):                               # re-runnable with a new prompt
-        # The playblast is mandatory and attached. Reference it DIRECTLY (the
-        # API's reference_video role); require_motion_video makes a failed upload
-        # FAIL LOUDLY (retry) instead of degrading -- Render must be faithful.
-        final = ("Strictly follow the motion, movement path, camera work and "
-                 "timing of the reference video; the reference video provides "
-                 "ONLY the motion, not the look.  " + p)
+        # The playblast is mandatory and attached. On 2.5 it is framed as a
+        # BASE-MESH previs (native task type) with the rendered Arnold frames as
+        # the look; on 2.0 the wording is the previous motion reference.
+        # require_motion_video makes a failed upload FAIL LOUDLY (retry) instead
+        # of degrading -- Render must be faithful.
+        final = _basemesh_clause(["Video 1"], bool(ref_paths)) + p
         return _seedance_generate(final, ref_paths, movie, duration,
                                   require_motion_video=True, fit_motion=True,
                                   out_meta=_meta)
@@ -9488,9 +9779,10 @@ class DialogueSceneDialog(QtWidgets.QDialog):
 
         drow = QtWidgets.QHBoxLayout()
         drow.addWidget(QtWidgets.QLabel("Duration (s):"))
+        _qlo, _qhi = _seedance_caps()["duration"]
         self.duration = QtWidgets.QComboBox()
-        self.duration.addItems([str(s) for s in range(4, 16)])
-        self.duration.setCurrentText("10")
+        self.duration.addItems([str(s) for s in range(_qlo, _qhi + 1)])
+        self.duration.setCurrentText(str(_fit_duration(10)))
         self.duration.currentTextChanged.connect(lambda *_: self._refresh_cast())
         drow.addWidget(self.duration)
         drow.addStretch(1)
@@ -9680,10 +9972,12 @@ class VideoGenDialog(QtWidgets.QDialog):
     character voices). Model (Base/Fast/Mini), resolution, ratio, duration, audio,
     watermark, priority. Result -> Video Gallery."""
 
-    _MODELS = [("Base — 1080p/4k", "base"), ("Fast — 480/720", "fast"),
-               ("Mini — 480/720", "mini")]
-    _RES = {"base": ["480p", "720p", "1080p", "4k"],
+    _MODELS = [("2.5 — up to 30 s, 480/720", "v25"), ("Base — 1080p/4k", "base"),
+               ("Fast — 480/720", "fast"), ("Mini — 480/720", "mini")]
+    _RES = {"v25": ["480p", "720p"], "base": ["480p", "720p", "1080p", "4k"],
             "fast": ["480p", "720p"], "mini": ["480p", "720p"]}
+    # Longest take each tier allows -- 2.5 doubles 2.0's window to 30 s.
+    _MAXDUR = {"v25": 30, "base": 15, "fast": 15, "mini": 15}
     _RATIOS = ["adaptive", "16:9", "9:16", "1:1", "4:3", "3:4", "21:9"]
 
     def __init__(self, parent=None):
@@ -9828,6 +10122,20 @@ class VideoGenDialog(QtWidgets.QDialog):
         brow.addWidget(self.b_gen)
         v.addLayout(brow)
 
+        # Open on whichever model Settings uses, so this dialog and Animate/Render
+        # agree instead of silently diverging (2.5 is listed first but must not
+        # override a user who deliberately stays on 2.0 for 4k).
+        for _t, _mid in (("v25", CONFIG.SEEDANCE_MODEL_25),
+                         ("base", CONFIG.SEEDANCE_MODEL_20),
+                         ("fast", CONFIG.SEEDANCE_FAST_MODEL),
+                         ("mini", CONFIG.SEEDANCE_MINI_MODEL)):
+            if CONFIG.SEEDANCE_MODEL == _mid:
+                _j = self.model.findData(_t)
+                if _j >= 0:
+                    self.model.blockSignals(True)
+                    self.model.setCurrentIndex(_j)
+                    self.model.blockSignals(False)
+                break
         self._sync_model()
         self._sync_mode()
 
@@ -9919,13 +10227,25 @@ class VideoGenDialog(QtWidgets.QDialog):
 
     # -- mode / model / cost -------------------------------------------------
     def _sync_model(self):
+        tier = self.model.currentData()
         cur = self.res.currentText()
         self.res.blockSignals(True)
         self.res.clear()
-        self.res.addItems(self._RES[self.model.currentData()])
+        self.res.addItems(self._RES[tier])
         i = self.res.findText(cur)
         self.res.setCurrentIndex(i if i >= 0 else 0)
         self.res.blockSignals(False)
+        # Rebuild the duration list for this tier (2.5 goes to 30 s, 2.0 to 15),
+        # keeping the current pick when the new window still allows it.
+        cur_d = self.duration.currentData()
+        self.duration.blockSignals(True)
+        self.duration.clear()
+        self.duration.addItem("Auto", -1)
+        for s in range(4, self._MAXDUR.get(tier, 15) + 1):
+            self.duration.addItem("{} s".format(s), s)
+        j = self.duration.findData(cur_d)
+        self.duration.setCurrentIndex(j if j >= 0 else self.duration.findData(5))
+        self.duration.blockSignals(False)
         self._refresh_cost()
 
     def _sync_mode(self):
@@ -9952,11 +10272,13 @@ class VideoGenDialog(QtWidgets.QDialog):
         d = self.duration.currentData()
         secs = 5 if d == -1 else int(d)
         tok, usd = _est_video_cost(self.res.currentText() or "720p",
-                                   self.ratio.currentText(), secs, False)
+                                   self.ratio.currentText(), secs, False,
+                                   self._model_id())
         self.cost.setText(_fmt_cost(tok, usd) + ("  (auto ≈5s)" if d == -1 else ""))
 
     def _model_id(self):
-        return {"base": CONFIG.SEEDANCE_MODEL, "fast": CONFIG.SEEDANCE_FAST_MODEL,
+        return {"v25": CONFIG.SEEDANCE_MODEL_25, "base": CONFIG.SEEDANCE_MODEL_20,
+                "fast": CONFIG.SEEDANCE_FAST_MODEL,
                 "mini": CONFIG.SEEDANCE_MINI_MODEL}[self.model.currentData()]
 
     def _enhance(self):
@@ -10075,13 +10397,12 @@ class VideoGenDialog(QtWidgets.QDialog):
             _discard_video_job(worker)
             self.b_gen.setEnabled(True); self.b_gen.setText("Generate")
             self.status.setText("❌ failed")
-            if any(s in tb for s in ("SensitiveContent", "PrivacyInformation",
-                                     "real person")):
-                _error("Seedance's content moderation blocked a reference.\n\n"
-                       "Usually an external/real human face. Use trusted images "
-                       "(Text to Image / Trusted Characters) for faces.\n\n"
-                       + next((l.strip() for l in reversed(str(tb).splitlines())
-                               if l.strip()), ""))
+            _mi = tb.find(_MODERATION_MARK)
+            if _mi >= 0:                   # already explained, with the asset named
+                _error(tb[_mi:])
+            elif any(s in tb for s in ("SensitiveContent", "PrivacyInformation",
+                                       "real person", "ContentModeration")):
+                _error(_explain_moderation(tb))
             else:
                 _error("Video GEN failed:\n\n" + tb)
 
@@ -11352,8 +11673,30 @@ class SettingsDialog(QtWidgets.QDialog):
                                         "lighter/faster (avoids timeouts); PNG is "
                                         "lossless but heavy.")
         form.addRow("Image output format (Pro / Lite)", self.seedream_outfmt)
-        self.seedance_model = QtWidgets.QLineEdit(CONFIG.SEEDANCE_MODEL)
-        self.seedance_model.setPlaceholderText("e.g. seedance model ID or ep-xxxx")
+        # Plain pick-one dropdown, like the image-model / output-format rows above.
+        # NOTE: the 2.0 row must use the IMMUTABLE id, never CONFIG.SEEDANCE_MODEL
+        # (that is the current selection -- using it would make both rows point at
+        # whatever was saved last, with no way back). Labels come from
+        # SEEDANCE_CAPS so they can never drift from what the model really allows.
+        self.seedance_model = QtWidgets.QComboBox()
+        for _mid, _extra in ((CONFIG.SEEDANCE_MODEL_25, ""),
+                             (CONFIG.SEEDANCE_MODEL_20, ""),
+                             (CONFIG.SEEDANCE_FAST_MODEL, ""),
+                             (CONFIG.SEEDANCE_MINI_MODEL, ", cheapest")):
+            _c = _seedance_caps(_mid)
+            _r = _c["resolutions"]
+            _res_txt = "up to 4K" if "4k" in _r else "/".join(x[:-1] for x in _r)
+            self.seedance_model.addItem(
+                "{} — {} s, {}{}".format(_seedance_name(_mid), _c["duration"][1],
+                                         _res_txt, _extra), _mid)
+        _i = self.seedance_model.findData(CONFIG.SEEDANCE_MODEL)
+        if _i < 0:      # a custom endpoint from prefs -- keep it instead of losing it
+            self.seedance_model.addItem(CONFIG.SEEDANCE_MODEL, CONFIG.SEEDANCE_MODEL)
+            _i = self.seedance_model.count() - 1
+        self.seedance_model.setCurrentIndex(_i)
+        self.seedance_model.setToolTip(
+            "2.5 renders a Maya playblast as a base-mesh previs and reaches 30 s, "
+            "but has no 1080p/4K — those step down to 720p. Stay on 2.0 for 4K.")
         form.addRow("Seedance (video) model", self.seedance_model)
         self.llm_model = QtWidgets.QLineEdit(CONFIG.LLM_MODEL)
         self.llm_model.setPlaceholderText("multimodal LLM for auto-prompt")
@@ -11660,7 +12003,8 @@ class SettingsDialog(QtWidgets.QDialog):
                                  else CONFIG.SEEDREAM_PRO_MODEL)
         CONFIG.SEEDREAM_FACE_MODEL = CONFIG.SEEDREAM_MODEL   # legacy fallback (windows pick per-use)
         CONFIG.SEEDREAM_OUTPUT_FORMAT = self.seedream_outfmt.currentData()
-        CONFIG.SEEDANCE_MODEL = self.seedance_model.text().strip()
+        CONFIG.SEEDANCE_MODEL = (self.seedance_model.currentData()
+                                 or CONFIG.SEEDANCE_MODEL)
         CONFIG.LLM_MODEL = self.llm_model.text().strip()
         CONFIG.SEED_CHAT_MODEL = self.seed_chat_model.text().strip()
         CONFIG.THREE_D_MODEL = self.three_d_model.text().strip()
