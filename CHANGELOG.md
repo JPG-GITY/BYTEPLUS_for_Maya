@@ -32,6 +32,8 @@ All user-facing changes, newest first. `USER_GUIDE.md` is the canonical guide;
   with a read-only call, no side effects.
 
 ### Dialogue Scene
+- The spoken track of a finished scene is extracted (WAV) and filed in the
+  **Audio Gallery** next to the video in the Video Gallery.
 - Progress: the job is a row in the activity HUD (cancel with ✕); the button
   reads *Generating…*; the result lands in the Video Gallery.
 - **Honest errors.** When Seedance's *output* filter flags the generated

@@ -3652,6 +3652,38 @@ def _fit_video_seconds(path: str, target: int) -> str:
     return path
 
 
+def _extract_audio_track(video_path: str, out_dir: str, stem: str):
+    """Demux a video's audio track to <out_dir>/<stem>_dialogue.wav (PCM, so it
+    works with the LGPL ffmpeg bundled on Windows -- no MP3 encoder needed).
+    Returns (path, seconds) or (None, 0) if there is no audio / no ffmpeg."""
+    import subprocess
+    ff = _ffmpeg_exe()
+    if not ff or not _has_audio_stream(video_path):
+        return None, 0
+    out = _unique_path(out_dir, stem + "_dialogue", ext=".wav")
+    kw = dict(capture_output=True, text=True)
+    if sys.platform.startswith("win"):
+        kw["creationflags"] = 0x08000000
+    try:
+        subprocess.run([ff, "-y", "-v", "error", "-i", video_path, "-vn",
+                        "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", out], **kw)
+    except Exception as e:
+        sys.stderr.write("[BYTEPLUS] audio extract failed: {}\n".format(e))
+        return None, 0
+    if not (os.path.exists(out) and os.path.getsize(out) > 44):
+        return None, 0
+    secs = 0
+    fp = _ffprobe_exe()
+    if fp:
+        try:
+            o = subprocess.run([fp, "-v", "error", "-show_entries", "format=duration",
+                                "-of", "csv=p=0", out], **kw).stdout
+            secs = float((o or "0").strip() or 0)
+        except Exception:
+            pass
+    return out, secs
+
+
 def _has_audio_stream(path: str) -> bool:
     """True if the file has at least one audio stream. Best-effort (ffprobe, else
     ffmpeg banner); False on any error or if ffmpeg is unavailable."""
@@ -5555,6 +5587,7 @@ def _add_video_result(video_bytes: bytes, poster_src, regen, prompt=None,
             pass
     g = _video_gallery()
     g.add_video(vid, poster, regen, prompt=prompt)
+    return vid
     g.show()
     g.raise_()
 
@@ -10450,10 +10483,35 @@ class DialogueSceneDialog(QtWidgets.QDialog):
 
         def done(vb):
             _restore()
-            self.status.setText("✅ done — see the Video Gallery.")
-            _add_video_result(vb, poster, None, prompt=prompt,
-                              last_frame_url=meta.get("last_frame_url"),
-                              video_url=meta.get("video_url"))
+            vid = _add_video_result(vb, poster, None, prompt=prompt,
+                                    last_frame_url=meta.get("last_frame_url"),
+                                    video_url=meta.get("video_url"))
+            self.status.setText("✅ done — video in the Video Gallery; extracting the "
+                                "dialogue audio…")
+            # The spoken track is also a deliverable: demux it (ffmpeg, off the UI
+            # thread) and file it in the Audio Gallery next to the Seed Audio clips.
+            out_dir, stem = _scene_audio_dir(), _scene_tag()       # main thread: maya.cmds
+            aw = _Worker(lambda: _extract_audio_track(vid, out_dir, stem) if vid else (None, 0),
+                         parent=_main_window())
+
+            def _audio_done(res):
+                apath, secs = res or (None, 0)
+                if apath:
+                    g = _audio_gallery()
+                    g.add_audio(apath, {"duration": secs, "source": "dialogue scene"})
+                    if g.isVisible():
+                        g.raise_()
+                    self.status.setText("✅ done — video in the Video Gallery, dialogue "
+                                        "audio ({:.1f}s) in the Audio Gallery.".format(secs))
+                else:
+                    self.status.setText("✅ done — video in the Video Gallery (no audio "
+                                        "track to extract).")
+
+            aw.done.connect(_audio_done)
+            aw.failed.connect(lambda tb: self.status.setText(
+                "✅ done — video in the Video Gallery (audio extract failed, see Script Editor)."))
+            aw.start()
+            self._aw = aw
 
         def failed(tb):
             _restore()
