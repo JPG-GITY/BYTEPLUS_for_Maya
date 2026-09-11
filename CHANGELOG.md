@@ -31,6 +31,16 @@ All user-facing changes, newest first. `USER_GUIDE.md` is the canonical guide;
 - **Diagnostics > Test Trusted Asset Library**: proves your keys and IAM policy
   with a read-only call, no side effects.
 
+### Dialogue Scene
+- Progress: the job is a row in the activity HUD (cancel with ✕); the button
+  reads *Generating…*; the result lands in the Video Gallery.
+- **Honest errors.** When Seedance's *output* filter flags the generated
+  video/audio (`OutputVideoSensitiveContentDetected.PolicyViolation`, usually
+  "copyright"), the plugin no longer claims your trusted characters were
+  rejected — the inputs were accepted and the job ran; the message now says so
+  and suggests a retry / rephrasing / audio off. Applies to every Seedance
+  dialog.
+
 ### Seed Audio
 - **Trusted Characters > Generate voice…** shows progress: a row in the
   activity HUD (cancel with ✕), the button reads *Generating…*, and the voice
