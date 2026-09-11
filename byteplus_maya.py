@@ -5751,6 +5751,31 @@ def _basemesh_clause(video_labels: list, has_look_ref: bool, model=None) -> str:
 
 
 _MODERATION_MARK = "Seedance's content moderation blocked"
+_OUTPUT_POLICY_MARK = "Seedance's OUTPUT filter flagged the generated"
+
+
+def _is_output_policy_error(err_text) -> bool:
+    """OutputVideo/OutputAudioSensitiveContentDetected(.PolicyViolation): the
+    GENERATED result was flagged (copyright / policy) -- the inputs were fine.
+    Must never be reported as 'your image / character was rejected'."""
+    t = str(err_text or "")
+    return ("OutputVideoSensitiveContentDetected" in t
+            or "OutputAudioSensitiveContentDetected" in t
+            or "OutputImageSensitiveContentDetected" in t)
+
+
+def _explain_output_policy(err_text: str) -> str:
+    t = str(err_text or "")
+    what = ("audio" if "OutputAudio" in t else "image" if "OutputImage" in t else "video")
+    low = t.lower()
+    why = ("copyright" if "copyright" in low else "policy")
+    return ("{} {} ({}).\n\nThis is the post-generation filter on the RESULT -- your "
+            "reference images, trusted characters and voices were accepted and the "
+            "job ran (it is billed). Measured on this account it is intermittent: "
+            "the same request can pass on a retry.\n\nWhat helps: retry as-is; "
+            "rephrase or shorten the spoken lines; use a different voice; or turn "
+            "audio off if the scene does not need it.".format(
+                _OUTPUT_POLICY_MARK, what, why))
 
 
 def _explain_moderation(err_text: str, labels=None) -> str:
@@ -5765,6 +5790,8 @@ def _explain_moderation(err_text: str, labels=None) -> str:
     platform itself generated."""
     import re as _re
     txt = str(err_text or "")
+    if _is_output_policy_error(txt):                 # result flagged, not an input
+        return _explain_output_policy(txt)
     m = _re.search(r"content\[(\d+)\]", txt)
     idx = int(m.group(1)) if m else None
     asset = None
@@ -6087,6 +6114,8 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                     raise
         except RuntimeError as e:
             # Name the rejected asset while we still know what went in which slot.
+            if _is_output_policy_error(str(e)):
+                raise RuntimeError(_explain_output_policy(str(e)))
             if any(s in str(e) for s in ("SensitiveContent", "PrivacyInformation",
                                          "ContentModeration", "biometric",
                                          "real person")):
@@ -10400,32 +10429,48 @@ class DialogueSceneDialog(QtWidgets.QDialog):
             if c.get("thumb") and os.path.exists(c["thumb"]):
                 poster = c["thumb"]; break
         _mark_active_project()
-        self.b_gen.setEnabled(False); self.b_gen.setText("Generating…")
-        self.status.setText("Submitting dialogue scene to Seedance…")
+        names = ", ".join(c["name"] for c in self._cast)[:40]
+        h = _progress("🎬 Dialogue · {}".format(names))   # row in the activity HUD (✕ cancels)
+        h.setLabelText("Seedance is generating the dialogue scene ({} s, {} voice(s))…"
+                       .format(duration, len(audio_sources)))
+        h.show()
+        self.b_gen.setEnabled(False); self.b_gen.setText("⏳ Generating…")
+        self.status.setText("⏳ Generating in the background — see the activity HUD; "
+                            "the result lands in the Video Gallery.")
         meta = {}
         worker = _Worker(lambda: _seedance_generate(
             prompt, image_sources, None, duration, generate_audio=True,
             audio_sources=audio_sources, out_meta=meta, trusted_input=True),
             parent=_main_window())
 
-        def done(vb):
+        def _restore():
+            h.close()
             _discard_video_job(worker)
             self.b_gen.setEnabled(True); self.b_gen.setText("Generate scene")
+
+        def done(vb):
+            _restore()
             self.status.setText("✅ done — see the Video Gallery.")
             _add_video_result(vb, poster, None, prompt=prompt,
                               last_frame_url=meta.get("last_frame_url"),
                               video_url=meta.get("video_url"))
 
         def failed(tb):
-            _discard_video_job(worker)
-            self.b_gen.setEnabled(True); self.b_gen.setText("Generate scene")
+            _restore()
             self.status.setText("❌ failed")
-            if any(s in tb for s in ("SensitiveContent", "PrivacyInformation",
-                                     "real person")):
-                _error("Seedance blocked a character face (not a trusted input).\n\n"
-                       "Dialogue scenes use your Trusted Characters (asset://), which "
-                       "should pass. If this persists, re-check the character's image "
-                       "is ✅ Active in Trusted Characters.")
+            if _OUTPUT_POLICY_MARK in tb or _is_output_policy_error(tb):
+                # The RESULT was flagged -- the trusted characters were accepted.
+                msg = tb[tb.index(_OUTPUT_POLICY_MARK):] if _OUTPUT_POLICY_MARK in tb \
+                    else _explain_output_policy(tb)
+                _error(msg.strip())
+            elif _MODERATION_MARK in tb:
+                _error(tb[tb.index(_MODERATION_MARK):].strip())
+            elif any(s in tb for s in ("SensitiveContent", "PrivacyInformation",
+                                       "real person")):
+                _error("Seedance blocked one of the INPUTS.\n\nDialogue scenes use your "
+                       "Trusted Characters (asset://), which should pass. Re-check "
+                       "that each character's image is ✅ Active in Trusted "
+                       "Characters, and that voice clips are ≤ 15 s.\n\n" + tb[-400:])
             else:
                 _error("Dialogue scene failed:\n\n" + tb)
 
