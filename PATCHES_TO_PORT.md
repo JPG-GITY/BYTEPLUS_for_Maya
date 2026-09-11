@@ -115,3 +115,35 @@ resolves the installed module file, loads that exact path with `importlib`, clea
   They are kept identical; decide which is canonical and drop the other.
 - Seedance 2.5 next steps (see **SEEDANCE_2.5_INTEGRATION.md**): timestamped shot lists
   from the Maya timeline, keyframe reference, `MAX_IMAGE_REFS` 30.
+
+---
+
+## 2026-09-10/11 — VPN gzip, Seed 3D model id, Trusted Asset Library (STS) — all in git
+
+- **Corporate VPN now gzips API responses** (`Server: feilian-agw`) even without
+  `Accept-Encoding`; urllib does not inflate, so every JSON call died with
+  `'utf-8' codec can't decode byte 0x8b`. `_undo_content_encoding()` inside `_open`
+  (the single `urlopen`) inflates only when the header says so; other networks unchanged.
+- **Seed 3D:** the documented id `Hyper3d-Rodin-Gen2` 404s; the live catalog id is
+  `hyper3d-gen2-260112` (verified text->3D -> usdz + 4 PBR maps -> imported).
+  `_DEAD_MODEL_IDS` migrates a stale saved pref on load (Windows installs included).
+- **Trusted Asset Library, audited (126-agent read-only audit) and live-tested:**
+  session-token support for temporary STS keys (`X-Security-Token` signed, TOS
+  `security_token`; new "Session token" fields in Settings and the hosting wizard);
+  credential pairs never mixed; `_AssetApiError` with the server Code and
+  `_asset_error_hint()` replacing the 'sign'/'authoriz' substring guesses; bare-host
+  sanitising; ListAssetGroups paginated (100/page cap); per-install auto group
+  `BYTEPLUS Auto <INSTALL_ID[:8]>` matched by exact name and validated (shared account);
+  GetAsset polling with backoff, hosted source removed only on a terminal status, a
+  timeout returns Processing (never Failed); deleting the auto group clears its id;
+  trusted pickers accept only Active; `asset://` no longer reaches `_data_uri` (Analyze /
+  Compose); atomic asset store + prefs; R2 PUT sends a real Content-Type; Diagnostics >
+  "Test Trusted Asset Library" (GetAssetQuota, no side effects).
+  Measured 2026-09-11 with STS: quota read OK, asset Active in 5 s, Seedance 2.5 and 2.0
+  both generate from `asset://` with identity preserved.
+- **TSP STS tokens live ~1 h (measured), not 12 h.** `ExpiredToken` is classified as a
+  credential error, and `_host_video()` falls back to R2 when a TOS upload fails, so a dead
+  token no longer blocks every playblast. TOS bucket for this account: `maya-byteplus`.
+- **Still open:** the `tos` SDK is NOT bundled (Mac: user-site install only) -> vendor it
+  like ffmpeg; `_host_video()` prefers TOS over R2 silently when both are configured;
+  8 minor audit findings (sidecar invalidation, picker greying, ASSET_PROJECT setting).

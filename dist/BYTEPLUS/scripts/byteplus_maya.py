@@ -53,6 +53,10 @@ import uuid
 import hmac
 import base64
 import hashlib
+import gzip
+import zlib
+import re
+import mimetypes
 import datetime
 import tempfile
 import threading
@@ -124,10 +128,12 @@ class CONFIG:
     SEEDREAM_OUTPUT_FORMAT = "jpeg"
     LLM_MODEL = "seed-1-6-250915"                        # multimodal (auto-prompt)
     SEED_CHAT_MODEL = "seed-2-0-pro-260328"              # Seed Chat window: agentic multimodal (tool-calling ready)
-    # Seed 3D. NOTE: the documented IDs (Hyper3d-Rodin-Gen2 / Hitem3d-2.0) returned
-    # HTTP 404 on this account -- set the REAL model ID (or 'ep-...' inference
-    # endpoint) from your ModelArk console in Settings > 3D model before using it.
-    THREE_D_MODEL = "Hyper3d-Rodin-Gen2"                 # text->3D + image->3D (UNVERIFIED)
+    # Seed 3D. The DOCUMENTED id "Hyper3d-Rodin-Gen2" 404s (InvalidEndpointOrModel.
+    # NotFound); the live GET /models catalog lists it as "hyper3d-gen2-260112".
+    # Verified 2026-09-11: text->3D -> usdz + 4 PBR maps -> imported into Maya.
+    # (Image->3D-only sibling: "hitem3d-2-0-251223".) An old saved pref holding the
+    # dead id is migrated on load -- see _DEAD_MODEL_IDS.
+    THREE_D_MODEL = "hyper3d-gen2-260112"                # text->3D + image->3D
     # --- Seed Audio 1.0 (TTS / voice / music & SFX) ---------------------------
     # SEPARATE service: its OWN host + its OWN API key (X-Api-Key from the Voice
     # console), NOT the ark Bearer key. Non-streaming; <=120 s per request; billed
@@ -246,6 +252,8 @@ class CONFIG:
     TOS_SK = ""
     TOS_AK_ENV = "TOS_ACCESS_KEY"
     TOS_SK_ENV = "TOS_SECRET_KEY"
+    TOS_SESSION_TOKEN = ""                              # only for temporary STS keys (AKTP...)
+    TOS_TOKEN_ENV = "TOS_SESSION_TOKEN"
     TOS_ENDPOINT = "tos-ap-southeast-1.bytepluses.com"
     TOS_REGION = "ap-southeast-1"
     TOS_BUCKET = ""                                      # e.g. "my-maya-bucket"
@@ -276,6 +284,8 @@ class CONFIG:
     # TOS_AK/TOS_SK (same BytePlus account credentials) when blank.
     ASSET_AK = ""
     ASSET_SK = ""
+    ASSET_SESSION_TOKEN = ""                            # only for temporary STS keys (AKTP...)
+    ASSET_HTTP_TIMEOUT = 60                              # control-plane calls are quick; never the 600 s media timeout
     ASSET_STORE_PATH = os.path.join(os.path.expanduser("~"), ".byteplus_maya_assets.json")
     # Auto-permanence: with Advanced Creation Rights + AK/SK, register faces you
     # actually use (Extend / Make-permanent) as permanent asset:// so the 24h
@@ -370,6 +380,16 @@ _PERSISTED = (
 )
 
 
+# Model ids that no longer resolve -> their live replacement. Applied on load so a
+# stale saved pref can't keep a feature broken on installs where nobody reopens
+# Settings (Windows machines, customers). (config key, dead id, live id)
+_PREFS_LOCK = threading.Lock()
+
+_DEAD_MODEL_IDS = (
+    ("THREE_D_MODEL", "Hyper3d-Rodin-Gen2", "hyper3d-gen2-260112"),
+)
+
+
 def _load_prefs():
     try:
         with open(CONFIG.PREFS_PATH) as f:
@@ -377,6 +397,9 @@ def _load_prefs():
         for k, v in data.items():
             if k in _PERSISTED:
                 setattr(CONFIG, k, v)
+        for k, dead, live in _DEAD_MODEL_IDS:
+            if str(getattr(CONFIG, k, "") or "").strip().lower() == dead.lower():
+                setattr(CONFIG, k, live)
         # Secrets are persisted only if the user opted in (Remember).
         if data.get("REMEMBER_API_KEY"):
             CONFIG.API_KEY = data.get("API_KEY", CONFIG.API_KEY)
@@ -387,6 +410,8 @@ def _load_prefs():
             CONFIG.ASSET_AK = data.get("ASSET_AK", CONFIG.ASSET_AK)
             CONFIG.ASSET_SK = data.get("ASSET_SK", CONFIG.ASSET_SK)
             CONFIG.AUDIO_API_KEY = data.get("AUDIO_API_KEY", CONFIG.AUDIO_API_KEY)
+            CONFIG.ASSET_SESSION_TOKEN = data.get("ASSET_SESSION_TOKEN", CONFIG.ASSET_SESSION_TOKEN)
+            CONFIG.TOS_SESSION_TOKEN = data.get("TOS_SESSION_TOKEN", CONFIG.TOS_SESSION_TOKEN)
     except (OSError, ValueError):
         pass
 
@@ -396,19 +421,23 @@ def _save_prefs():
     # Only write secrets when the user explicitly asked to remember them.
     if CONFIG.REMEMBER_API_KEY:
         for k in ("API_KEY", "TOS_AK", "TOS_SK", "R2_ACCESS_KEY", "R2_SECRET_KEY",
-                  "ASSET_AK", "ASSET_SK", "AUDIO_API_KEY"):
+                  "ASSET_AK", "ASSET_SK", "AUDIO_API_KEY",
+                  "ASSET_SESSION_TOKEN", "TOS_SESSION_TOKEN"):
             if getattr(CONFIG, k):
                 data[k] = getattr(CONFIG, k)
-    try:
-        with open(CONFIG.PREFS_PATH, "w") as f:
-            json.dump(data, f, indent=2)
-        # Best-effort: lock the file down (no-op on Windows).
+    with _PREFS_LOCK:                              # workers and the UI both save
         try:
-            os.chmod(CONFIG.PREFS_PATH, 0o600)
+            tmp = CONFIG.PREFS_PATH + ".tmp"          # atomic: never a half-written prefs file
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, CONFIG.PREFS_PATH)
+            # Best-effort: lock the file down (no-op on Windows).
+            try:
+                os.chmod(CONFIG.PREFS_PATH, 0o600)
+            except OSError:
+                pass
         except OSError:
             pass
-    except OSError:
-        pass
 
 
 # Gallery "hidden" list: files removed from a gallery WITHOUT deleting from disk.
@@ -604,10 +633,43 @@ _POLL_NET_RETRIES = 12        # consecutive poll blips tolerated (task stays run
 _NET_DOWNLOAD_RETRIES = 3     # retries to download a finished (already-paid) result
 
 
-def _open(req_or_url):
+def _undo_content_encoding(resp):
+    """Transparently undo a gzip/deflate Content-Encoding on a urlopen response
+    (or HTTPError), so every caller keeps reading the plain body.
+
+    WHY: the ByteDance corporate VPN gateway (Feilian -- `Server: feilian-agw`)
+    gzips API responses even though we never send Accept-Encoding, and urllib
+    does not decompress -- so every JSON reply arrived as raw gzip ("'utf-8'
+    codec can't decode byte 0x8b"). Acts ONLY when the header says so: on any
+    other network the response object is returned untouched."""
     try:
-        return urllib.request.urlopen(req_or_url, timeout=CONFIG.HTTP_TIMEOUT,
-                                      context=_ssl_context())
+        enc = (resp.headers.get("Content-Encoding") or "").strip().lower()
+    except Exception:
+        return resp
+    if enc not in ("gzip", "x-gzip", "deflate"):
+        return resp
+    raw_read = resp.read
+
+    def read(*_args):
+        raw = raw_read()
+        try:
+            if enc == "deflate":
+                try:
+                    return zlib.decompress(raw)
+                except zlib.error:
+                    return zlib.decompress(raw, -zlib.MAX_WBITS)   # raw deflate
+            return gzip.decompress(raw)
+        except (OSError, EOFError, zlib.error):
+            return raw                           # not really compressed -- as-is
+    resp.read = read
+    return resp
+
+
+def _open(req_or_url, timeout=None):
+    try:
+        return _undo_content_encoding(
+            urllib.request.urlopen(req_or_url, timeout=timeout or CONFIG.HTTP_TIMEOUT,
+                                   context=_ssl_context()))
     except urllib.error.URLError as e:
         reason = getattr(e, "reason", e)
         if isinstance(reason, ssl.SSLCertVerificationError) or \
@@ -623,6 +685,7 @@ def _open(req_or_url):
                 "certificates' (less secure)."
             )
         if isinstance(e, urllib.error.HTTPError):
+            _undo_content_encoding(e)            # error bodies are gzipped too
             raise                                # keep the HTTP response for _request
         # Plain connection / DNS / timeout error (no HTTP response) -> a clean,
         # retryable message instead of a urllib traceback.
@@ -1273,6 +1336,40 @@ def diagnose_r2():
     print("=" * 60)
 
 
+def diagnose_assets():
+    """Validate the Trusted Asset Library credentials with ZERO side effects:
+    GetAssetQuota (signed read) + this install's auto group. Prints each step.
+
+        import byteplus_maya; byteplus_maya.diagnose_assets()
+    """
+    print("=" * 60)
+    print("BYTEPLUS diagnose_assets")
+    ak, _sk, tok = _asset_credentials()
+    print("  host   :", CONFIG.ASSET_API_HOST, " project:", CONFIG.ASSET_PROJECT)
+    print("  keys   :", ("AK " + ak[:6] + "... " + ("+ session token" if tok else "(permanent)"))
+          if ak else "(none -- Settings > Storage & Hosting > Trusted Asset Library)")
+    if not _asset_api_ready():
+        print("=" * 60)
+        return
+    try:
+        q = _asset_quota()
+        print("  quota  : aigc_writable={} liveness_writable={} max_assets={}".format(
+            q.get("aigc_writable"), q.get("liveness_writable"), q.get("max_assets")))
+        mine = [p for p in (q.get("projects") or []) if p.get("project_name") == CONFIG.ASSET_PROJECT]
+        print("  project:", mine[0] if mine else "'{}' not in the quota list".format(CONFIG.ASSET_PROJECT))
+        name = _auto_trust_group_name()
+        gs = [g for g in _asset_list_groups(name=name) if (g.get("Name") or "") == name]
+        print("  group  : '{}' -> {}".format(name, (gs[0].get("Id") if gs else "not created yet (made on first use)")))
+        if not q.get("aigc_writable"):
+            print("  NOTE   : aigc_writable is false -- Advanced Creation Rights / the "
+                  "authorization letter are not active for this account.")
+        print("  RESULT : Asset Library credentials work \U0001F389")
+    except Exception as e:
+        print("  RESULT : FAILED")
+        print("  " + _asset_error_hint(e))
+    print("=" * 60)
+
+
 def _data_uri(path: str, mime: str) -> str:
     """Base64 a local file into a data URI for the `content`/`image` arrays.
     Fine for 720p stills/short playblasts; for production prefer TOS pre-signed
@@ -1282,10 +1379,16 @@ def _data_uri(path: str, mime: str) -> str:
 
 
 def _tos_creds() -> tuple:
-    """(access_key, secret_key) -- Settings values take precedence over env."""
-    ak = (CONFIG.TOS_AK or "").strip() or os.environ.get(CONFIG.TOS_AK_ENV, "").strip()
-    sk = (CONFIG.TOS_SK or "").strip() or os.environ.get(CONFIG.TOS_SK_ENV, "").strip()
-    return ak, sk
+    """(access_key, secret_key, session_token) -- ONE coherent pair: the Settings
+    TOS keys (with their optional STS session token), else the env pair. Never a
+    Settings AK with an env SK: a mixed pair signs as SignatureDoesNotMatch."""
+    ak = (CONFIG.TOS_AK or "").strip()
+    sk = (CONFIG.TOS_SK or "").strip()
+    if ak and sk:
+        return ak, sk, (CONFIG.TOS_SESSION_TOKEN or "").strip()
+    return (os.environ.get(CONFIG.TOS_AK_ENV, "").strip(),
+            os.environ.get(CONFIG.TOS_SK_ENV, "").strip(),
+            os.environ.get(CONFIG.TOS_TOKEN_ENV, "").strip())
 
 
 def _tos_available() -> bool:
@@ -1295,20 +1398,22 @@ def _tos_available() -> bool:
         import tos  # noqa: F401
     except Exception:
         return False
-    ak, sk = _tos_creds()
+    ak, sk, _tok = _tos_creds()
     return bool(ak and sk and CONFIG.TOS_BUCKET)
 
 
 def _tos_upload_presigned(path: str) -> str:
     """Upload `path` to BytePlus TOS and return a pre-signed GET URL.
-    Uses the official `tos` SDK so signing/region handling is correct. Raises
-    if the SDK or config is missing -- the caller falls back to base64."""
+    Uses the official `tos` SDK so signing/region handling is correct (a temporary
+    STS session token, if set, rides as X-Tos-Security-Token). Raises if the SDK
+    or config is missing -- the caller falls back to base64."""
     import tos  # official BytePlus TOS SDK: pip install tos
-    ak, sk = _tos_creds()
+    ak, sk, tok = _tos_creds()
     if not (ak and sk and CONFIG.TOS_BUCKET):
         raise RuntimeError("TOS not fully configured (AK/SK + bucket).")
 
-    client = tos.TosClientV2(ak, sk, CONFIG.TOS_ENDPOINT, CONFIG.TOS_REGION)
+    client = tos.TosClientV2(ak, sk, CONFIG.TOS_ENDPOINT, CONFIG.TOS_REGION,
+                             security_token=(tok or None))
     key = "maya/{}/{}".format(int(time.time()), os.path.basename(path))
     client.put_object_from_file(CONFIG.TOS_BUCKET, key, path)
     signed = client.pre_signed_url(
@@ -1381,6 +1486,9 @@ def _r2_request(method: str, key: str, payload: bytes = b"", retries: int = 3,
         req.add_header("x-amz-content-sha256", payload_hash)
         req.add_header("x-amz-date", amzdate)
         req.add_header("Authorization", authorization)
+        if method.upper() == "PUT":                  # not a signed header -> safe to add;
+            req.add_header("Content-Type",           # else urllib sends x-www-form-urlencoded
+                           mimetypes.guess_type(key)[0] or "application/octet-stream")
         try:
             with _open(req) as resp:
                 resp.read()
@@ -1443,7 +1551,13 @@ def _host_video(path: str):
     configured. cleanup_callable() removes the remote file (no-op for TOS, which
     expires via its pre-sign TTL)."""
     if _tos_available():
-        return _tos_upload_presigned(path), (lambda: None)
+        try:
+            return _tos_upload_presigned(path), (lambda: None)
+        except Exception as e:                      # e.g. an expired STS token: fall back
+            if not _r2_available():
+                raise
+            sys.stderr.write("[BYTEPLUS] TOS upload failed ({}); falling back to R2.\n"
+                             .format(str(e).strip().splitlines()[-1][:160]))
     if _r2_available():
         return _r2_upload_presigned(path)
     raise RuntimeError("no motion-video host configured (TOS or R2)")
@@ -1493,19 +1607,81 @@ def _motion_host_selftest(kind: str):
 # ONCE -> a permanent asset://<id> that Seedance trusts forever (no 24h expiry),
 # with consistent identity across videos. NEEDS Advanced Creation Rights + AK/SK.
 
+class _AssetApiError(RuntimeError):
+    """A Trusted Asset Library (control-plane) failure with the server's error
+    Code kept separately, so callers classify by CODE -- never by substrings like
+    'sign', which SignatureDoesNotMatch tracebacks also contain."""
+
+    def __init__(self, code, message, http_status=0):
+        self.code = code or "?"
+        self.message = message or ""
+        self.http_status = http_status or 0
+        super().__init__("Assets API error {}: {} (HTTP {})".format(
+            self.code, self.message, self.http_status or "-"))
+
+
+_ASSET_CRED_CODES = ("SignatureDoesNotMatch", "InvalidSignature", "InvalidAccessKey",
+                     "InvalidAccessKeyId", "InvalidSecurityToken", "RequestTimeExpired",
+                     "SignatureExpired", "InvalidCredential", "NoCredentials",
+                     "MissingAuthenticationToken", "AuthFailure", "ExpiredToken",
+                     "TokenExpired", "InvalidToken")
+_ASSET_PERM_CODES = ("AccessDenied", "Unauthorized", "Forbidden", "NoPermission",
+                     "PermissionDenied", "UnauthorizedOperation")
+
+
+def _asset_error_hint(err) -> str:
+    """Human advice for an Asset Library failure, chosen by the server's error CODE
+    (from an _AssetApiError, or parsed out of a worker traceback text)."""
+    text = str(err)
+    code = getattr(err, "code", "") or ""
+    msg = getattr(err, "message", "") or ""
+    if not code:
+        m = re.search(r"Assets API error (\S+?): (.*?) \(HTTP", text, re.S)
+        if m:
+            code, msg = m.group(1), m.group(2)
+    low = (msg or text).lower()
+    if code in _ASSET_CRED_CODES or code.startswith("InvalidSignature"):
+        return ("The Asset Library rejected the credentials ({}).\n\nCheck the Asset "
+                "Library Access Key + Secret Key in BYTEPLUS > Settings > Storage & "
+                "Hosting. Temporary STS keys (AKTP...) also need their Session token "
+                "and expire after ~12 h -- mint a fresh set.".format(code))
+    if code in _ASSET_PERM_CODES or "not authorized" in low or "no permission" in low:
+        return ("Your IAM user is not allowed to use the Asset Library ({}).\n\nAsk the "
+                "account admin for the IAM policy  ark:*Asset*  (BytePlus console > IAM "
+                "> Policies).".format(code))
+    if code == "AccountFlowLimitExceeded" or getattr(err, "http_status", 0) == 429:
+        return "The Asset Library is rate-limiting this account -- wait a moment and retry."
+    if any(w in low for w in ("authorization letter", "agreement", "virtual portrait",
+                              "advanced creation")):
+        return ("First-time setup: sign the asset-library authorization letter in the "
+                "BytePlus console (Model Playground > My assets > Virtual Portrait) and "
+                "make sure Advanced Creation Rights are active, then try again."
+                "\n\nServer said: {}: {}".format(code, msg or text[-300:]))
+    tail = (msg or text).strip().splitlines()[-1][:300] if (msg or text).strip() else ""
+    return "Asset Library error {}: {}".format(code or "?", tail)
+
+
 def _asset_credentials():
-    """(ak, sk) for the Assets API: Settings ASSET_AK/SK first, then TOS_AK/SK (same
-    BytePlus account keys), then env. NOT the Bearer API key."""
-    ak = ((CONFIG.ASSET_AK or "").strip() or (CONFIG.TOS_AK or "").strip()
-          or os.environ.get(CONFIG.TOS_AK_ENV, "").strip())
-    sk = ((CONFIG.ASSET_SK or "").strip() or (CONFIG.TOS_SK or "").strip()
-          or os.environ.get(CONFIG.TOS_SK_ENV, "").strip())
-    return ak, sk
+    """(ak, sk, session_token) for the Assets API -- ONE coherent pair, never a mix:
+    the Settings Asset Library keys (with their optional STS session token), else
+    the Settings TOS keys, else the env pair. NOT the Bearer API key."""
+    ak, sk = (CONFIG.ASSET_AK or "").strip(), (CONFIG.ASSET_SK or "").strip()
+    if ak and sk:
+        return ak, sk, (CONFIG.ASSET_SESSION_TOKEN or "").strip()
+    return _tos_creds()
 
 
 def _asset_api_ready() -> bool:
-    ak, sk = _asset_credentials()
+    ak, sk, _tok = _asset_credentials()
     return bool(ak and sk)
+
+
+def _asset_quota():
+    """GetAssetQuota -- a READ with no side effects: the cheapest proof that the
+    AK/SK (+token) and the IAM policy work before any billable write. Returns the
+    'quota' dict (aigc_writable, liveness_writable, max_assets, projects...)."""
+    res = _ark_call("GetAssetQuota", {})
+    return res.get("quota") or res
 
 
 def _ark_norm_query(params: dict) -> str:
@@ -1523,30 +1699,39 @@ def _ark_norm_query(params: dict) -> str:
 def _ark_call(action: str, body: dict, method: str = "POST"):
     """Signed call to the BytePlus 'ark' OpenAPI (Volcengine HMAC-SHA256). Returns
     the parsed `Result` dict (falls back to the top-level object). Raises
-    RuntimeError on any API/HTTP error. NETWORK ONLY -- call from a _Worker."""
-    ak, sk = _asset_credentials()
+    _AssetApiError (a RuntimeError) carrying the server's Code on any API/HTTP
+    error. NETWORK ONLY -- call from a _Worker.
+
+    Signature checked against the official byteplussdkcore SignerV4: signed
+    headers are lower-cased and sorted; a temporary STS session token rides as
+    X-Security-Token AND is part of the signed set (it sorts last)."""
+    ak, sk, token = _asset_credentials()
     if not (ak and sk):
-        raise RuntimeError(
+        raise _AssetApiError(
+            "NoCredentials",
             "The Trusted Asset Library needs an Access Key + Secret Key (AK/SK) from "
-            "your BytePlus console (IAM > Access Keys) -- not the Bearer API key.\n\n"
+            "your BytePlus console (IAM > Access Keys) -- not the Bearer API key. "
             "Add them in BYTEPLUS > Settings > Storage & Hosting.")
     host = (CONFIG.ASSET_API_HOST or "").strip()
-    region, service = CONFIG.ASSET_REGION, CONFIG.ASSET_SERVICE
+    host = re.sub(r"^https?://", "", host).strip("/").split("/")[0]   # bare host, or the
+    region, service = CONFIG.ASSET_REGION, CONFIG.ASSET_SERVICE          # signed host: line lies
     body_str = json.dumps(body or {})
-    x_date = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    x_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     short_date = x_date[:8]
     body_hash = hashlib.sha256(body_str.encode("utf-8")).hexdigest()
     query = {"Action": action, "Version": CONFIG.ASSET_API_VERSION}
-    signed_headers = "content-type;host;x-content-sha256;x-date"
-    canonical_request = "\n".join([
-        method.upper(), "/", _ark_norm_query(query),
+    canon_headers = [                                  # MUST stay sorted by name
         "content-type:application/json",
         "host:" + host,
         "x-content-sha256:" + body_hash,
         "x-date:" + x_date,
-        "",
-        signed_headers, body_hash,
-    ])
+    ]
+    if token:
+        canon_headers.append("x-security-token:" + token)
+    signed_headers = ";".join(h.split(":", 1)[0] for h in canon_headers)
+    canonical_request = "\n".join(
+        [method.upper(), "/", _ark_norm_query(query)] + canon_headers
+        + ["", signed_headers, body_hash])
     scope = "/".join([short_date, region, service, "request"])
     string_to_sign = "\n".join([
         "HMAC-SHA256", x_date, scope,
@@ -1566,24 +1751,33 @@ def _ark_call(action: str, body: dict, method: str = "POST"):
         "Authorization": "HMAC-SHA256 Credential={}/{}, SignedHeaders={}, "
                          "Signature={}".format(ak, scope, signed_headers, signature),
     }
+    if token:
+        headers["X-Security-Token"] = token
     url = "https://{}/?{}".format(host, _ark_norm_query(query))
     req = urllib.request.Request(url, data=body_str.encode("utf-8"),
                                  headers=headers, method=method.upper())
+    status = 0
     try:
-        with _open(req) as resp:
+        with _open(req, timeout=CONFIG.ASSET_HTTP_TIMEOUT) as resp:
+            status = getattr(resp, "status", 200)
             raw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         try:
-            detail = e.read().decode("utf-8")
+            raw = e.read().decode("utf-8", "replace")
         except Exception:
-            detail = str(e)
-        raise RuntimeError("Assets API HTTP {}: {}".format(e.code, detail))
+            raw = ""
+        code, msg = "HTTP{}".format(e.code), (raw[:500] or str(e))
+        try:                                           # the body carries the real Code
+            err = (json.loads(raw).get("ResponseMetadata") or {}).get("Error") or {}
+            code, msg = err.get("Code") or code, err.get("Message") or msg
+        except Exception:
+            pass
+        raise _AssetApiError(code, msg, e.code)
     data = json.loads(raw) if raw else {}
     meta = data.get("ResponseMetadata") or {}
     err = meta.get("Error")
     if err:
-        raise RuntimeError("Assets API error {}: {}".format(
-            err.get("Code", "?"), err.get("Message", "")))
+        raise _AssetApiError(err.get("Code", "?"), err.get("Message", ""), status)
     result = data.get("Result")
     return result if result is not None else data
 
@@ -1599,10 +1793,23 @@ def _asset_create_group(name, description="", group_type="AIGC"):
     return res.get("Id") or res.get("GroupId") or ""
 
 
-def _asset_list_groups():
-    res = _ark_call("ListAssetGroups", {
-        "Filter": {"GroupType": "AIGC"}, "PageNumber": 1, "PageSize": 100})
-    return res.get("Items") or []
+def _asset_list_groups(name=None, page_size=100, max_pages=50):
+    """ALL AIGC groups in the project: ListAssetGroups caps one page at 100 and
+    this shared account has far more, so walk PageNumber until a short page.
+    `name` = the API's (fuzzy) Filter.Name. Raises on failure -- callers must
+    never read 'could not list' as 'no groups'."""
+    out = []
+    for page in range(1, max_pages + 1):
+        filt = {"GroupType": "AIGC"}
+        if name:
+            filt["Name"] = name
+        res = _ark_call("ListAssetGroups", {
+            "Filter": filt, "PageNumber": page, "PageSize": page_size})
+        items = res.get("Items") or []
+        out.extend(items)
+        if len(items) < page_size:
+            break
+    return out
 
 
 def _asset_create_asset(group_id, url, asset_type="Image", name=""):
@@ -1649,54 +1856,100 @@ def _asset_public_url(src):
     return _host_video(src)                              # hosts any file bytes
 
 
-def _asset_add_and_wait(group_id, src, name="", poll_timeout=180, poll_interval=3,
+def _asset_add_and_wait(group_id, src, name="", poll_timeout=900, poll_interval=2,
                         asset_type="Image"):
-    """NETWORK ONLY. Host `src`, CreateAsset, then poll GetAsset until Active/Failed/
-    timeout. Keeps the hosted URL alive until processing finishes (the server fetches
-    it), then cleans up. `asset_type` = Image / Audio / Video. Returns
-    {id, status, uri, url, error}."""
+    """NETWORK ONLY. Host `src`, CreateAsset, then poll GetAsset until Active/Failed,
+    backing off 2 s -> 30 s (no SLA is published, so the ceiling is generous and
+    the HUD's cancel stops it). The hosted URL is removed ONLY after a terminal
+    status: the server fetches it asynchronously and 'may queue', so deleting it on
+    a timeout would fail the asset. On timeout the asset comes back still
+    'Processing' WITH its id -- never as Failed. `asset_type` = Image / Audio /
+    Video. Returns {id, status, uri, url, error}."""
     url, cleanup = _asset_public_url(src)
-    try:
-        asset_id = _asset_create_asset(group_id, url, asset_type, name)
-        if not asset_id:
-            raise RuntimeError("CreateAsset returned no asset id")
-        status, final_url, err = "Processing", "", ""
-        deadline = time.time() + poll_timeout
-        while time.time() < deadline:
-            res = _asset_get(asset_id)
-            status = (res.get("Status") or "").strip() or "Processing"
-            final_url = res.get("URL") or final_url
-            err = res.get("Error") or ""
-            if status in ("Active", "Failed"):
-                break
-            time.sleep(poll_interval)
-        return {"id": asset_id, "status": status, "uri": "asset://" + asset_id,
-                "url": final_url, "error": err}
-    finally:
+    asset_id = _asset_create_asset(group_id, url, asset_type, name)
+    if not asset_id:
         try:
             cleanup()
         except Exception:
             pass
+        raise RuntimeError("CreateAsset returned no asset id")
+    status, final_url, err = "Processing", "", ""
+    deadline = time.time() + poll_timeout
+    wait, blips = poll_interval, 0
+    while time.time() < deadline:
+        if _cancel_requested():                      # leave the hosted file: server may still fetch
+            break
+        try:
+            res = _asset_get(asset_id)
+            blips = 0
+        except _AssetApiError as e:
+            if e.http_status == 429 or e.code == "AccountFlowLimitExceeded":
+                time.sleep(wait); wait = min(wait * 2, 30)
+                continue
+            raise
+        except (_NetworkError, ConnectionError, TimeoutError):
+            blips += 1
+            if blips > 3:
+                raise
+            time.sleep(wait); wait = min(wait * 2, 30)
+            continue
+        status = (res.get("Status") or "").strip() or "Processing"
+        final_url = res.get("URL") or final_url
+        err = res.get("Error") or res.get("ErrorMessage") or res.get("Message") or ""
+        if status in ("Active", "Failed"):
+            try:
+                cleanup()                            # terminal: the server is done with the URL
+            except Exception:
+                pass
+            break
+        time.sleep(wait)
+        wait = min(wait * 2, 30)
+    if status not in ("Active", "Failed"):
+        sys.stderr.write("[BYTEPLUS] asset {} still Processing after polling -- keeping "
+                         "the hosted source until it settles (press ↻ Status later).\n"
+                         .format(asset_id))
+    return {"id": asset_id, "status": status, "uri": "asset://" + asset_id,
+            "url": final_url, "error": err}
 
 
 # --- Local cache (group/asset names + a local thumbnail; the API URL expires 12h) --
 
+_STORE_LOCK = threading.RLock()
+
+
 def _asset_store_load():
-    try:
-        with open(CONFIG.ASSET_STORE_PATH) as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        data = {}
-    data.setdefault("groups", {})
-    return data
+    with _STORE_LOCK:
+        try:
+            with open(CONFIG.ASSET_STORE_PATH) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict) or not isinstance(data.get("groups"), dict):
+            data = {"groups": {}}                     # a list / null / truncated file
+        return data
 
 
 def _asset_store_save(data):
-    try:
-        with open(CONFIG.ASSET_STORE_PATH, "w") as f:
-            json.dump(data, f, indent=2)
-    except OSError:
-        pass
+    """Atomic (temp + os.replace) and serialized: the worker thread and the UI both
+    read-modify-write this file, and a crash mid-write must not blank it."""
+    with _STORE_LOCK:
+        try:
+            tmp = CONFIG.ASSET_STORE_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, CONFIG.ASSET_STORE_PATH)
+        except OSError:
+            pass
+
+
+def _asset_store_thumb(uri_or_id) -> str:
+    """Local thumbnail recorded for a trusted asset ('asset://<id>' or id), or ''."""
+    aid = str(uri_or_id or "").replace("asset://", "", 1)
+    for g in _asset_store_load()["groups"].values():
+        a = (g.get("assets") or {}).get(aid)
+        if a and a.get("thumb") and os.path.isfile(a["thumb"]):
+            return a["thumb"]
+    return ""
 
 
 def _asset_store_group(group_id, name):
@@ -1758,33 +2011,38 @@ def _character_voice_dir() -> str:
 
 # --- Auto-permanence (make faces/last-frames permanent asset:// on demand) --------
 
+def _auto_trust_group_name() -> str:
+    """Per-install name: on a SHARED account several installs use the same AK/SK,
+    so a generic 'BYTEPLUS Auto' would be adopted (and deletable) by everyone."""
+    return "BYTEPLUS Auto {}".format(_install_id()[:8])
+
+
 def _auto_trust_group():
-    """Get-or-create the plugin's default asset group for auto-registered assets;
-    persists its id. NETWORK ONLY. Raises a clear message if the one-time
-    authorization letter hasn't been signed."""
+    """Get-or-create THIS install's asset group for auto-registered assets and
+    persist its id. NETWORK ONLY. Validates a persisted id (a deleted group must
+    not be reused), matches by EXACT name, and re-raises credential / permission
+    errors instead of hiding them behind 'create a new group'."""
     gid = (CONFIG.AUTO_TRUST_GROUP_ID or "").strip()
+    name = _auto_trust_group_name()
     if gid:
-        return gid
-    try:                                              # reuse an existing BYTEPLUS group
-        for g in _asset_list_groups():
-            if (g.get("Name") or g.get("Title") or "").startswith("BYTEPLUS"):
-                gid = g.get("Id") or g.get("GroupId") or ""
-                if gid:
-                    break
-    except Exception:
-        gid = ""
-    if not gid:
         try:
-            gid = _asset_create_group("BYTEPLUS Auto",
-                                      "Auto-registered trusted assets (BYTEPLUS for Maya)")
-        except RuntimeError as e:
-            if any(s in str(e).lower() for s in
-                   ("authoriz", "agreement", "sign", "letter", "portrait")):
-                raise RuntimeError(
-                    "First-time setup: sign the asset-library authorization letter in "
-                    "the BytePlus console (Model Playground > My assets > Virtual "
-                    "Portrait), then try again.")
-            raise
+            res = _ark_call("ListAssetGroups", {
+                "Filter": {"GroupType": "AIGC", "GroupIds": [gid]},
+                "PageNumber": 1, "PageSize": 10})
+            if any((g.get("Id") or g.get("GroupId")) == gid
+                   for g in (res.get("Items") or [])):
+                return gid
+        except _AssetApiError as e:
+            if e.code in _ASSET_CRED_CODES or e.code in _ASSET_PERM_CODES:
+                raise
+        gid = ""                                       # persisted id no longer exists
+    for g in _asset_list_groups(name=name):            # fuzzy on the API side...
+        if (g.get("Name") or "") == name:              # ...exact on ours
+            gid = g.get("Id") or g.get("GroupId") or ""
+            if gid:
+                break
+    if not gid:
+        gid = _asset_create_group(name, "Auto-registered trusted assets (BYTEPLUS for Maya)")
     if gid:
         CONFIG.AUTO_TRUST_GROUP_ID = gid
         _save_prefs()
@@ -1793,16 +2051,20 @@ def _auto_trust_group():
 
 def _auto_register_asset(src, name="", asset_type="Image"):
     """Register `src` (local path or http url) as a PERMANENT trusted asset; return
-    'asset://<id>' or None on failure. An already-asset:// src is returned as-is.
-    NETWORK ONLY -- call from a _Worker."""
+    'asset://<id>' or None if it is not (yet) Active. An already-asset:// src is
+    returned as-is. A still-Processing asset is remembered in the local store so
+    ↻ Status / the pickers can resolve it later. NETWORK ONLY -- call from a _Worker."""
     if isinstance(src, str) and src.startswith("asset://"):
         return src
     gid = _auto_trust_group()
     if not gid:
         return None
     res = _asset_add_and_wait(gid, src, name=name or "auto", asset_type=asset_type)
+    if res.get("id"):
+        _asset_store_group(gid, _auto_trust_group_name())
+        _asset_store_asset(gid, res["id"], name=name or "auto",
+                           status=res.get("status") or "Processing")
     if res.get("status") == "Active" and res.get("id"):
-        _asset_store_asset(gid, res["id"], name=name or "auto", status="Active")
         return res["uri"]
     return None
 
@@ -5032,6 +5294,8 @@ class VideoGallery(QtWidgets.QDialog):
                         pass
 
             uw.done.connect(_upg)
+            uw.failed.connect(lambda tb: sys.stderr.write(
+                "[BYTEPLUS] auto-permanence failed: " + _asset_error_hint(tb) + "\n"))
             uw.start()
             self._uw = uw
 
@@ -6038,6 +6302,14 @@ def _compose_ref_prompt(text, img_refs, vid_refs, has_playblast, main_image=None
     srcs = ([main_image] if main_image else []) + [r.get("path") for r in img_refs]
     for p in [s for s in srcs if s][:9]:
         try:
+            if isinstance(p, str) and p.startswith("asset://"):   # trusted character
+                thumb = _asset_store_thumb(p)
+                if not thumb:                # keep the LLM's numbering honest
+                    user[0]["text"] += ("\n(Image 1, the main subject, is a trusted "
+                                        "character not attached here; attached images "
+                                        "start at Image 2.)")
+                    continue
+                p = thumb
             uri = p if (isinstance(p, str) and p.startswith("http")) \
                 else _data_uri(p, _image_mime(p))
             user.append({"type": "image_url", "image_url": {"url": uri}})
@@ -6177,13 +6449,18 @@ def _pick_trusted_asset(parent):
         icon = QtGui.QIcon(_to_pixmap(thumb)) if thumb else QtGui.QIcon()
         it = QtWidgets.QListWidgetItem(icon, "{} {} · {}".format(
             badge.get(status, "•"), gname, aname or aid[-6:]))
-        it.setData(QtCore.Qt.UserRole, (aid, thumb))
+        it.setData(QtCore.Qt.UserRole, (aid, thumb, status))
         lw.addItem(it)
     lay.addWidget(lw, 1)
     chosen = {}
 
     def _accept(it):
-        aid, thumb = it.data(QtCore.Qt.UserRole)
+        aid, thumb, status = it.data(QtCore.Qt.UserRole)
+        if status != "Active":                       # only Active assets are usable
+            _error("That image is not usable yet ({}). Only ✅ Active assets can be "
+                   "Image 1 -- press ↻ Status in BYTEPLUS > Trusted Characters, or "
+                   "pick another.".format(status or "unknown"))
+            return
         chosen["uri"] = "asset://" + aid
         chosen["thumb"] = thumb
         dlg.accept()
@@ -6417,13 +6694,24 @@ class AnimateDialog(QtWidgets.QDialog):
         self._update_cost()
 
     def _uri(self):
+        """Main image as something the LLM can look at. A trusted asset:// is NOT a
+        file: use its local thumbnail from the asset store, or None -> callers skip
+        vision instead of open()ing 'asset://...' as a path."""
         s = self._image_src
+        if isinstance(s, str) and s.startswith("asset://"):
+            thumb = _asset_store_thumb(s)
+            return _data_uri(thumb, _image_mime(thumb)) if thumb else None
         return s if s.startswith("http") else _data_uri(s, _image_mime(s))
 
     def _auto(self):
         self.b_auto.setEnabled(False)
         self.b_auto.setText("Analyzing…")
         uri = self._uri()
+        if not uri:                                  # trusted character without a preview
+            self.b_auto.setEnabled(True); self.b_auto.setText("✨ Analyze")
+            cmds.inViewMessage(amg="Trusted character has no local preview to analyze "
+                               "— describe the motion yourself.", pos="midCenter", fade=True)
+            return
         self._worker = _Worker(lambda: _caption_motion(uri), parent=self)
 
         def done(text):
@@ -8616,12 +8904,7 @@ class DreamGallery(QtWidgets.QDialog):
                        "Failed). Real human faces are never allowed.")
 
         def fail(tb):
-            if any(s in tb.lower() for s in ("authoriz", "letter", "sign", "portrait")):
-                _error("First time: sign the asset-library authorization letter in the "
-                       "BytePlus console (Model Playground > My assets > Virtual "
-                       "Portrait), then try again.")
-            else:
-                _error("Make-permanent failed:\n\n" + tb)
+            _error("Make-permanent failed.\n\n" + _asset_error_hint(tb))
 
         w.done.connect(done); w.failed.connect(fail); w.start()
         self._perm_worker = w
@@ -8959,7 +9242,7 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
 
     def _fail(self, tb):
         sys.stderr.write("[BYTEPLUS] asset op failed:\n" + tb + "\n")
-        self._set_status("❌ " + tb.strip().splitlines()[-1][:200])
+        self._set_status("❌ " + _asset_error_hint(tb)[:220])
 
     def _ask_text(self, title, label, default=""):
         dlg = QtWidgets.QInputDialog(self)
@@ -9011,13 +9294,7 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
                              "Create returned no id — check the console.")
 
         def _fail(tb):
-            # First-ever group needs the authorization letter signed in the console.
-            hint = ""
-            if "authoriz" in tb.lower() or "agreement" in tb.lower() or "sign" in tb.lower():
-                hint = ("\n\nFIRST TIME: you must sign the asset-library authorization "
-                        "letter in the BytePlus console (Model Playground > My assets > "
-                        "Virtual Portrait), then try again.")
-            _error("Could not create the character group:\n\n" + tb + hint)
+            _error("Could not create the character group.\n\n" + _asset_error_hint(tb))
             self._set_status("❌ create failed (see dialog).")
 
         self._run(_make, _done, _fail)
@@ -9033,9 +9310,14 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
                    ) != QtWidgets.QMessageBox.Ok:
             return
         self._set_status("Deleting…")
-        self._run(lambda: (_asset_delete_group(gid), gid)[1],
-                  lambda _r: (_asset_store_forget(gid), self._refresh_groups(),
-                              self.assets.clear(), self._set_status("Deleted.")))
+        def _done(_r):
+            _asset_store_forget(gid)
+            if gid == (CONFIG.AUTO_TRUST_GROUP_ID or "").strip():
+                CONFIG.AUTO_TRUST_GROUP_ID = ""       # never reuse a deleted group
+                _save_prefs()
+            self._refresh_groups(); self.assets.clear(); self._set_status("Deleted.")
+
+        self._run(lambda: (_asset_delete_group(gid), gid)[1], _done)
 
     def _on_group(self):
         it = self.groups.currentItem()
@@ -11853,6 +12135,10 @@ class SettingsDialog(QtWidgets.QDialog):
         skrow.addWidget(self.tos_sk, 1); skrow.addWidget(tos_reveal)
         skw = QtWidgets.QWidget(); skw.setLayout(skrow)
         form.addRow("TOS Secret Key", skw)
+        self.tos_token = QtWidgets.QLineEdit(CONFIG.TOS_SESSION_TOKEN)
+        self.tos_token.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.tos_token.setPlaceholderText("Session token -- ONLY for temporary STS keys (AKTP...)")
+        form.addRow("TOS Session token", self.tos_token)
         self.bucket = QtWidgets.QLineEdit(CONFIG.TOS_BUCKET)
         self.bucket.setPlaceholderText("your bucket name")
         form.addRow("TOS bucket", self.bucket)
@@ -11921,13 +12207,20 @@ class SettingsDialog(QtWidgets.QDialog):
         asrow.addWidget(self.asset_sk, 1); asrow.addWidget(asset_reveal)
         asw = QtWidgets.QWidget(); asw.setLayout(asrow)
         form.addRow("Asset Library Secret Key", asw)
+        self.asset_token = QtWidgets.QLineEdit(CONFIG.ASSET_SESSION_TOKEN)
+        self.asset_token.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.asset_token.setPlaceholderText(
+            "Session token -- ONLY for temporary STS keys (AKTP...); blank for permanent keys")
+        form.addRow("Asset Library Session token", self.asset_token)
         self.asset_host = QtWidgets.QLineEdit(CONFIG.ASSET_API_HOST)
         self.asset_host.setPlaceholderText("ark.ap-southeast-1.byteplusapi.com")
         form.addRow("Asset API host", self.asset_host)
         ashint = QtWidgets.QLabel(
             "For BYTEPLUS > Trusted Characters. AK/SK come from your BytePlus console "
-            "(IAM > Access Keys) and need Advanced Creation Rights activated. Leave "
-            "AK/SK blank to reuse the TOS keys above (same account).")
+            "(IAM > Access Keys; the IAM user needs the policy ark:*Asset*) and need "
+            "Advanced Creation Rights activated. Temporary STS keys (AKTP...) also need "
+            "their Session token and expire after ~12 h. Leave AK/SK blank to reuse the "
+            "TOS keys above (same account).")
         ashint.setWordWrap(True); ashint.setStyleSheet("color:#888;")
         form.addRow("", ashint)
         self.auto_trust = QtWidgets.QCheckBox(
@@ -12022,6 +12315,7 @@ class SettingsDialog(QtWidgets.QDialog):
         CONFIG.USE_TOS = self.use_tos.isChecked()
         CONFIG.TOS_AK = self.tos_ak.text().strip()
         CONFIG.TOS_SK = self.tos_sk.text().strip()
+        CONFIG.TOS_SESSION_TOKEN = self.tos_token.text().strip()
         CONFIG.TOS_BUCKET = self.bucket.text().strip()
         CONFIG.TOS_ENDPOINT = self.endpoint.text().strip()
         CONFIG.TOS_REGION = self.region.text().strip()
@@ -12034,6 +12328,7 @@ class SettingsDialog(QtWidgets.QDialog):
             CONFIG.MOTION_HOST = "r2"
         CONFIG.ASSET_AK = self.asset_ak.text().strip()
         CONFIG.ASSET_SK = self.asset_sk.text().strip()
+        CONFIG.ASSET_SESSION_TOKEN = self.asset_token.text().strip()
         CONFIG.ASSET_API_HOST = self.asset_host.text().strip() or CONFIG.ASSET_API_HOST
         CONFIG.AUTO_TRUST_ASSETS = self.auto_trust.isChecked()
         CONFIG.AUDIO_API_KEY = self.audio_key.text().strip()
@@ -12183,7 +12478,8 @@ class MotionHostWizard(QtWidgets.QDialog):
         steps = QtWidgets.QLabel(
             "<b>BytePlus TOS</b> (same account as your API key):<br>"
             "1. console.byteplus.com &rarr; TOS &rarr; create a bucket.<br>"
-            "2. Create an Access Key / Secret Key (IAM).<br>"
+            "2. Create an Access Key / Secret Key (IAM). Temporary STS keys "
+            "(AKTP...) also need their session token and expire in ~12 h.<br>"
             "<b>Requires the 'tos' package</b> in Maya's Python. In a terminal:<br>"
             "<tt>\"&lt;Maya&gt;\\bin\\mayapy.exe\" -m pip install tos</tt><br>"
             "If unsure, use R2 instead - it needs nothing.")
@@ -12196,6 +12492,10 @@ class MotionHostWizard(QtWidgets.QDialog):
         self.tos_sk = QtWidgets.QLineEdit(CONFIG.TOS_SK)
         self.tos_sk.setEchoMode(QtWidgets.QLineEdit.Password)
         f.addRow("Secret Key", self.tos_sk)
+        self.tos_token = QtWidgets.QLineEdit(CONFIG.TOS_SESSION_TOKEN)
+        self.tos_token.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.tos_token.setPlaceholderText("only for temporary STS keys (AKTP...) -- blank otherwise")
+        f.addRow("Session token", self.tos_token)
         self.tos_bucket = QtWidgets.QLineEdit(CONFIG.TOS_BUCKET)
         self.tos_bucket.setPlaceholderText("your bucket name")
         f.addRow("Bucket", self.tos_bucket)
@@ -12215,6 +12515,7 @@ class MotionHostWizard(QtWidgets.QDialog):
         else:
             CONFIG.TOS_AK = self.tos_ak.text().strip()
             CONFIG.TOS_SK = self.tos_sk.text().strip()
+            CONFIG.TOS_SESSION_TOKEN = self.tos_token.text().strip()
             CONFIG.TOS_BUCKET = self.tos_bucket.text().strip()
             CONFIG.TOS_ENDPOINT = self.tos_endpoint.text().strip() or CONFIG.TOS_ENDPOINT
             CONFIG.TOS_REGION = self.tos_region.text().strip() or CONFIG.TOS_REGION
@@ -12902,8 +13203,8 @@ def open_seed_chat():
 # imports the downloaded mesh into the current Maya scene on the MAIN thread. v1 is
 # Text->3D (CONFIG.THREE_D_MODEL). Image->3D + asset breakdown is a later phase.
 #
-# The 3D model ID must be set from your ModelArk console in Settings > 3D model --
-# the documented IDs 404'd on this account until the model is activated there.
+# Model id: CONFIG.THREE_D_MODEL ("hyper3d-gen2-260112" -- the documented
+# "Hyper3d-Rodin-Gen2" 404s; stale prefs are migrated by _DEAD_MODEL_IDS).
 # =============================================================================
 
 # fmt key -> (maya plugin to load, cmds.file import "type"). Missing = not natively
@@ -14258,6 +14559,9 @@ def install():
         cmds.menuItem(label="Test R2 hosting", parent=diag,
                       annotation="Upload/presign/fetch/delete a test file on R2",
                       command=_safe(diagnose_r2))
+        cmds.menuItem(label="Test Trusted Asset Library", parent=diag,
+                      annotation="Signed GetAssetQuota read -- proves AK/SK (+token) and the IAM policy, no side effects",
+                      command=_safe(diagnose_assets))
         cmds.menuItem(label="Test telemetry", parent=diag,
                       annotation="Send one test event to PostHog / R2",
                       command=_safe(diagnose_telemetry))
