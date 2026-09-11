@@ -4247,6 +4247,15 @@ class _ProgressHandle:
 
     def setLabelText(self, text):
         self._title = text
+        # Safe from ANY thread: workers report progress with this, but widgets may
+        # only be touched on the main thread -> re-dispatch via Maya's idle queue.
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app is not None and QtCore.QThread.currentThread() is not app.thread():
+                maya.utils.executeDeferred(self.setLabelText, text)
+                return
+        except Exception:
+            pass
         if self._lbl is not None:
             try:
                 self._lbl.setText(text)
@@ -6039,8 +6048,12 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                 audio_urls.append(_au)
                 cleanups.append(_cu)
             except Exception as e:
-                sys.stderr.write("[BYTEPLUS] voice ref not hosted, skipping -> "
-                                 "{}\n".format(e))
+                # Skipping would silently shift every later "Audio N" in the prompt
+                # onto the wrong speaker -- fail loudly instead.
+                raise RuntimeError(
+                    "Could not host the reference audio '{}' ({}). Set up Cloudflare "
+                    "R2 / TOS in BYTEPLUS > Set up motion hosting…, or check the "
+                    "hosting credentials, then try again.".format(os.path.basename(a), e))
 
     def _content(ff_role):
         c = [{"type": "text", "text": prompt}]
@@ -6228,6 +6241,10 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
             if audio and any(s in str(e) for s in
                              ("OutputAudioSensitiveContentDetected",
                               "AudioSensitiveContent")):
+                if audio_sources:
+                    # The user asked for THIS dialogue; a silent clip would quietly
+                    # drop it. Report the output filter honestly instead.
+                    raise RuntimeError(_explain_output_policy(str(e)))
                 sys.stderr.write("[BYTEPLUS] audio output moderated; producing a "
                                  "silent clip.\n")
                 return _run(False)
@@ -7231,6 +7248,10 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
             QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel)
         if proceed != QtWidgets.QMessageBox.Ok:
             return
+        if audio_sources:                             # local clips can't be hosted either
+            sys.stderr.write("[BYTEPLUS] no motion host: dialogue audio dropped.\n")
+            audio_sources, dlg_audio, audio_map = [], [], ""
+            audio = d.wants_audio()
 
     # Cost guard (only prompts if the estimate exceeds the threshold).
     has_video = bool(host) and (use_anim or bool(extra_movies))
@@ -10603,7 +10624,7 @@ class DialogueSceneDialog(QtWidgets.QDialog):
         self.script = QtWidgets.QPlainTextEdit()
         self.script.setPlaceholderText(
             "@Ana: ¡Hola Danny! ¿Cómo estás?\n@Danny: Muy bien, ¿y tú?")
-        self.script.textChanged.connect(self._refresh_cast)
+        self.script.textChanged.connect(self._refresh_cost)
         v.addWidget(self.script, 1)
 
         orow = QtWidgets.QHBoxLayout()
@@ -10639,9 +10660,13 @@ class DialogueSceneDialog(QtWidgets.QDialog):
             self.cast_list.addItem("{} · {}{}".format(
                 i, c["name"], "  🎙️" if c.get("voice") else "  (no voice — Trusted "
                 "Characters > Generate voice…)"))
+        self._refresh_cost()
+
+    def _refresh_cost(self):
         lines = self._parse_lines()
         words = sum(len(l["text"].split()) for l in lines)
-        secs = words / 2.5                                  # ~150 words per minute
+        chars = sum(len(l["text"]) for l in lines)
+        secs = max(words / 2.5, chars / 15.0)              # ~150 wpm; chars for CJK/no spaces
         tok_hint = ""
         if lines:
             fits = ("fits Seedance 2.0 (≤15 s) and 2.5 (≤30 s)" if secs <= 15 else
@@ -10720,6 +10745,16 @@ class DialogueSceneDialog(QtWidgets.QDialog):
                           "thumb": c.get("thumb", ""), "voice": c.get("voice", "")}
                          for c in self._cast]
         speakers = [_asset_group_voice(c.get("gid", "")) or {} for c in self._cast]
+        # A voice is a preset id OR a clone sample on disk -- never fall back to the
+        # default TTS voice silently.
+        broken = sorted({c["name"] for l in lines
+                         for c in [cast_snapshot[l["cast_index"] - 1]]
+                         if not ((speakers[l["cast_index"] - 1].get("speaker") or "").strip()
+                                 or os.path.isfile(c["voice"] or ""))})
+        if broken:
+            _error("The voice clip for {} is missing on disk. Regenerate it in BYTEPLUS > "
+                   "Trusted Characters > Generate voice…".format(", ".join(broken)))
+            return
 
         h = _progress("🎙️ Dialogue · {} line(s)".format(len(lines)))
         h.setLabelText("Seed Audio: line 1 of {}…".format(len(lines)))
@@ -10728,8 +10763,24 @@ class DialogueSceneDialog(QtWidgets.QDialog):
         self.status.setText("⏳ Generating {} line(s) in the background — see the activity "
                             "HUD; the Audio Gallery opens when done.".format(len(lines)))
 
+        produced = []                                   # shared with the main thread: paid
+        record_base = {"kind": "dialogue", "scene": scene_txt, "gap": gap,      # clips survive
+                       "cast": [{k: c[k] for k in ("name", "gid", "uri", "thumb")}   # a cancel
+                                for c in cast_snapshot], "created": int(time.time())}
+
+        def _sidecar(path, lines_so_far, this=None, **extra):
+            try:
+                rec = dict(record_base, lines=lines_so_far, **extra)
+                if this:
+                    rec["this_line"] = this
+                with open(_dialogue_sidecar_path(path), "w", encoding="utf-8") as f:
+                    json.dump(rec, f, indent=1)
+            except OSError as e:
+                sys.stderr.write("[BYTEPLUS] dialogue sidecar not written: {}\n".format(e))
+
         def _work():
-            clips = []
+            clips = produced
+            error = ""
             for n, l in enumerate(lines, 1):
                 if _cancel_requested():
                     return {"cancelled": True, "clips": clips}
@@ -10737,13 +10788,20 @@ class DialogueSceneDialog(QtWidgets.QDialog):
                 c = cast_snapshot[l["cast_index"] - 1]
                 vrec = speakers[l["cast_index"] - 1]
                 speaker = (vrec.get("speaker") or "").strip() or None
-                ref_audio = None if speaker else (c["voice"] if os.path.isfile(c["voice"]) else None)
+                ref_audio = None if speaker else c["voice"]
                 stem = "{}_dlg{:02d}_{}".format(tag, n, _safe_name(c["name"])[:16])
-                path, info = _seed_audio(l["text"], speaker=speaker, ref_audio=ref_audio,
-                                         fmt="wav", out_dir=out_dir, stem=stem)
+                try:
+                    path, info = _seed_audio(l["text"], speaker=speaker, ref_audio=ref_audio,
+                                             fmt="wav", out_dir=out_dir, stem=stem)
+                except Exception as e:                  # keep what is already paid for
+                    error = "line {} ({}): {}".format(n, c["name"], str(e).strip().splitlines()[-1][:200])
+                    break
                 secs = float(info.get("original_duration") or info.get("duration") or 0)
                 clips.append({"n": n, "who": c["name"], "cast_index": l["cast_index"],
                               "text": l["text"], "file": path, "seconds": secs})
+                _sidecar(path, list(clips), this=n)      # filed immediately, cancel-proof
+            if error:
+                return {"cancelled": False, "clips": clips, "error": error}
             mix, mix_secs, mix_err = None, 0.0, ""
             if want_mix and clips:
                 try:
@@ -10751,17 +10809,10 @@ class DialogueSceneDialog(QtWidgets.QDialog):
                     mix_secs = _wav_concat([c["file"] for c in clips], mix, gap)
                 except Exception as e:                         # formats differ etc.
                     mix, mix_err = None, str(e)
-            record = {"kind": "dialogue", "scene": scene_txt, "gap": gap,
-                      "cast": [{k: c[k] for k in ("name", "gid", "uri", "thumb")}
-                               for c in cast_snapshot],
-                      "lines": clips, "mix": mix, "mix_seconds": mix_secs,
-                      "created": int(time.time())}
-            for c in clips:                                     # every clip knows the scene
-                with open(_dialogue_sidecar_path(c["file"]), "w", encoding="utf-8") as f:
-                    json.dump(dict(record, this_line=c["n"]), f, indent=1)
+            for c in clips:                                     # final, complete records
+                _sidecar(c["file"], list(clips), this=c["n"], mix=mix, mix_seconds=mix_secs)
             if mix:
-                with open(_dialogue_sidecar_path(mix), "w", encoding="utf-8") as f:
-                    json.dump(record, f, indent=1)
+                _sidecar(mix, list(clips), mix=mix, mix_seconds=mix_secs)
             return {"cancelled": False, "clips": clips, "mix": mix, "mix_seconds": mix_secs,
                     "mix_err": mix_err}
 
@@ -10771,19 +10822,32 @@ class DialogueSceneDialog(QtWidgets.QDialog):
             h.close()
             self.b_gen.setEnabled(True); self.b_gen.setText("🎙️ Generate dialogue audio")
 
-        def done(res):
-            _restore()
-            clips = res.get("clips") or []
+        def _file(clips, mix=None, mix_secs=0.0):
             g = _audio_gallery()
-            if res.get("mix"):
-                g.add_audio(res["mix"], {"duration": res.get("mix_seconds"),
-                                         "source": "dialogue mix"})
+            if mix:
+                g.add_audio(mix, {"duration": mix_secs, "source": "dialogue mix"})
             for c in clips:
                 g.add_audio(c["file"], {"duration": c["seconds"], "source": "dialogue line",
                                         "who": c["who"]})
-            if res.get("cancelled"):
+            return g
+
+        def _finished():
+            # QThread.finished fires on EVERY exit -- including a HUD ✕ cancel, where the
+            # worker emits neither done nor failed. Restore the UI and keep paid clips.
+            _restore()
+            if h.cancel.is_set():
+                _file(list(produced))
                 self.status.setText("Cancelled after {} line(s) — those are in the Audio "
-                                    "Gallery.".format(len(clips)))
+                                    "Gallery.".format(len(produced)))
+
+        def done(res):
+            _restore()
+            clips = res.get("clips") or []
+            g = _file(clips, res.get("mix"), res.get("mix_seconds") or 0.0)
+            if res.get("error"):
+                self.status.setText("❌ stopped at {} — {} line(s) already made are in the "
+                                    "Audio Gallery.".format(res["error"], len(clips)))
+                _error("Dialogue audio stopped at " + res["error"])
                 return
             total = sum(c["seconds"] for c in clips)
             fits = ("OK for Seedance 2.0 and 2.5" if total <= 15 else
@@ -10802,6 +10866,7 @@ class DialogueSceneDialog(QtWidgets.QDialog):
 
         self._worker.done.connect(done)
         self._worker.failed.connect(failed)
+        self._worker.finished.connect(_finished)
         self._worker.start()
 
 
@@ -11249,7 +11314,12 @@ class VideoGenDialog(QtWidgets.QDialog):
             video_srcs = [r["path"] for r in self._vid_refs if r.get("path")][:3]
             _amax = _dialogue_audio_limits(self._model_id())[0]
             voice_srcs = [v["voice"] for v in self._voice_refs if v.get("voice")]
-            audio_srcs = (voice_srcs + [t["path"] for t in self._dlg_refs])[:_amax]
+            audio_srcs = voice_srcs + [t["path"] for t in self._dlg_refs]
+            if len(audio_srcs) > _amax:              # never truncate: the prompt maps them
+                _error("Too many reference audio clips for {}: {} (max {}). Remove a "
+                       "character voice or a dialogue clip, or switch to Seedance 2.5."
+                       .format(_seedance_name(self._model_id()), len(audio_srcs), _amax))
+                return
             if self._dlg_refs:                       # bind speakers to Audio positions
                 text = (text + "  " if text else "") + _dialogue_mapping_text(
                     self._dlg_refs, first_audio_index=len(voice_srcs) + 1)
