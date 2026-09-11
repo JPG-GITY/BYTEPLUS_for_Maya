@@ -32,6 +32,9 @@ All user-facing changes, newest first. `USER_GUIDE.md` is the canonical guide;
   with a read-only call, no side effects.
 
 ### Seed Audio
+- **Trusted Characters > Generate voice…** shows progress: a row in the
+  activity HUD (cancel with ✕), the button reads *Generating…*, and the voice
+  line / status say what is being generated.
 - **Generate** now runs as a row in the activity HUD (cancel with ✕, queue
   several); the Seed Audio window stays usable and the **Audio Gallery opens by
   itself** when the clip is ready. The system media player no longer pops up.

@@ -9319,6 +9319,7 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
         self.voice_lbl.setStyleSheet("color:#7ee081;")
         vbox.addWidget(self.voice_lbl, 1)
         b_gv = QtWidgets.QPushButton("Generate voice…")
+        self._b_gv = b_gv
         b_gv.setToolTip("Give this character a reusable voice (from its image, a "
                         "description, or a preset) — for consistent Seedance dialogue")
         b_gv.clicked.connect(self._gen_voice)
@@ -9713,24 +9714,54 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
         gname = (self.groups.currentItem().text()
                  if self.groups.currentItem() else gid)
         out_dir, stem = _character_voice_dir(), _safe_name(gid or gname)
-        self._set_status("Generating voice…")
+        # Progress: a row in the shared activity HUD (cancellable), the button
+        # shows it is busy, and the voice line + status say what is happening.
+        how = {"image": "from the character image", "describe": "from your description",
+               "preset": "preset voice"}.get(source, source)
+        h = _progress("🎙️ Voice · {}".format(gname[:24]))
+        h.setLabelText("Seed Audio is generating the voice ({})… up to ~2 min".format(how))
+        h.show()
+        self._b_gv.setEnabled(False); self._b_gv.setText("⏳ Generating…")
+        try:
+            self.voice_lbl.setText("🎙️ Voice: ⏳ generating {}…".format(how))
+        except Exception:
+            pass
+        self._set_status("⏳ Generating '{}' voice {} — see the activity HUD; this "
+                         "window stays usable.".format(gname, how))
+
+        def _restore():
+            self._b_gv.setEnabled(True); self._b_gv.setText("Generate voice…")
+            h.close()
 
         def _make():
-            return _seed_audio(sample, speaker=speaker, ref_image=ref_image,
-                               fmt="mp3", out_dir=out_dir, stem=stem)
+            res = _seed_audio(sample, speaker=speaker, ref_image=ref_image,
+                              fmt="mp3", out_dir=out_dir, stem=stem)
+            return None if _cancel_requested() else res    # ✕ pressed meanwhile
 
         def _done(result):
+            _restore()
+            if not result:
+                self._set_status("Voice generation cancelled.")
+                if self._group_id == gid:
+                    self._refresh_voice()
+                return
             path, _info = result
             _asset_store_set_voice(gid, {"path": path, "speaker": speaker or "",
                                          "source": source, "name": gname})
             if self._group_id == gid:
                 self._refresh_voice()
-            self._set_status("✅ voice ready — ▶ to play. Reuse it in Animate "
-                             "(Phase 3).")
+            self._set_status("✅ '{}' voice ready — ▶ to play. Reuse it in Animate "
+                             "(Phase 3).".format(gname))
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
 
-        self._run(_make, _done, lambda tb: (self._set_status("❌ voice failed"),
-                                            _error("Voice generation failed:\n\n" + tb)))
+        def _fail(tb):
+            _restore()
+            if self._group_id == gid:
+                self._refresh_voice()
+            self._set_status("❌ voice failed")
+            _error("Voice generation failed:\n\n" + tb)
+
+        self._run(_make, _done, _fail)
 
     def _play_voice(self):
         v = _asset_group_voice(self._group_id) if self._group_id else None
