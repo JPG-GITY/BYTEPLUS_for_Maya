@@ -61,6 +61,7 @@ optionally share your details, or click **Stay anonymous**. It won't ask again.
 | **Seed Audio** | Voice / TTS, music & SFX, voice cloning → Audio Gallery |
 | **Seed 3D** | Prompt or images → a textured 3D asset imported into the scene |
 | **Trusted Characters** | Permanent digital characters (no 24 h expiry) for Animate |
+| **Dialogue Audio** | Cast + script → each line spoken in its character's voice → Audio Gallery |
 | **Generate Texture** | Prompt → texture wired into a new OpenPBR shader |
 | **Settings…** | API key, models, resolution, hosting, analytics |
 | **Set up motion hosting…** | Guided wizard to enable faithful video motion |
@@ -203,6 +204,29 @@ example *"deep, commanding male voice, slow and menacing: 'Kneel before me.'"*
 Generate runs in the activity HUD; the **Audio Gallery** opens by itself with the
 clip when it is ready (▶ to play, Save As, Delete). Seed Audio needs its **own
 API key** from the BytePlus Voice console (Settings > API & Models).
+
+### 🗣️ Dialogue Audio → Animate (spoken scenes)
+Dialogue is made as **audio first**, then used as a reference in the video:
+
+1. Give each character a voice: **Trusted Characters** → select the character →
+   **Generate voice…** (from its image, a description, or a preset).
+2. **BYTEPLUS > Dialogue Audio** → **+ Add character** for each speaker → write the
+   script, one line each (`@Alice: No, I won't. I am a princess.` — use **Insert
+   @tag** to avoid typos) → **🎙️ Generate dialogue audio**. Each line is spoken in
+   that character's voice; you get one clip per line plus a mixed scene track in
+   the **Audio Gallery** (▶ to check them). The status line tells you whether the
+   script fits Seedance 2.0 (≤ 15 s of audio) or 2.5 (≤ 30 s).
+3. Make the video where all your references live: **Animate** (from a Dream
+   image) or **Video GEN › Multimodal** → **🎙️ Dialogue audio** → tick the mixed
+   track (or individual lines) → add your playblast, environment and character
+   references as usual → Generate. The plugin writes the speaker mapping into the
+   prompt ("Image 1 is Alice; Audio 1 is Alice's line …") and Seedance speaks the
+   clip with synced lips.
+
+> Tip: iterate on the words and voices in Dialogue Audio (cents per take) before
+> paying for the video. If Seedance's *output* filter flags a finished clip for
+> "copyright", your inputs were fine — retry, rephrase the line, or rename
+> characters that sound like protected titles.
 
 ### 🎨 Generate Texture
 1. Select an object (or just run it).
