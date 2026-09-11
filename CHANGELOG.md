@@ -5,6 +5,26 @@ All user-facing changes, newest first. `USER_GUIDE.md` is the canonical guide;
 
 ## 2026-09-11
 
+### Dialogue Audio (replaces "Dialogue Scene")
+- **Dialogue is now audio first.** BYTEPLUS > **Dialogue Audio**: pick a cast of
+  Trusted Characters (each with a voice), write `@Name: line` per line, and Seed
+  Audio speaks every line in that character's own voice. You get one WAV per line
+  plus a mixed scene track, all in the **Audio Gallery** (with a record of who
+  says what). Cheap to iterate (Seed Audio ≈ $0.0025/s) and no video is generated
+  here.
+- **Animate and Video GEN (Multimodal) gained 🎙️ Dialogue audio**: pick those
+  clips and they go to Seedance as reference audio (Audio 1, 2, …) next to your
+  playblast, environment and character references. The plugin writes the speaker
+  mapping into the prompt for you ("Image 1 is Alice; Audio 1 is Alice's line: …")
+  and turns Generate audio on. Verified live: Seedance 2.5 speaks the clip
+  verbatim with synced lips (transcribed back word for word).
+- Limits are enforced per model: 2.0 → 3 clips / 15 s of audio per job; 2.5 → 10
+  clips / 30 s. Dialogue Audio tells you which model your script fits.
+- Audio Gallery shows dialogue clips with a badge (speaker + line, or "dialogue
+  mix") and their duration; deleting a clip removes its record too.
+- Why: a dialogue is one more reference for a shot, not a separate kind of shot —
+  one video front-end (Animate / Video GEN) instead of two.
+
 ### Trusted Characters (permanent digital characters)
 - **Temporary STS credentials work.** Settings > Storage & Hosting gained a
   **Session token** field for TOS and for the Asset Library (the hosting wizard
