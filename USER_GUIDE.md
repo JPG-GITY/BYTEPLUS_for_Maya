@@ -57,6 +57,10 @@ optionally share your details, or click **Stay anonymous**. It won't ask again.
 | **Dream with Seedreams 5.0** | Viewport + prompt → generated concept image |
 | **Open Dream Gallery** | Browse / refine / regenerate / animate your images |
 | **Open Video Gallery** | Browse / open / edit / save your videos |
+| **Open Audio Gallery** | Browse / play / save your Seed Audio clips |
+| **Seed Audio** | Voice / TTS, music & SFX, voice cloning → Audio Gallery |
+| **Seed 3D** | Prompt or images → a textured 3D asset imported into the scene |
+| **Trusted Characters** | Permanent digital characters (no 24 h expiry) for Animate |
 | **Generate Texture** | Prompt → texture wired into a new OpenPBR shader |
 | **Settings…** | API key, models, resolution, hosting, analytics |
 | **Set up motion hosting…** | Guided wizard to enable faithful video motion |
@@ -140,8 +144,13 @@ must be uploaded somewhere Seedance can read it. A one-time, ~2-minute setup:
 Without hosting, Animate still works — the motion just comes from your **text
 description** (approximate) instead of the playblast.
 
-> Advanced: **BytePlus TOS** is also supported (same vendor as your API key) but
-> needs the `tos` Python package; the wizard shows the command. R2 needs nothing.
+> Advanced: **BytePlus TOS** is also supported (same vendor as your API key).
+> It needs the `tos` Python package in Maya's Python (the wizard shows the
+> command), a **bucket** you create in the BytePlus console, and an IAM
+> **Access Key / Secret Key**. If your keys are *temporary* STS credentials
+> (`AKTP…`), paste their **Session token** too — they expire, and the plugin will
+> tell you when to mint a fresh set. When both TOS and R2 are configured the
+> plugin prefers TOS and **falls back to R2** if a TOS upload fails.
 
 ![Motion hosting setup — Cloudflare R2 (recommended)](images/MotionVideoHostingSetup.jpg)
 
@@ -162,6 +171,39 @@ All your videos, persistent. Select one and:
 
 ![Edit video](images/Edit_Video.jpg)
 
+### 🎭 Trusted Characters (permanent digital characters)
+Seedance blocks unverified real faces. AI-generated characters can be registered
+**once** as *trusted assets* that never expire (a plain Dream image is trusted
+for ~24 h only). Needs **Advanced Creation Rights** on your BytePlus account and
+an IAM Access Key / Secret Key (Settings > Storage & Hosting > Trusted Asset
+Library — or leave blank to reuse your TOS keys).
+
+1. **BYTEPLUS > Trusted Characters** → **+ New** → name the character.
+2. Select it → **+ From gallery** (a Dream image; for best identity add a
+   full-body frontal *and* a face close-up) or **+ From file**. Each image takes
+   a few seconds to become ✅ **Active**.
+3. Animate → **🎭 Trusted character** picks it as Image 1 — the face stays
+   consistent across videos, forever.
+
+Shortcuts and details:
+- **Dream Gallery > 🎭 Make permanent** does steps 1–2 for the selected image:
+  it asks which character (or a new name) and confirms the result in a dialog.
+- The list shows **your** characters (created on this machine). On a shared
+  account a project may hold thousands of groups — use **🔍 Find…** to bring in
+  one specific group by name instead of listing everything.
+- **Diagnostics > Test Trusted Asset Library** checks your keys and IAM policy
+  with a read-only call.
+- Real human portraits are rejected by policy; use AI-generated characters.
+
+### 🎙️ Seed Audio & Audio Gallery
+**BYTEPLUS > Seed Audio**: Voice / TTS, Music & SFX, or Clone voice (from a
+clip). Describe the voice *and* the line — age, gender, accent, emotion — for
+example *"deep, commanding male voice, slow and menacing: 'Kneel before me.'"*
+(scene descriptions like camera angles or lighting add nothing to audio).
+Generate runs in the activity HUD; the **Audio Gallery** opens by itself with the
+clip when it is ready (▶ to play, Save As, Delete). Seed Audio needs its **own
+API key** from the BytePlus Voice console (Settings > API & Models).
+
 ### 🎨 Generate Texture
 1. Select an object (or just run it).
 2. **BYTEPLUS > Generate Texture**.
@@ -180,8 +222,11 @@ Tabs in **Settings…**:
 - **Generation** — video resolution, aspect ratio, max reference frames,
   reference frame size, bump depth, colour management, SSL verify.
 - **Storage & Hosting** — TOS / Cloudflare R2 for hosting videos (used by the
-  Render/Animate motion reference and video-to-video editing). Easiest to set up
-  via the **Set up motion hosting…** wizard.
+  Render/Animate motion reference and video-to-video editing), and the **Trusted
+  Asset Library** keys. Easiest to set up via the **Set up motion hosting…**
+  wizard. **Session token** fields are only for temporary STS credentials
+  (`AKTP…`); permanent IAM keys leave them blank. Asset Library keys left blank
+  reuse the TOS keys.
 - **Analytics & Webhook** — anonymous usage telemetry (PostHog / R2), callback
   URL.
 
@@ -207,12 +252,21 @@ Tabs in **Settings…**:
 - **SSL certificate error?** In Settings, install `certifi` into Maya's Python or
   untick *Verify SSL certificates* (less secure).
 - **A real human face is rejected.** Seedance blocks unverified real faces by
-  policy — use non-human / AI-generated subjects.
+  policy — use non-human / AI-generated subjects, and register recurring
+  characters in **Trusted Characters**.
+- **"credentials expired" / ExpiredToken?** Temporary STS keys have a lifetime;
+  mint a fresh Access Key / Secret Key / Session token and paste all three in
+  Settings > Storage & Hosting (TOS and/or Trusted Asset Library).
+- **Trusted Characters is empty but my character exists?** The list shows the
+  characters created on this machine. Use **🔍 Find…** to import one by name.
+- **Behind a corporate proxy?** Compressed (gzip) API responses and
+  keychain-issued certificates are handled automatically on macOS; if every
+  call fails with an SSL error, see `SSL_CORPORATE_CA_FIX.md`.
 - **"Edit video" needs motion hosting.** Editing uploads the clip as a public
   URL, so set up Cloudflare R2 / TOS in **Settings > Storage & Hosting**.
 - **Something failing?** The **Diagnostics** submenu has a test for each service
-  (Seedream, LLM, Seedance, image refs, TOS, R2, telemetry). Results print to the
-  Script Editor.
+  (Seedream, LLM, Seedance, image refs, TOS, R2, Trusted Asset Library,
+  telemetry). Results print to the Script Editor.
 - **Check your usage.** BYTEPLUS > Usage… shows images, videos and tokens used on
   this machine.
 - **Found a bug?** BYTEPLUS > Report a Bug…

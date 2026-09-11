@@ -9917,7 +9917,7 @@ class SeedAudioDialog(QtWidgets.QDialog):
         tip = QtWidgets.QLabel(
             "Tip: describing the voice in the prompt (age / gender / accent / "
             "emotion / tone) is the best path — a preset below is just an optional "
-            "shortcut. Prompt-described voices are English &amp; Chinese for now.")
+            "shortcut. Prompt-described voices are English and Chinese for now.")
         tip.setWordWrap(True); tip.setStyleSheet("color:#888;")
         v.addWidget(tip)
         prow = QtWidgets.QHBoxLayout()
@@ -10108,27 +10108,38 @@ class SeedAudioDialog(QtWidgets.QDialog):
         _mark_active_project()
         out_dir = _scene_audio_dir()                  # MAIN THREAD: maya.cmds not thread-safe
         stem = _scene_tag()
-        self.b_gen.setEnabled(False); self.b_gen.setText("Generating…")
-        self.status.setText("Contacting Seed Audio (up to ~2 min)…")
-        self._worker = _Worker(
-            lambda: _seed_audio(text, speaker=speaker, ref_audio=ref_audio,
-                                fmt=fmt, pitch=pitch, speed=speed,
-                                out_dir=out_dir, stem=stem),
-            parent=_main_window())
+        # The job runs as a row in the shared Activity HUD (like Seedance video):
+        # this window stays free, more clips can be queued, and the Audio Gallery
+        # opens by itself when the clip is ready. No modal wait, no OS player pop.
+        h = _progress("🎙️ Seed Audio · " + (text[:28] + "…" if len(text) > 28 else text))
+        h.setLabelText("Contacting Seed Audio (up to ~2 min)…")
+        h.show()
+        self.status.setText("⏳ Generating in the background (see the activity HUD) — "
+                            "the Audio Gallery opens when it's ready. You can queue another.")
+
+        def _work():
+            res = _seed_audio(text, speaker=speaker, ref_audio=ref_audio,
+                              fmt=fmt, pitch=pitch, speed=speed,
+                              out_dir=out_dir, stem=stem)
+            return None if _cancel_requested() else res   # ✕ pressed meanwhile: drop it
+
+        self._worker = _Worker(_work, parent=_main_window())
 
         def done(result):
-            self.b_gen.setEnabled(True); self.b_gen.setText("Generate")
+            h.close()
+            if not result:
+                self.status.setText("Cancelled.")
+                return
             path, info = result
             dur = info.get("original_duration") or info.get("duration") or 0
-            self.status.setText("✅ {:.1f}s  ·  ≈ ${:.3f}".format(
-                dur, _est_audio_cost(dur)) if dur else "✅ done")
+            self.status.setText("✅ {:.1f}s  ·  ≈ ${:.3f}  →  Audio Gallery".format(
+                dur, _est_audio_cost(dur)) if dur else "✅ done  →  Audio Gallery")
             g = _audio_gallery()
             g.add_audio(path, info)
-            g.show(); g.raise_()
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
+            g.show(); g.raise_(); g.activateWindow()
 
         def fail(tb):
-            self.b_gen.setEnabled(True); self.b_gen.setText("Generate")
+            h.close()
             self.status.setText("❌ failed")
             _error("Seed Audio failed:\n\n" + tb)
 
