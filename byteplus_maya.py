@@ -4246,16 +4246,22 @@ class _ProgressHandle:
         _ActivityHUD.instance().add(self)
 
     def setLabelText(self, text):
+        """Safe from ANY thread: workers report progress with this, but widgets may
+        only be touched on the main thread -> re-dispatch via Maya's idle queue.
+        Python-level check (Maya's Qt main thread IS Python's main thread; a QThread
+        worker always runs in another), and the deferred call goes to _apply_label,
+        never back here -- in batch mode executeDeferred runs inline, which would
+        otherwise recurse forever."""
         self._title = text
-        # Safe from ANY thread: workers report progress with this, but widgets may
-        # only be touched on the main thread -> re-dispatch via Maya's idle queue.
-        try:
-            app = QtWidgets.QApplication.instance()
-            if app is not None and QtCore.QThread.currentThread() is not app.thread():
-                maya.utils.executeDeferred(self.setLabelText, text)
-                return
-        except Exception:
-            pass
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                maya.utils.executeDeferred(self._apply_label, text)
+            except Exception:
+                pass                                    # never touch widgets off-thread
+            return
+        self._apply_label(text)
+
+    def _apply_label(self, text):
         if self._lbl is not None:
             try:
                 self._lbl.setText(text)
