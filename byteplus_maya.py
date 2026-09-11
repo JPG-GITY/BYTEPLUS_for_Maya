@@ -107,9 +107,11 @@ class CONFIG:
     # of the model id, so a custom endpoint id ("ep-...") falls back to 2.0.
     SEEDANCE_CAPS = {
         "2-5": {"resolutions": ("480p", "720p"), "duration": (4, 30),
-                "formats": ("mp4", "mov"), "refs": (30, 10, 10), "timestamps": True},
+                "formats": ("mp4", "mov"), "refs": (30, 10, 10), "timestamps": True,
+                "audio_secs": 30},
         "2-0": {"resolutions": ("480p", "720p", "1080p", "4k"), "duration": (4, 15),
-                "formats": ("mp4",), "refs": (9, 3, 3), "timestamps": False},
+                "formats": ("mp4",), "refs": (9, 3, 3), "timestamps": False,
+                "audio_secs": 15},
     }
     SEEDANCE_FAST_MODEL = "dreamina-seedance-2-0-fast-260128"  # 480/720, faster/cheaper
     SEEDANCE_MINI_MODEL = "dreamina-seedance-2-0-mini-260615"  # 480/720, cheapest
@@ -1986,6 +1988,15 @@ def _asset_store_save(data):
             os.replace(tmp, CONFIG.ASSET_STORE_PATH)
         except OSError:
             pass
+
+
+def _asset_name_for_uri(uri_or_id) -> str:
+    """Character (group) name that owns a trusted asset ('asset://<id>' or id), or ''."""
+    aid = str(uri_or_id or "").replace("asset://", "", 1)
+    for gid, g in _asset_store_load()["groups"].items():
+        if aid in (g.get("assets") or {}):
+            return g.get("name") or gid
+    return ""
 
 
 def _asset_store_thumb(uri_or_id) -> str:
@@ -6018,7 +6029,8 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
     # up to 3, wav/mp3, <=15s each). An http/asset:// source passes through; a local
     # clip is hosted like a video. Needs generate_audio=true to take effect.
     audio_urls = []
-    for a in (audio_sources or [])[:3]:
+    _amax = _seedance_caps(model or CONFIG.SEEDANCE_MODEL)["refs"][2]   # 3 on 2.0, 10 on 2.5
+    for a in (audio_sources or [])[:_amax]:
         if isinstance(a, str) and (a.startswith("http") or a.startswith("asset://")):
             audio_urls.append(a)
         elif isinstance(a, str) and os.path.isfile(a):
@@ -6599,6 +6611,7 @@ class AnimateDialog(QtWidgets.QDialog):
         self._img_n = 0
         self._vid_n = 0
         self._trusted_uri = None                     # chosen trusted character (asset://)
+        self._dlg_audio = []                         # Dialogue Audio tracks -> reference_audio
         v = QtWidgets.QVBoxLayout(self)
         self.lbl = QtWidgets.QLabel()
         v.addWidget(self.lbl)
@@ -6655,6 +6668,13 @@ class AnimateDialog(QtWidgets.QDialog):
                                   "no 24h expiry, animates without face rejection.")
         self.b_trusted.clicked.connect(self._pick_trusted)
         rr.addWidget(self.b_trusted)
+        self.b_dialogue = QtWidgets.QPushButton("🎙️ Dialogue audio")
+        self.b_dialogue.setToolTip("Attach dialogue clips made in BYTEPLUS > Dialogue Audio as "
+                                   "reference audio (Audio 1, 2…). Seedance speaks them with "
+                                   "synced lips; the mapping sentence is added to the prompt "
+                                   "for you. Forces 'Generate audio' on.")
+        self.b_dialogue.clicked.connect(self._pick_dialogue_audio)
+        rr.addWidget(self.b_dialogue)
         rr.addStretch(1)
         v.addLayout(rr)
         self.ref_list = QtWidgets.QListWidget()
@@ -6662,6 +6682,11 @@ class AnimateDialog(QtWidgets.QDialog):
         self.ref_list.setToolTip("Added references. Double-click one to remove it.")
         self.ref_list.itemDoubleClicked.connect(lambda _i: self._remove_ref())
         v.addWidget(self.ref_list)
+        self.dlg_lbl = QtWidgets.QLabel("")           # picked dialogue clips (read-only)
+        self.dlg_lbl.setStyleSheet("color:#8bd;")
+        self.dlg_lbl.setWordWrap(True)
+        self.dlg_lbl.hide()
+        v.addWidget(self.dlg_lbl)
 
         self.use_anim = QtWidgets.QCheckBox(
             "Use the scene's animation (playblast) to drive the motion")
@@ -6919,6 +6944,28 @@ class AnimateDialog(QtWidgets.QDialog):
     def video_refs(self):
         return list(self._vid_refs)
 
+    def dialogue_audio(self):
+        return list(self._dlg_audio)
+
+    def _pick_dialogue_audio(self):
+        picked = _pick_dialogue_audio(self)             # None = cancelled, [] = clear
+        if picked is None:
+            return
+        self._dlg_audio = picked
+        if picked:
+            self.cb_audio.setChecked(True)               # reference_audio needs audio on
+            secs = sum(t["seconds"] for t in picked)
+            self.b_dialogue.setText("🎙️ Dialogue ✓")
+            self.dlg_lbl.setText("🎙️ Dialogue audio ({} clip(s), {:.1f} s): ".format(len(picked), secs)
+                                 + "  ·  ".join(("whole dialogue" if t["kind"] == "mix"
+                                                 else "{}: “{}”".format(t["who"], t["text"][:40]))
+                                                for t in picked))
+            self.dlg_lbl.show()
+        else:
+            self.b_dialogue.setText("🎙️ Dialogue audio")
+            self.dlg_lbl.hide()
+        self._update_cost()
+
     def _refresh_refs(self):
         self.ref_list.clear()
         for r in self._img_refs:
@@ -7102,6 +7149,10 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
     img_refs = d.image_refs()
     vid_refs = d.video_refs()
     extra_movies = [r.get("path") for r in vid_refs if r.get("path")]
+    dlg_audio = d.dialogue_audio()
+    audio_sources = [t["path"] for t in dlg_audio if t.get("path")]
+    if audio_sources:
+        audio = True                                  # reference_audio needs generate_audio
     motion = d.prompt_text()
     # Only inject a generic motion description when there is genuinely NO motion
     # source (no scene animation AND no reference video) -- otherwise it would tell
@@ -7142,6 +7193,17 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
     if use_anim:                                  # playblast intended -> reinforce it
         look_tag = "Camera and pacing follow the reference video exactly. " + look_tag
     prompt = look_tag + (("Action: " + motion) if motion else "")
+    # Dialogue clips: bind speakers to Image/Audio POSITIONS in the prompt (Seedance
+    # reads "Image 1" / "Audio 2", never file names). Appended inside make_video so a
+    # regenerate with an edited prompt keeps the binding.
+    audio_map = ""
+    if dlg_audio:
+        names = {}
+        if trusted_uri:                               # Image 1 = the trusted character
+            nm = _asset_name_for_uri(trusted_uri)
+            if nm:
+                names[1] = nm
+        audio_map = _dialogue_mapping_text(dlg_audio, 1, names or None)
 
     # Playblast ON -> clip length follows the scene animation; OFF -> the user's
     # choice from the dialog (Seedance 2.0: 4-15 s, verified).
@@ -7155,7 +7217,7 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
     # Reference videos (the playblast and/or an extra clip) need a public video
     # host (R2/TOS). If there isn't one, alert the user -- they'll be dropped.
     host = _motion_host_ready()
-    if (use_anim or extra_movies) and not host:
+    if (use_anim or extra_movies or audio_sources) and not host:   # local audio is hosted too
         proceed = _msgbox(
             QtWidgets.QMessageBox.Warning, "BYTEPLUS - motion hosting not configured",
             "Reference-video hosting (Cloudflare R2 / TOS) is not set up, so the "
@@ -7309,8 +7371,9 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
                              len(extra_movies), len(ready_extras),
                              "" if host else " (motion hosting R2/TOS not configured)"))
 
-    dlg.setLabelText("Submitting to Seedance (image + {})...".format(
-        "motion video" if (movie or ready_extras) else "motion description"))
+    dlg.setLabelText("Submitting to Seedance (image + {}{})...".format(
+        "motion video" if (movie or ready_extras) else "motion description",
+        " + {} dialogue clip(s)".format(len(audio_sources)) if audio_sources else ""))
     QtWidgets.QApplication.processEvents()
     def failed(tb):
         dlg.close()
@@ -7356,9 +7419,12 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
                                  "{}\n".format(e))
         # No first_frame (can't mix with a video ref). require_motion_video makes a
         # failed playblast upload FAIL LOUDLY instead of silently degrading.
+        if audio_map:
+            final = final + "  " + audio_map
         return _seedance_generate(final, image_sources, movie, duration,
                                   require_motion_video=bool(movie),
                                   generate_audio=audio, extra_movies=ready_extras,
+                                  audio_sources=audio_sources,
                                   fit_motion=True, trusted_input=trusted_input,
                                   resolution=_res, out_meta=_meta)
 
@@ -9901,8 +9967,21 @@ class AudioGallery(QtWidgets.QDialog):
         path = os.path.normpath(path)
         if any(os.path.normpath(it["path"]) == path for it in self._items):
             return
+        badge = ""
+        rec = _read_dialogue_sidecar(path)                 # Dialogue Audio clip?
+        if rec:
+            info = dict(info or {}); info["dialogue"] = rec
+            this = rec.get("this_line")
+            line = next((l for l in rec.get("lines", []) if l.get("n") == this), None) if this else None
+            if line:
+                info.setdefault("duration", line.get("seconds"))
+                badge = "  ·  🎙️ {}: “{}”".format(line.get("who", ""), line.get("text", "")[:36]
+                                                 + ("…" if len(line.get("text", "")) > 36 else ""))
+            else:
+                info.setdefault("duration", rec.get("mix_seconds"))
+                badge = "  ·  🎬 dialogue mix ({} lines)".format(len(rec.get("lines", [])))
         dur = info.get("original_duration") or info.get("duration")
-        label = os.path.basename(path) + ("  ·  {:.1f}s".format(dur) if dur else "")
+        label = os.path.basename(path) + ("  ·  {:.1f}s".format(dur) if dur else "") + badge
         it = QtWidgets.QListWidgetItem(label)
         it.setData(QtCore.Qt.UserRole, path)
         self.list.addItem(it)
@@ -9948,6 +10027,10 @@ class AudioGallery(QtWidgets.QDialog):
             return
         try:
             os.remove(p)
+        except OSError:
+            pass
+        try:
+            os.remove(_dialogue_sidecar_path(p))          # its dialogue record, if any
         except OSError:
             pass
         self._items = [x for x in self._items
@@ -10255,7 +10338,8 @@ def open_seed_audio():
 
 
 # =============================================================================
-# Dialogue Scene -- multi-character spoken dialogue with Seedance 2.0
+# Dialogue Audio -- per-line Seed Audio clips for a cast of trusted characters;
+# the video is made in Animate / Video GEN with these clips as reference audio
 # =============================================================================
 
 def _trusted_characters_list():
@@ -10308,23 +10392,195 @@ def _pick_trusted_character(parent, exclude=()):
     return chosen or None
 
 
+# --- Dialogue audio: per-line Seed Audio clips + a mixed scene track --------------
+
+def _dialogue_sidecar_path(audio_path: str) -> str:
+    return str(audio_path) + ".dialogue.json"
+
+
+def _read_dialogue_sidecar(audio_path: str):
+    """The cast/lines record written next to a Dialogue Audio clip (or None)."""
+    try:
+        with open(_dialogue_sidecar_path(audio_path), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _wav_concat(paths, out_path, gap_seconds=0.4):
+    """Join PCM WAV clips (all the same rate / channels / width) with `gap_seconds`
+    of silence between them. Pure Python (`wave`): no ffmpeg, no MP3 encoder, so it
+    works with the LGPL ffmpeg-less Windows install. Returns total seconds."""
+    import wave
+    params = None
+    frames = []
+    for pth in paths:
+        with wave.open(pth, "rb") as w:
+            q = (w.getframerate(), w.getnchannels(), w.getsampwidth())
+            if params is None:
+                params = q
+            elif q != params:
+                raise ValueError("clip formats differ ({} vs {})".format(q, params))
+            frames.append(w.readframes(w.getnframes()))
+    rate, ch, width = params
+    silence = b"\x00" * (int(rate * max(0.0, gap_seconds)) * ch * width)
+    with wave.open(out_path, "wb") as w:
+        w.setnchannels(ch); w.setsampwidth(width); w.setframerate(rate)
+        for i, fr in enumerate(frames):
+            if i:
+                w.writeframes(silence)
+            w.writeframes(fr)
+    total = sum(len(fr) for fr in frames) + len(silence) * max(0, len(frames) - 1)
+    return total / float(rate * ch * width)
+
+
+def _dialogue_tracks_available():
+    """Dialogue Audio clips for THIS scene: audio files in the scene's audio folder
+    that carry a .dialogue.json sidecar. [{path, seconds, kind ('mix'|'line'), who,
+    text, record}], newest first. Reads disk only -- no gallery window needed."""
+    out = []
+    try:
+        d = _scene_audio_dir()
+        files = [os.path.join(d, f) for f in os.listdir(d) if f.lower().endswith(_AUDIO_EXTS)]
+    except OSError:
+        files = []
+    for pth in files:
+        rec = _read_dialogue_sidecar(pth)
+        if not rec:
+            continue
+        this = rec.get("this_line")
+        line = next((l for l in rec.get("lines", []) if l.get("n") == this), None) if this else None
+        if line:
+            out.append({"path": pth, "seconds": float(line.get("seconds") or 0), "kind": "line",
+                        "who": line.get("who", ""), "text": line.get("text", ""), "record": rec})
+        else:
+            out.append({"path": pth, "seconds": float(rec.get("mix_seconds") or 0), "kind": "mix",
+                        "who": "", "text": "", "record": rec})
+    # newest scene first; within a scene the mixed track first, then lines in order
+    out.sort(key=lambda t: (-int(t["record"].get("created", 0)), t["kind"] != "mix",
+                            int(t["record"].get("this_line") or 0)))
+    return out
+
+
+def _dialogue_audio_limits(model=None):
+    """(max_clips, max_seconds) of reference audio for a Seedance model."""
+    caps = _seedance_caps(model)
+    return caps["refs"][2], caps.get("audio_secs", 15)
+
+
+def _pick_dialogue_audio(parent, model=None, already_secs=0.0, already_count=0):
+    """Modal multi-pick over the scene's Dialogue Audio clips, enforcing the model's
+    reference-audio limits (2.0: 3 clips / 15 s; 2.5: 10 clips / 30 s). Returns a
+    list of track dicts (see _dialogue_tracks_available) or []."""
+    tracks = _dialogue_tracks_available()
+    if not tracks:
+        _error("No dialogue audio for this scene yet.\n\nMake it in BYTEPLUS > Dialogue "
+               "Audio (cast + script → clips in the Audio Gallery), then come back.")
+        return None
+    max_n, max_s = _dialogue_audio_limits(model)
+    dlg = QtWidgets.QDialog(parent)
+    dlg.setWindowTitle("Add dialogue audio")
+    dlg.setMinimumSize(640, 420)
+    lay = QtWidgets.QVBoxLayout(dlg)
+    lay.addWidget(QtWidgets.QLabel(
+        "Tick the clips to use as reference audio. {} allows up to <b>{}</b> clips and "
+        "<b>{} s</b> of audio per job (a mixed track counts once).".format(
+            _seedance_name(model), max_n, max_s)))
+    lw = QtWidgets.QListWidget()
+    for t in tracks:
+        if t["kind"] == "mix":
+            label = "🎬 whole dialogue ({:.1f} s): ".format(t["seconds"]) + " / ".join(
+                "{}: “{}”".format(l.get("who", ""),
+                                  (l.get("text", "")[:32] + "…") if len(l.get("text", "")) > 32
+                                  else l.get("text", ""))
+                for l in t["record"].get("lines", [])[:4])
+        else:
+            label = "🎙️ {} ({:.1f} s): “{}”".format(t["who"], t["seconds"], t["text"])
+        it = QtWidgets.QListWidgetItem(label)
+        it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+        it.setCheckState(QtCore.Qt.Unchecked)
+        it.setData(QtCore.Qt.UserRole, t)
+        it.setToolTip(t["path"])
+        lw.addItem(it)
+    lay.addWidget(lw, 1)
+    tally = QtWidgets.QLabel("")
+    tally.setStyleSheet("color:#888;")
+    lay.addWidget(tally)
+    bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+
+    def _recount(*_):
+        picked = [lw.item(i).data(QtCore.Qt.UserRole) for i in range(lw.count())
+                  if lw.item(i).checkState() == QtCore.Qt.Checked]
+        n = already_count + len(picked)
+        secs = already_secs + sum(t["seconds"] for t in picked)
+        over = n > max_n or secs > max_s
+        tally.setText("{} clip(s), {:.1f} s selected{}".format(
+            n, secs, "  —  ⚠️ over the {} clips / {} s limit".format(max_n, max_s) if over else ""))
+        tally.setStyleSheet("color:#e66;" if over else "color:#888;")
+        bb.button(QtWidgets.QDialogButtonBox.Ok).setEnabled(not over)   # empty OK = clear
+
+    bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+    lw.itemChanged.connect(_recount)
+    lay.addWidget(bb)
+    _recount()
+    if dlg.exec() != QtWidgets.QDialog.Accepted:
+        return None                                       # cancelled: caller keeps its list
+    return [lw.item(i).data(QtCore.Qt.UserRole) for i in range(lw.count())
+            if lw.item(i).checkState() == QtCore.Qt.Checked]
+
+
+def _dialogue_mapping_text(tracks, first_audio_index=1, image_names=None):
+    """The prompt sentence that binds reference audio to speakers, by POSITION
+    (Seedance reads 'Audio N' / 'Image N', never file names). `image_names` maps a
+    1-based image index -> character name for the images in this job, when known."""
+    parts = []
+    if image_names:
+        parts.append("; ".join("Image {} is {}".format(i, n)
+                               for i, n in sorted(image_names.items())) + ".")
+    k = first_audio_index
+    for t in tracks:
+        if t["kind"] == "mix":
+            seq = "  ".join("{} says: “{}”".format(l.get("who", ""), l.get("text", ""))
+                            for l in t["record"].get("lines", []))
+            parts.append("Audio {} is the whole dialogue, in order; each character speaks "
+                         "their own line with synced lip movement: {}".format(k, seq))
+        else:
+            parts.append("Audio {} is {}'s line; {} speaks it with synced lip movement: “{}”"
+                         .format(k, t["who"], t["who"], t["text"]))
+        k += 1
+    return " ".join(parts)
+
+
 class DialogueSceneDialog(QtWidgets.QDialog):
-    """Multi-character spoken dialogue -> Seedance 2.0. Pick a cast of trusted
-    characters (image asset:// + optional voice), write the script, and Seedance
-    generates the video with synced spoken dialogue (EN / ES / JA / ID / PT)."""
+    """Dialogue AUDIO: a cast of trusted characters (each with a voice) + an
+    @Name: line script -> one Seed Audio clip per line in that character's voice,
+    plus a mixed scene track, filed in the Audio Gallery with a sidecar that
+    records who says what. The VIDEO is then made in Animate / Video GEN, where
+    these clips are added as reference audio next to the playblast, environment
+    and character references -- one video front-end instead of two.
+
+    Why not generate the video here: a dialogue is one more reference for the
+    shot, not a separate kind of shot. Measured 2026-09-11: Seedance 2.5 speaks a
+    reference clip verbatim (ASR-checked), so the words are decided here, cheaply
+    (Seed Audio ~$0.0025/s), and the expensive video is generated once."""
 
     def __init__(self, parent=None):
         super().__init__(parent or _main_window())
-        self.setWindowTitle("BYTEPLUS - Dialogue Scene")
+        self.setWindowTitle("BYTEPLUS - Dialogue Audio")
         self.setMinimumSize(560, 620)
         self._cast = []
         self._worker = None
         v = QtWidgets.QVBoxLayout(self)
         v.addWidget(QtWidgets.QLabel(
-            "Give each character a line — Seedance speaks the dialogue with synced "
-            "lip movement (English, Spanish, Japanese, Indonesian, Portuguese)."))
+            "Give each character a line. Seed Audio speaks every line in that "
+            "character's own voice; the clips (and a mixed scene track) land in the "
+            "<b>Audio Gallery</b>. Then, in <b>Animate</b> or <b>Video GEN</b>, add them "
+            "with 🎙️ <b>Dialogue audio</b> -- together with your playblast, environment "
+            "and character references."))
+        v.itemAt(0).widget().setWordWrap(True)
 
-        v.addWidget(QtWidgets.QLabel("<b>Cast</b>  (up to 3 characters; 🎙️ = has a voice)"))
+        v.addWidget(QtWidgets.QLabel("<b>Cast</b>  (🎙️ = has a voice — needed to speak)"))
         self.cast_list = QtWidgets.QListWidget()
         self.cast_list.setFixedHeight(84)
         v.addWidget(self.cast_list)
@@ -10337,7 +10593,8 @@ class DialogueSceneDialog(QtWidgets.QDialog):
         cb.addStretch(1)
         v.addLayout(cb)
 
-        v.addWidget(QtWidgets.QLabel("<b>Scene</b>  (optional — setting / mood / camera)"))
+        v.addWidget(QtWidgets.QLabel("<b>Scene</b>  (optional — kept with the clips for the "
+                                     "video prompt later)"))
         self.scene = QtWidgets.QLineEdit()
         self.scene.setPlaceholderText("e.g. two friends at a sunny café, warm light, medium shot")
         v.addWidget(self.scene)
@@ -10346,47 +10603,55 @@ class DialogueSceneDialog(QtWidgets.QDialog):
         self.script = QtWidgets.QPlainTextEdit()
         self.script.setPlaceholderText(
             "@Ana: ¡Hola Danny! ¿Cómo estás?\n@Danny: Muy bien, ¿y tú?")
+        self.script.textChanged.connect(self._refresh_cast)
         v.addWidget(self.script, 1)
 
-        drow = QtWidgets.QHBoxLayout()
-        drow.addWidget(QtWidgets.QLabel("Duration (s):"))
-        _qlo, _qhi = _seedance_caps()["duration"]
-        self.duration = QtWidgets.QComboBox()
-        self.duration.addItems([str(s) for s in range(_qlo, _qhi + 1)])
-        self.duration.setCurrentText(str(_fit_duration(10)))
-        self.duration.currentTextChanged.connect(lambda *_: self._refresh_cast())
-        drow.addWidget(self.duration)
-        drow.addStretch(1)
-        v.addLayout(drow)
+        orow = QtWidgets.QHBoxLayout()
+        orow.addWidget(QtWidgets.QLabel("Gap between lines (s):"))
+        self.gap = QtWidgets.QDoubleSpinBox()
+        self.gap.setRange(0.0, 3.0); self.gap.setSingleStep(0.1); self.gap.setValue(0.4)
+        orow.addWidget(self.gap)
+        self.cb_mix = QtWidgets.QCheckBox("Also make one mixed scene track")
+        self.cb_mix.setChecked(True)
+        orow.addWidget(self.cb_mix)
+        orow.addStretch(1)
+        v.addLayout(orow)
 
         self.cost = QtWidgets.QLabel(""); self.cost.setStyleSheet("color:#888;")
+        self.cost.setWordWrap(True)
         v.addWidget(self.cost)
 
         brow = QtWidgets.QHBoxLayout()
         self.status = QtWidgets.QLabel(""); self.status.setStyleSheet("color:#2E8BE6;")
+        self.status.setWordWrap(True)
         brow.addWidget(self.status, 1)
-        self.b_gen = QtWidgets.QPushButton("Generate scene")
+        self.b_gen = QtWidgets.QPushButton("🎙️ Generate dialogue audio")
         self.b_gen.setDefault(True)
         self.b_gen.clicked.connect(self._generate)
         brow.addWidget(self.b_gen)
         v.addLayout(brow)
         self._refresh_cast()
 
+    # -- cast -----------------------------------------------------------------
     def _refresh_cast(self):
         self.cast_list.clear()
         for i, c in enumerate(self._cast, 1):
-            self.cast_list.addItem("Image {} · {}{}".format(
-                i, c["name"], "  🎙️" if c.get("voice") else "  (no voice)"))
-        n = len([c for c in self._cast if c.get("voice")])
-        tok, usd = _est_video_cost(CONFIG.VIDEO_RESOLUTION, CONFIG.VIDEO_RATIO,
-                                   int(self.duration.currentText()), False)
-        self.cost.setText("{}   ·   {} character(s), {} voice(s).".format(
-            _fmt_cost(tok, usd), len(self._cast), n))
+            self.cast_list.addItem("{} · {}{}".format(
+                i, c["name"], "  🎙️" if c.get("voice") else "  (no voice — Trusted "
+                "Characters > Generate voice…)"))
+        lines = self._parse_lines()
+        words = sum(len(l["text"].split()) for l in lines)
+        secs = words / 2.5                                  # ~150 words per minute
+        tok_hint = ""
+        if lines:
+            fits = ("fits Seedance 2.0 (≤15 s) and 2.5 (≤30 s)" if secs <= 15 else
+                    "fits Seedance 2.5 (≤30 s) only" if secs <= 30 else
+                    "too long for one shot (30 s max on 2.5) — split the script")
+            tok_hint = "  ·  {} line(s), ~{:.0f} s of speech — {}".format(len(lines), secs, fits)
+        self.cost.setText("Seed Audio ≈ ${:.3f} for this script{}".format(
+            _est_audio_cost(secs), tok_hint))
 
     def _add_char(self):
-        if len(self._cast) >= 3:
-            _error("Up to 3 characters per scene (Seedance's voice-reference limit).")
-            return
         c = _pick_trusted_character(self, exclude=[x["gid"] for x in self._cast])
         if c:
             self._cast.append(c)
@@ -10404,141 +10669,140 @@ class DialogueSceneDialog(QtWidgets.QDialog):
             self.script.insertPlainText("@{}: ".format(self._cast[r]["name"]))
             self.script.setFocus()
 
-    def _build(self):
-        import re
-        image_sources, audio_sources, img_map = [], [], {}
-        for i, c in enumerate(self._cast, 1):
-            av = None
-            if c.get("voice") and os.path.exists(c["voice"]) and len(audio_sources) < 3:
-                audio_sources.append(c["voice"]); av = len(audio_sources)
-            img_map[c["name"].lower()] = (i, av)
-            image_sources.append(c["uri"])
-        legend = " ".join("Image {} = {}.".format(i, c["name"])
-                          for i, c in enumerate(self._cast, 1))
-        lines = []
+    # -- script -----------------------------------------------------------------
+    def _parse_lines(self):
+        """[{who, text, cast_index (1-based) or None}] from the @Name: line script.
+        Names match case-insensitively; a line without a known name keeps who=None."""
+        import re as _re
+        names = {c["name"].lower(): i for i, c in enumerate(self._cast, 1)}
+        out = []
         for raw in self.script.toPlainText().splitlines():
             raw = raw.strip()
             if not raw:
                 continue
-            m = re.match(r"^@?\s*([^:]+):\s*(.+)$", raw)
-            if m:
-                who, line = m.group(1).strip(), m.group(2).strip()
-                info = img_map.get(who.lower())
-                if info:
-                    idx, av = info
-                    vtag = ", voice from Audio {}".format(av) if av else ""
-                    lines.append('{} (the person in Image {}{}) says: "{}"'.format(
-                        who, idx, vtag, line))
-                else:
-                    lines.append('Someone says: "{}"'.format(line))
-            else:
-                lines.append(raw)
-        scene = self.scene.text().strip()
-        prompt = (((scene + "  ") if scene else "")
-                  + "Characters: " + legend + "  " + "  ".join(lines)
-                  + "  Keep each character's exact appearance and identity from their "
-                  "reference image; natural lip-sync and facial expression; clear, "
-                  "well-separated spoken dialogue.")
-        return prompt, image_sources, audio_sources
+            m = _re.match(r"^@?\s*([^:]+):\s*(.+)$", raw)
+            if not m:
+                continue
+            who, text = m.group(1).strip(), m.group(2).strip()
+            out.append({"who": who, "text": text, "cast_index": names.get(who.lower())})
+        return out
 
+    # -- generate -------------------------------------------------------------
     def _generate(self):
+        if not (CONFIG.AUDIO_API_KEY or "").strip():
+            _error("Seed Audio needs its API key first — add it in\n"
+                   "BYTEPLUS > Settings > API & Models > 'Seed Audio API key'.")
+            return
+        lines = self._parse_lines()
         if not self._cast:
             _error("Add at least one character to the cast (+ Add character).")
             return
-        if not self.script.toPlainText().strip():
+        if not lines:
             _error("Write the dialogue script  (e.g.  @{}: your line).".format(
                 self._cast[0]["name"]))
             return
-        active = _video_jobs_active()
-        if active >= _video_cap():
-            _msgbox(QtWidgets.QMessageBox.Information, "BYTEPLUS - Seedance is busy",
-                    "You already have {} Seedance job(s) running (max {}). Wait for "
-                    "one to finish, then generate again.".format(active, _video_cap()))
+        unknown = sorted({l["who"] for l in lines if not l["cast_index"]})
+        if unknown:
+            _error("These names in the script are not in the cast: {}.\n\nUse "
+                   "Insert @tag, or add them with + Add character.".format(", ".join(unknown)))
             return
-        prompt, image_sources, audio_sources = self._build()
-        duration = int(self.duration.currentText())
-        poster = None
-        for c in self._cast:
-            if c.get("thumb") and os.path.exists(c["thumb"]):
-                poster = c["thumb"]; break
+        mute = sorted({self._cast[l["cast_index"] - 1]["name"] for l in lines
+                       if not self._cast[l["cast_index"] - 1].get("voice")})
+        if mute:
+            _error("No voice yet for: {}.\n\nGive them one in BYTEPLUS > Trusted "
+                   "Characters > Generate voice…, then come back.".format(", ".join(mute)))
+            return
         _mark_active_project()
-        names = ", ".join(c["name"] for c in self._cast)[:40]
-        h = _progress("🎬 Dialogue · {}".format(names))   # row in the activity HUD (✕ cancels)
-        h.setLabelText("Seedance is generating the dialogue scene ({} s, {} voice(s))…"
-                       .format(duration, len(audio_sources)))
+        out_dir, tag = _scene_audio_dir(), _scene_tag()        # main thread: maya.cmds
+        scene_txt = self.scene.text().strip()
+        gap, want_mix = float(self.gap.value()), self.cb_mix.isChecked()
+        cast_snapshot = [{"name": c["name"], "gid": c.get("gid", ""), "uri": c.get("uri", ""),
+                          "thumb": c.get("thumb", ""), "voice": c.get("voice", "")}
+                         for c in self._cast]
+        speakers = [_asset_group_voice(c.get("gid", "")) or {} for c in self._cast]
+
+        h = _progress("🎙️ Dialogue · {} line(s)".format(len(lines)))
+        h.setLabelText("Seed Audio: line 1 of {}…".format(len(lines)))
         h.show()
         self.b_gen.setEnabled(False); self.b_gen.setText("⏳ Generating…")
-        self.status.setText("⏳ Generating in the background — see the activity HUD; "
-                            "the result lands in the Video Gallery.")
-        meta = {}
-        worker = _Worker(lambda: _seedance_generate(
-            prompt, image_sources, None, duration, generate_audio=True,
-            audio_sources=audio_sources, out_meta=meta, trusted_input=True),
-            parent=_main_window())
+        self.status.setText("⏳ Generating {} line(s) in the background — see the activity "
+                            "HUD; the Audio Gallery opens when done.".format(len(lines)))
+
+        def _work():
+            clips = []
+            for n, l in enumerate(lines, 1):
+                if _cancel_requested():
+                    return {"cancelled": True, "clips": clips}
+                h.setLabelText("Seed Audio: line {} of {} ({})…".format(n, len(lines), l["who"]))
+                c = cast_snapshot[l["cast_index"] - 1]
+                vrec = speakers[l["cast_index"] - 1]
+                speaker = (vrec.get("speaker") or "").strip() or None
+                ref_audio = None if speaker else (c["voice"] if os.path.isfile(c["voice"]) else None)
+                stem = "{}_dlg{:02d}_{}".format(tag, n, _safe_name(c["name"])[:16])
+                path, info = _seed_audio(l["text"], speaker=speaker, ref_audio=ref_audio,
+                                         fmt="wav", out_dir=out_dir, stem=stem)
+                secs = float(info.get("original_duration") or info.get("duration") or 0)
+                clips.append({"n": n, "who": c["name"], "cast_index": l["cast_index"],
+                              "text": l["text"], "file": path, "seconds": secs})
+            mix, mix_secs, mix_err = None, 0.0, ""
+            if want_mix and clips:
+                try:
+                    mix = _unique_path(out_dir, "{}_dialogue_mix".format(tag), ext=".wav")
+                    mix_secs = _wav_concat([c["file"] for c in clips], mix, gap)
+                except Exception as e:                         # formats differ etc.
+                    mix, mix_err = None, str(e)
+            record = {"kind": "dialogue", "scene": scene_txt, "gap": gap,
+                      "cast": [{k: c[k] for k in ("name", "gid", "uri", "thumb")}
+                               for c in cast_snapshot],
+                      "lines": clips, "mix": mix, "mix_seconds": mix_secs,
+                      "created": int(time.time())}
+            for c in clips:                                     # every clip knows the scene
+                with open(_dialogue_sidecar_path(c["file"]), "w", encoding="utf-8") as f:
+                    json.dump(dict(record, this_line=c["n"]), f, indent=1)
+            if mix:
+                with open(_dialogue_sidecar_path(mix), "w", encoding="utf-8") as f:
+                    json.dump(record, f, indent=1)
+            return {"cancelled": False, "clips": clips, "mix": mix, "mix_seconds": mix_secs,
+                    "mix_err": mix_err}
+
+        self._worker = _Worker(_work, parent=_main_window())
 
         def _restore():
             h.close()
-            _discard_video_job(worker)
-            self.b_gen.setEnabled(True); self.b_gen.setText("Generate scene")
+            self.b_gen.setEnabled(True); self.b_gen.setText("🎙️ Generate dialogue audio")
 
-        def done(vb):
+        def done(res):
             _restore()
-            vid = _add_video_result(vb, poster, None, prompt=prompt,
-                                    last_frame_url=meta.get("last_frame_url"),
-                                    video_url=meta.get("video_url"))
-            self.status.setText("✅ done — video in the Video Gallery; extracting the "
-                                "dialogue audio…")
-            # The spoken track is also a deliverable: demux it (ffmpeg, off the UI
-            # thread) and file it in the Audio Gallery next to the Seed Audio clips.
-            out_dir, stem = _scene_audio_dir(), _scene_tag()       # main thread: maya.cmds
-            aw = _Worker(lambda: _extract_audio_track(vid, out_dir, stem) if vid else (None, 0),
-                         parent=_main_window())
-
-            def _audio_done(res):
-                apath, secs = res or (None, 0)
-                if apath:
-                    g = _audio_gallery()
-                    g.add_audio(apath, {"duration": secs, "source": "dialogue scene"})
-                    if g.isVisible():
-                        g.raise_()
-                    self.status.setText("✅ done — video in the Video Gallery, dialogue "
-                                        "audio ({:.1f}s) in the Audio Gallery.".format(secs))
-                else:
-                    self.status.setText("✅ done — video in the Video Gallery (no audio "
-                                        "track to extract).")
-
-            aw.done.connect(_audio_done)
-            aw.failed.connect(lambda tb: self.status.setText(
-                "✅ done — video in the Video Gallery (audio extract failed, see Script Editor)."))
-            aw.start()
-            self._aw = aw
+            clips = res.get("clips") or []
+            g = _audio_gallery()
+            if res.get("mix"):
+                g.add_audio(res["mix"], {"duration": res.get("mix_seconds"),
+                                         "source": "dialogue mix"})
+            for c in clips:
+                g.add_audio(c["file"], {"duration": c["seconds"], "source": "dialogue line",
+                                        "who": c["who"]})
+            if res.get("cancelled"):
+                self.status.setText("Cancelled after {} line(s) — those are in the Audio "
+                                    "Gallery.".format(len(clips)))
+                return
+            total = sum(c["seconds"] for c in clips)
+            fits = ("OK for Seedance 2.0 and 2.5" if total <= 15 else
+                    "OK for Seedance 2.5 only (2.0 allows 15 s of audio)" if total <= 30 else
+                    "over 30 s — use the per-line clips across several shots")
+            extra = "  (mixed track skipped: {})".format(res["mix_err"]) if res.get("mix_err") else ""
+            self.status.setText("✅ {} line(s), {:.1f} s of speech → Audio Gallery. {}.{}\n"
+                                "Next: Animate / Video GEN → 🎙️ Dialogue audio."
+                                .format(len(clips), total, fits, extra))
+            g.show(); g.raise_(); g.activateWindow()
 
         def failed(tb):
             _restore()
             self.status.setText("❌ failed")
-            if _OUTPUT_POLICY_MARK in tb or _is_output_policy_error(tb):
-                # The RESULT was flagged -- the trusted characters were accepted.
-                msg = tb[tb.index(_OUTPUT_POLICY_MARK):] if _OUTPUT_POLICY_MARK in tb \
-                    else _explain_output_policy(tb)
-                _error(msg.strip())
-            elif _MODERATION_MARK in tb:
-                _error(tb[tb.index(_MODERATION_MARK):].strip())
-            elif any(s in tb for s in ("SensitiveContent", "PrivacyInformation",
-                                       "real person")):
-                _error("Seedance blocked one of the INPUTS.\n\nDialogue scenes use your "
-                       "Trusted Characters (asset://), which should pass. Re-check "
-                       "that each character's image is ✅ Active in Trusted "
-                       "Characters, and that voice clips are ≤ 15 s.\n\n" + tb[-400:])
-            else:
-                _error("Dialogue scene failed:\n\n" + tb)
+            _error("Dialogue audio failed:\n\n" + tb)
 
-        worker.done.connect(done)
-        worker.failed.connect(failed)
-        _register_video_job(worker)
-        worker.start()
-        _g = _video_gallery_if_open()
-        if _g:
-            _g.add_pending(worker)                    # placeholder if gallery is open
+        self._worker.done.connect(done)
+        self._worker.failed.connect(failed)
+        self._worker.start()
 
 
 def open_dialogue_scene():
@@ -10601,6 +10865,7 @@ class VideoGenDialog(QtWidgets.QDialog):
         self._img_refs = []                           # [{url, path}]
         self._vid_refs = []                           # [{path}]
         self._voice_refs = []                         # cast dicts (name, voice)
+        self._dlg_refs = []                           # Dialogue Audio tracks (sidecar-backed)
         self._worker = None
         v = QtWidgets.QVBoxLayout(self)
 
@@ -10702,13 +10967,20 @@ class VideoGenDialog(QtWidgets.QDialog):
                         ("Remove", lambda: self._rm(self.vid_list, self._vid_refs))):
             b = QtWidgets.QPushButton(lab); b.clicked.connect(fn); vr.addWidget(b)
         vr.addStretch(1); mmv.addLayout(vr)
-        mmv.addWidget(QtWidgets.QLabel("Character voices (≤3 — needs Generate audio):"))
+        self.voice_lbl = QtWidgets.QLabel("Character voices / dialogue audio (needs Generate audio):")
+        mmv.addWidget(self.voice_lbl)
         mmv.addWidget(self.voice_list)
         cr = QtWidgets.QHBoxLayout()
         b_av = QtWidgets.QPushButton("+ Add character"); b_av.clicked.connect(self._add_voice)
+        b_ag = QtWidgets.QPushButton("🎙️ Dialogue audio"); b_ag.clicked.connect(self._add_dialogue_audio)
+        b_ag.setToolTip("Clips made in BYTEPLUS > Dialogue Audio. Seedance speaks them with synced "
+                        "lips (Audio N); the speaker mapping is appended to the prompt for you.")
         b_rv = QtWidgets.QPushButton("Remove")
         b_rv.clicked.connect(lambda: self._rm(self.voice_list, self._voice_refs))
-        cr.addWidget(b_av); cr.addWidget(b_rv); cr.addStretch(1); mmv.addLayout(cr)
+        cr.addWidget(b_av); cr.addWidget(b_ag); cr.addWidget(b_rv); cr.addStretch(1); mmv.addLayout(cr)
+        self.dlg_lbl = QtWidgets.QLabel(""); self.dlg_lbl.setStyleSheet("color:#8bd;")
+        self.dlg_lbl.setWordWrap(True); self.dlg_lbl.hide()
+        mmv.addWidget(self.dlg_lbl)
         v.addWidget(self.grp_mm)
 
         adv = QtWidgets.QHBoxLayout()
@@ -10819,9 +11091,38 @@ class VideoGenDialog(QtWidgets.QDialog):
         self._vid_refs.append({"path": path})
         self.vid_list.addItem(os.path.basename(path))
 
+    def _audio_used(self):
+        """(clips, seconds) of reference audio already attached (voices + dialogue)."""
+        n = len([v for v in self._voice_refs if v.get("voice")]) + len(self._dlg_refs)
+        secs = sum(t["seconds"] for t in self._dlg_refs)
+        for v in self._voice_refs:
+            if v.get("voice"):
+                secs += _video_duration(v["voice"]) or 0
+        return n, secs
+
+    def _add_dialogue_audio(self):
+        n_voices = len([v for v in self._voice_refs if v.get("voice")])
+        v_secs = sum((_video_duration(v["voice"]) or 0) for v in self._voice_refs if v.get("voice"))
+        picked = _pick_dialogue_audio(self, model=self._model_id(),
+                                      already_secs=v_secs, already_count=n_voices)
+        if picked is None:                               # cancelled
+            return
+        self._dlg_refs = picked
+        if picked:
+            self.cb_audio.setChecked(True)
+            self.dlg_lbl.setText("🎙️ Dialogue audio ({} clip(s), {:.1f} s): ".format(
+                len(picked), sum(t["seconds"] for t in picked))
+                + "  ·  ".join(("whole dialogue" if t["kind"] == "mix"
+                                else "{}: “{}”".format(t["who"], t["text"][:40])) for t in picked))
+            self.dlg_lbl.show()
+        else:
+            self.dlg_lbl.hide()
+
     def _add_voice(self):
-        if len(self._voice_refs) >= 3:
-            _error("Up to 3 character voices."); return
+        max_n, _max_s = _dialogue_audio_limits(self._model_id())
+        if self._audio_used()[0] >= max_n:
+            _error("Up to {} reference audio clips on {} (voices + dialogue).".format(
+                max_n, _seedance_name(self._model_id()))); return
         c = _pick_trusted_character(self, exclude=[x.get("gid") for x in self._voice_refs])
         if not c:
             return
@@ -10840,6 +11141,12 @@ class VideoGenDialog(QtWidgets.QDialog):
     # -- mode / model / cost -------------------------------------------------
     def _sync_model(self):
         tier = self.model.currentData()
+        try:
+            _n, _secs = _dialogue_audio_limits(self._model_id())
+            self.voice_lbl.setText("Character voices / dialogue audio (≤{} clips, ≤{} s total — "
+                                   "needs Generate audio):".format(_n, _secs))
+        except Exception:
+            pass
         cur = self.res.currentText()
         self.res.blockSignals(True)
         self.res.clear()
@@ -10940,7 +11247,12 @@ class VideoGenDialog(QtWidgets.QDialog):
             image_sources = [self._resolve(r) for r in self._img_refs][:9]
             image_sources = [s for s in image_sources if s]
             video_srcs = [r["path"] for r in self._vid_refs if r.get("path")][:3]
-            audio_srcs = [v["voice"] for v in self._voice_refs if v.get("voice")][:3]
+            _amax = _dialogue_audio_limits(self._model_id())[0]
+            voice_srcs = [v["voice"] for v in self._voice_refs if v.get("voice")]
+            audio_srcs = (voice_srcs + [t["path"] for t in self._dlg_refs])[:_amax]
+            if self._dlg_refs:                       # bind speakers to Audio positions
+                text = (text + "  " if text else "") + _dialogue_mapping_text(
+                    self._dlg_refs, first_audio_index=len(voice_srcs) + 1)
             if not image_sources and not video_srcs:
                 _error("Multimodal needs at least one image or video reference "
                        "(or switch to Text → Video).")
@@ -14825,10 +15137,11 @@ def install():
                   annotation="Upload an AI character once → a permanent asset:// that "
                              "Seedance trusts forever (no 24h expiry). Reuse it in Animate.",
                   command=_safe(open_trusted_characters))
-    cmds.menuItem(label="Dialogue Scene", parent=CONFIG.MENU_NAME,
+    cmds.menuItem(label="Dialogue Audio", parent=CONFIG.MENU_NAME,
                   image="playblast.png",
-                  annotation="Multi-character spoken dialogue: cast trusted characters "
-                             "+ a script → Seedance video with synced voices (EN/ES/JA/ID/PT)",
+                  annotation="Cast trusted characters + a script → one Seed Audio clip per "
+                             "line in each character's voice (+ a mixed track) → Audio Gallery; "
+                             "then add them in Animate / Video GEN as 🎙️ Dialogue audio",
                   command=_safe(open_dialogue_scene))
     cmds.menuItem(label="Blockout from image  (experimental)", parent=CONFIG.MENU_NAME,
                   image="polyPlane.png",
