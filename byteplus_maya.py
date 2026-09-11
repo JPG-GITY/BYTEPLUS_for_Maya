@@ -1793,23 +1793,61 @@ def _asset_create_group(name, description="", group_type="AIGC"):
     return res.get("Id") or res.get("GroupId") or ""
 
 
-def _asset_list_groups(name=None, page_size=100, max_pages=50):
-    """ALL AIGC groups in the project: ListAssetGroups caps one page at 100 and
-    this shared account has far more, so walk PageNumber until a short page.
-    `name` = the API's (fuzzy) Filter.Name. Raises on failure -- callers must
-    never read 'could not list' as 'no groups'."""
+def _asset_list_groups(name=None, page_size=100, max_pages=10):
+    """AIGC groups in the project matching the API's (fuzzy) Filter.Name, walking
+    PageNumber until a short page. NEVER call this without `name` to build a UI
+    list: a shared account measured 8,645 groups (87 pages at 10 QPS). The
+    dialog lists this install's own groups via _asset_known_groups() instead.
+    Raises on failure -- callers must never read 'could not list' as 'no groups'."""
     out = []
     for page in range(1, max_pages + 1):
         filt = {"GroupType": "AIGC"}
         if name:
             filt["Name"] = name
-        res = _ark_call("ListAssetGroups", {
-            "Filter": filt, "PageNumber": page, "PageSize": page_size})
+        for attempt in range(4):
+            try:
+                res = _ark_call("ListAssetGroups", {
+                    "Filter": filt, "PageNumber": page, "PageSize": page_size})
+                break
+            except _AssetApiError as e:                # 10 QPS flow control
+                if attempt == 3 or not (e.http_status == 429
+                                        or e.code == "AccountFlowLimitExceeded"):
+                    raise
+                time.sleep(1.0 * (attempt + 1))
         items = res.get("Items") or []
         out.extend(items)
         if len(items) < page_size:
             break
     return out
+
+
+def _asset_known_groups():
+    """This install's character groups (the local store), validated against the
+    server in ONE ListAssetGroups call per 50 ids (Filter.GroupIds) so names are
+    current and deleted groups drop out. Returns [{"Id", "Name"}] newest first.
+    Never enumerates the project: on a shared account that is thousands of
+    other people's groups. NETWORK ONLY."""
+    store = _asset_store_load()["groups"]
+    ids = list(store.keys())
+    if not ids:
+        return []
+    live = {}
+    for i in range(0, len(ids), 50):
+        res = _ark_call("ListAssetGroups", {
+            "Filter": {"GroupType": "AIGC", "GroupIds": ids[i:i + 50]},
+            "PageNumber": 1, "PageSize": 50})
+        for g in res.get("Items") or []:
+            gid = g.get("Id") or g.get("GroupId") or ""
+            if gid:
+                live[gid] = g.get("Name") or store.get(gid, {}).get("name") or gid
+    gone = [g for g in ids if g not in live]
+    if gone:                                            # deleted in the console / elsewhere
+        for g in gone:
+            _asset_store_forget(g)
+        sys.stderr.write("[BYTEPLUS] {} character group(s) no longer exist on the "
+                         "server; dropped from the local list.\n".format(len(gone)))
+    return [{"Id": g, "Name": n} for g, n in
+            sorted(live.items(), key=lambda kv: kv[0], reverse=True)]
 
 
 def _asset_create_asset(group_id, url, asset_type="Image", name=""):
@@ -1825,12 +1863,20 @@ def _asset_get(asset_id):
     return _ark_call("GetAsset", {"Id": asset_id, "ProjectName": CONFIG.ASSET_PROJECT})
 
 
-def _asset_list(group_id):
-    res = _ark_call("ListAssets", {
-        "Filter": {"GroupIds": [group_id], "GroupType": "AIGC",
-                   "Statuses": ["Active", "Processing", "Failed"]},
-        "PageNumber": 1, "PageSize": 200})
-    return res.get("Items") or []
+def _asset_list(group_id, page_size=100, max_pages=5):
+    """Assets of ONE group. The server caps PageSize at 100 (measured:
+    InvalidParameter.PageSize), so walk pages until a short one."""
+    out = []
+    for page in range(1, max_pages + 1):
+        res = _ark_call("ListAssets", {
+            "Filter": {"GroupIds": [group_id], "GroupType": "AIGC",
+                       "Statuses": ["Active", "Processing", "Failed"]},
+            "PageNumber": page, "PageSize": page_size})
+        items = res.get("Items") or []
+        out.extend(items)
+        if len(items) < page_size:
+            break
+    return out
 
 
 def _asset_delete(asset_id):
@@ -8509,6 +8555,7 @@ class DreamGallery(QtWidgets.QDialog):
         b_clear = QtWidgets.QPushButton("Clear all")
         b_clear.clicked.connect(self._clear_all)
         b_perm = QtWidgets.QPushButton("🎭 Make permanent")
+        self._b_perm = b_perm
         b_perm.setToolTip("Register this AI character as a PERMANENT trusted asset:// "
                           "(Advanced Creation Rights). It then animates forever with no "
                           "24h expiry and no face rejection.")
@@ -8865,9 +8912,10 @@ class DreamGallery(QtWidgets.QDialog):
         ABCompareDialog(a_src, b_src, "A", "B", parent=self).exec()
 
     def _make_permanent(self):
-        """Register the selected AI character as a PERMANENT trusted asset:// so it
-        animates forever (no 24h expiry, no face rejection). Needs Advanced Creation
-        Rights + AK/SK."""
+        """Register the selected AI character image as a PERMANENT trusted asset://
+        in a character of the user's choosing (or a new one), and report the result
+        IN THIS WINDOW -- a viewport message is hidden behind the gallery and led to
+        triple registrations. Needs Advanced Creation Rights + AK/SK."""
         if not self._current:
             return
         if not _asset_api_ready():
@@ -8875,37 +8923,83 @@ class DreamGallery(QtWidgets.QDialog):
                    "Settings > Storage & Hosting first (needs Advanced Creation Rights).")
             return
         path = self._current.get("path")
-        if _read_asset_sidecar(path):
-            cmds.inViewMessage(amg="Already a permanent trusted character.",
-                               pos="midCenter", fade=True)
+        prev = _read_asset_sidecar(path)
+        if prev:
+            _msgbox(QtWidgets.QMessageBox.Information, "Already permanent",
+                    "This image is already a permanent trusted character:\n{}\n\n"
+                    "Use it in Animate → 🎭 Trusted character.".format(prev))
             return
         url = self._current.get("url")
         src = url if (url and _url_is_fresh(url)) else path
         if not src:
             _error("This image has no fresh URL or local file to register.")
             return
-        name = os.path.splitext(os.path.basename(path or "character"))[0][:40]
-        cmds.inViewMessage(amg="Registering permanent trusted character…",
-                           pos="midCenter", fade=True)
-        w = _Worker(lambda: _auto_register_asset(src, name=name), parent=_main_window())
+        # --- which character? (existing from this install, or a new one) ---------
+        store = _asset_store_load()["groups"]
+        auto_name = _auto_trust_group_name()
+        groups = sorted(((g.get("name") or gid), gid) for gid, g in store.items())
+        groups = [x for x in groups if x[0] != auto_name] + [x for x in groups if x[0] == auto_name]
+        NEW = "➕ New character…"
+        labels = [n for n, _g in groups] + [NEW]
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self, "Make permanent", "Add this image to which character?",
+            labels, 0, False)
+        if not ok or not choice:
+            return
+        gid, gname = "", ""
+        if choice == NEW:
+            gname, ok = QtWidgets.QInputDialog.getText(
+                self, "New character", "Character name (e.g. 'Alice - kitchen maid'):")
+            gname = (gname or "").strip()
+            if not ok or not gname:
+                return
+        else:
+            gid, gname = dict((n, g) for n, g in groups)[choice], choice
+        stem = os.path.splitext(os.path.basename(path or "character"))[0][:40]
+        self._b_perm.setEnabled(False); self._b_perm.setText("⏳ Registering…")
 
-        def done(uri):
-            if uri and path:
+        def _work():
+            g = gid or _asset_create_group(gname)
+            if not g:
+                raise RuntimeError("CreateAssetGroup returned no id")
+            _asset_store_group(g, gname)
+            res = _asset_add_and_wait(g, src, name=stem)
+            if res.get("id"):
+                _asset_store_asset(g, res["id"], name=stem, thumb=path or "",
+                                   status=res.get("status") or "Processing")
+            res["gid"], res["gname"] = g, gname
+            return res
+
+        def _finish():
+            self._b_perm.setEnabled(True); self._b_perm.setText("🎭 Make permanent")
+
+        def done(res):
+            _finish()
+            st = res.get("status")
+            if st == "Active":
                 try:
-                    with open(path + ".asset", "w") as f:
-                        f.write(uri)
+                    with open((path or "") + ".asset", "w") as f:
+                        f.write(res["uri"])
                 except OSError:
                     pass
-                cmds.inViewMessage(amg="✅ Now a <hl>permanent trusted character</hl> "
-                                   "— animate forever, no 24h.", pos="midCenter", fade=True)
+                _msgbox(QtWidgets.QMessageBox.Information, "Permanent trusted character",
+                        "✅ Added to '{}' as a permanent trusted image.\n\n{}\n\nUse it in "
+                        "Animate → 🎭 Trusted character, or manage it in BYTEPLUS > "
+                        "Trusted Characters.".format(res["gname"], res["uri"]))
+            elif st == "Failed":
+                _error("❌ '{}' rejected this image: {}\n\nThe asset library wants a valid "
+                       "virtual-human portrait; real human faces are never allowed."
+                       .format(res["gname"], res.get("error") or "moderation failed"))
             else:
-                _error("Could not make it permanent — the asset library wants a valid "
-                       "virtual-human portrait, or preprocessing failed (Status "
-                       "Failed). Real human faces are never allowed.")
+                _msgbox(QtWidgets.QMessageBox.Information, "Still processing",
+                        "⏳ Added to '{}' but still processing ({}).\n\nCheck ↻ Status in "
+                        "BYTEPLUS > Trusted Characters in a moment.".format(res["gname"], res["uri"]))
 
         def fail(tb):
+            _finish()
             _error("Make-permanent failed.\n\n" + _asset_error_hint(tb))
 
+        w = _Worker(_work, parent=_main_window())
         w.done.connect(done); w.failed.connect(fail); w.start()
         self._perm_worker = w
 
@@ -9115,14 +9209,38 @@ def open_gallery():
 # =============================================================================
 
 def _trusted_dream_items():
-    """Dream Gallery items if the gallery is open, else []."""
+    """Dream Gallery items: the open gallery's list, else the current scene's
+    images folder scanned with the gallery's own rules (*dream*.png, skipping
+    ref/anim inputs and hidden files) -- so '+ From gallery' works without the
+    gallery window being open. Newest first."""
     g = getattr(_dream_gallery, "_inst", None)
-    if g is None:
-        return []
+    if g is not None:
+        try:
+            items = list(g._items)
+            if items:
+                return items
+        except Exception:
+            pass
+    import glob
+    out, hidden, scene = [], _load_hidden(), _scene_tag()
     try:
-        return list(g._items)
+        files = sorted(glob.glob(os.path.join(_scene_images_dir(), "*dream*.png")),
+                       key=os.path.getmtime, reverse=True)
     except Exception:
-        return []
+        files = []
+    for f in files:
+        base = os.path.basename(f)
+        tail = base[len(scene):] if base.startswith(scene) else base
+        if "ref" in tail or "anim" in tail or f in hidden:
+            continue
+        try:
+            with open(f, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        out.append({"bytes": data, "path": f, "url": _read_url_sidecar(f),
+                    "prompt": _read_prompt_sidecar(f)})
+    return out
 
 
 class TrustedCharacterDialog(QtWidgets.QDialog):
@@ -9162,7 +9280,13 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
         b_refg = QtWidgets.QPushButton("↻")
         b_refg.setFixedWidth(32)
         b_refg.clicked.connect(self._refresh_groups)
+        b_find = QtWidgets.QPushButton("🔍 Find…")
+        b_find.setToolTip("Bring in a character group that exists in the project but was "
+                          "created elsewhere (console, another machine): search by name, "
+                          "pick one. Only what you pick is loaded -- never the whole project.")
+        b_find.clicked.connect(self._find_group)
         gb.addWidget(b_new)
+        gb.addWidget(b_find)
         gb.addWidget(b_delg)
         gb.addWidget(b_refg)
 
@@ -9259,7 +9383,7 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
         if not _asset_api_ready():
             return
         self._set_status("Loading characters…")
-        self._run(_asset_list_groups, self._on_groups)
+        self._run(_asset_known_groups, self._on_groups)
 
     def _on_groups(self, items):
         self.groups.clear()
@@ -9267,7 +9391,8 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
         for it in (items or []):
             gid = it.get("Id") or it.get("GroupId") or ""
             name = it.get("Name") or it.get("Title") or (store.get(gid, {}).get("name")) or gid
-            _asset_store_group(gid, name)
+            if store.get(gid, {}).get("name") != name:   # only refresh a known name
+                _asset_store_group(gid, name)
             w = QtWidgets.QListWidgetItem(name)
             w.setData(QtCore.Qt.UserRole, gid)
             self.groups.addItem(w)
@@ -9298,6 +9423,65 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
             self._set_status("❌ create failed (see dialog).")
 
         self._run(_make, _done, _fail)
+
+    def _find_group(self):
+        """Selective import: server-side fuzzy search by name (Filter.Name, at most
+        2 pages), then the user picks ONE group to add to the local list. This is
+        the only way other people's / console-made groups enter the dialog."""
+        if not self._require_api():
+            return
+        q = self._ask_text("Find a character in the project",
+                           "Part of the group name (server-side search):")
+        if not q or not q.strip():
+            return
+        q = q.strip()
+        self._set_status("Searching '{}'…".format(q))
+
+        def _search():
+            return _asset_list_groups(name=q, max_pages=2)
+
+        def _pick(items):
+            items = [i for i in (items or []) if (i.get("Id") or i.get("GroupId"))]
+            if not items:
+                self._set_status("No group in the project matches '{}'.".format(q))
+                return
+            known = _asset_store_load()["groups"]
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("Pick a character group")
+            dlg.setMinimumSize(520, 360)
+            lay = QtWidgets.QVBoxLayout(dlg)
+            lay.addWidget(QtWidgets.QLabel(
+                "{} match(es) for '{}' -- double-click ONE to add it to your list."
+                .format(len(items), q)))
+            lw = QtWidgets.QListWidget()
+            for it in items:
+                gid = it.get("Id") or it.get("GroupId")
+                row = QtWidgets.QListWidgetItem("{}   ·   {}   ·   {}{}".format(
+                    it.get("Name") or gid, (it.get("CreateTime") or "")[:10], gid,
+                    "   (already in your list)" if gid in known else ""))
+                row.setData(QtCore.Qt.UserRole, (gid, it.get("Name") or gid))
+                lw.addItem(row)
+            lay.addWidget(lw, 1)
+            chosen = {}
+
+            def _accept(row):
+                chosen["g"] = row.data(QtCore.Qt.UserRole)
+                dlg.accept()
+
+            lw.itemDoubleClicked.connect(_accept)
+            bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel)
+            bb.rejected.connect(dlg.reject)
+            lay.addWidget(bb)
+            dlg.exec()
+            if chosen.get("g"):
+                gid, name = chosen["g"]
+                _asset_store_group(gid, name)
+                self._refresh_groups()
+                self._set_status("Added '{}' to your list.".format(name))
+            else:
+                self._set_status("")
+
+        self._run(_search, _pick)
 
     def _del_group(self):
         gid = self._group_id
@@ -9361,7 +9545,8 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
             return
         items = _trusted_dream_items()
         if not items:
-            _error("Open the Dream Gallery (with images) first, or use + From file.")
+            _error("No Dream images found for this scene ({}).\n\nGenerate one with "
+                   "BYTEPLUS > Dream, or use + From file.".format(_scene_images_dir()))
             return
         picked = _pick_gallery_image(items, self, warn_trust=False)
         if not picked:
