@@ -1,7 +1,81 @@
 # Changelog — BYTEPLUS for Maya
 
-All user-facing changes, newest first. `USER_GUIDE.md` is the canonical guide;
-`USER_GUIDE.html` / `.docx` are older snapshots and will be regenerated.
+All user-facing changes, newest first. `dist/USER_GUIDE.md` is the canonical
+guide; `dist/USER_GUIDE.html` / `.docx` are generated from it, and the root
+`USER_GUIDE.md` is only a pointer. The client-facing release notes ship as
+`dist/WHATS_NEW.md` (no internal file names or lab notes there).
+
+## 2.02 — 2026-09-15
+
+Client release **2.02 (Technology Preview)**. It includes everything since 2.01
+(2026-07-17), and the dated sections below have the details. Packages:
+`BYTEPLUS_for_Maya_2.02_Windows.zip` and `BYTEPLUS_for_Maya_2.02_macOS.zip` (same
+plugin, docs and `BYTEPLUS/lib`; only the bundled ffmpeg differs). Requires Maya
+2025+ (Python 3.10+).
+
+- **Seedance 2.5 support**: model picker in Settings and Video GEN, 4–30 s,
+  **480p / 720p only** (1080p/4K requests step down to 720p), base-mesh mode for
+  playblasts, `mov` output, model-aware resolution/duration lists. Seedance 2.0
+  keeps 480p / 720p / 1080p / 4K (4–15 s).
+- **Corporate VPN / proxy**: macOS keychain certificates are trusted (SSL fix),
+  and gzip-compressed API responses (including error bodies) are decoded.
+- **Seed 3D**: default model id `hyper3d-gen2-260112`; a saved
+  `Hyper3d-Rodin-Gen2` (404) is migrated automatically.
+- **Trusted Characters**:
+  - temporary STS credentials (Session token fields for TOS and the Asset
+    Library), with a clear message when they expire;
+  - the list shows only this install's characters, and **🔍 Find…** imports one
+    by name;
+  - Dream Gallery **🎭 Make permanent** asks which character, shows progress and
+    confirms;
+  - error messages are driven by the server's error code.
+- **Trusted Characters robustness (new in 2.02)**:
+  - deleting an image or character invalidates its saved permanent links;
+  - a Seedance "The specified asset … is not found" error makes the plugin forget
+    the asset and say so, with no doomed retry;
+  - images are checked before upload against the documented Asset Library limits
+    (JPEG/PNG/WEBP/BMP/TIFF/GIF/HEIC/HEIF, 300–6000 px per side, aspect ratio
+    0.4–2.5, < 30 MB);
+  - a made-permanent image picked as an extra reference is sent as its
+    `asset://`;
+  - reopening Trusted Characters after adding keys refreshes the list;
+  - *Auto-make Extend last frames permanent* (renamed from "Auto-make faces I use
+    permanent") runs only with Asset Library keys, or with the TOS-key fallback
+    once a Trusted Character exists, and never registers the same last frame twice;
+  - picking 🎭 Trusted character in Animate makes Analyze/Compose describe that
+    character.
+
+  Known limitation: the Asset Library project stays `default` (not configurable).
+- **Seed Audio**: generation runs as an activity-HUD job; the new **Audio
+  Gallery** opens by itself when the clip is ready.
+- **Dialogue Audio** (replaces Dialogue Scene): per-line Seed Audio clips plus a
+  mixed track, attached in Animate / Video GEN as **🎙️ Dialogue audio** (2.0: 3
+  clips / 15 s; 2.5: 10 clips / 30 s). The clips are local files and need motion
+  hosting (R2 or TOS).
+- **Motion hosting**: the **BytePlus TOS Python SDK is bundled** in
+  `BYTEPLUS/lib` (tos 2.9.2 + requests, urllib3, idna, charset-normalizer,
+  certifi, wrapt, Deprecated, pytz, crcmod, six), so there is nothing to pip
+  install, and a user-installed `tos` wins. TOS falls back to R2 on upload
+  failure.
+- **macOS ffmpeg lookup**: no ffmpeg is bundled for macOS (the only static build
+  available was x86_64 and does not run on Apple Silicon without Rosetta). The
+  plugin now finds Homebrew / MacPorts ffmpeg even when Maya is opened from the
+  Dock (minimal PATH), and a bundled binary is only used if it actually runs.
+- **License fixes**:
+  - the Windows ffmpeg notice now correctly says **LGPL-3.0-or-later** (build
+    N-125350-g3f6bf150cb-20260629, sha256 pinned);
+  - README and NOTICE list the bundled Python libraries with their licenses;
+  - NOTICE mentions Seed Audio.
+- **Docs**:
+  - `dist/USER_GUIDE.md` merged into one v2.02 guide;
+  - new `dist/WHATS_NEW.md`;
+  - README gains a "What's new in 2.02" section;
+  - Diagnostics is documented as opt-in (*Settings > Analytics & Webhook >
+    Developer mode*).
+- Also since 2.01: content-moderation diagnostics, honest output-policy errors
+  (`OutputVideoSensitiveContentDetected` is no longer blamed on your inputs),
+  empty-gallery hints, and VideoPilot retired (Edit video / Extend run on
+  Seedance video-to-video).
 
 ## 2026-09-11
 
@@ -90,7 +164,6 @@ All user-facing changes, newest first. `USER_GUIDE.md` is the canonical guide;
 
 ### Under the hood
 - Preferences and the local character store are written atomically.
-- Seedance 2.5 now accepts **1080p**; the resolution list follows the model.
 
 ## 2026-08-07
 - Seedance 2.5 support (model picker, 4–30 s, base-mesh mode for playblasts,

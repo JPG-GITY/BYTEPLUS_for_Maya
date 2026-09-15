@@ -1,0 +1,116 @@
+Metadata-Version: 2.4
+Name: tos
+Version: 2.9.2
+Summary: Volc TOS (Tinder Object Storage) SDK
+Home-page: https://www.volcengine.com/
+Author: sunyushan
+Author-email: sunyushan.jason@bytedance.com
+Keywords: boilerplate
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3.5
+Classifier: Programming Language :: Python :: 3.6
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: wrapt==1.16.0
+Requires-Dist: Deprecated<2.0.0,>=1.2.13
+Requires-Dist: pytz
+Requires-Dist: requests==2.*,>=2.19.1
+Requires-Dist: crcmod>=1.7
+Requires-Dist: six
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary
+
+
+# Volcengine TOS SDK for Python
+The TOS Python SDK enables Python developers to easily work with TOS(Tinder Object Storage) service in the volcengine.
+This document will show developers some basic examples about TOS bucket and object operation.
+
+
+## Install
+### Requirements
+- Python3
+# Quick Start
+
+This section introduces how to create a bucket, upload/download/delete an object in TOS service through our SDK.
+
+## Create a TOS Client
+
+You can interact with TOS service after initiating a TOSClient instance.
+The accesskey and secretkey of your account, endpoint and region are required as params.
+
+```python
+import tos
+
+ak = "your access key"
+sk = "your secret key"
+endpoint = "your endpoint"
+region = "your region"
+bucket_name = "your bucket name"
+object_key = "your object key"
+client = tos.TosClientV2(ak, sk, endpoint, region)     
+```
+
+## Create a bucket
+
+The bucket is a kind of unique namespace in TOS, which is a container to store data.
+This example shows you how to create a bucket.
+
+```python
+import tos
+
+ak = "your access key"
+sk = "your secret key"
+endpoint = "your endpoint"
+region = "your region"
+bucket_name = "your bucket name"
+client = tos.TosClientV2(ak, sk, endpoint, region)
+client.create_bucket(bucket_name)                            
+```
+
+## Put Object
+
+You can put your file as an object into your own bucket.
+
+```python
+# call put_object to upload you data to the TOS                     
+client.put_object(bucket_name, object_key, content="123")
+assert resp.status_code == 200       
+```
+## Get Object
+You can download objects in the TOS bucket through our SDK.
+
+```python
+# call get_object to download your data from your bucket
+client.get_object(bucket_name, object_key)
+```
+
+## Delete Object
+
+Your can delete your objects in the bucket：
+
+```python
+# call put_object to upload you data to the TOS  
+resp = client.put_object(bucket_name, key_name, content="123")
+assert resp.status_code == 200   
+# call delete_object to delete an object in your bucket
+resp = client.delete_object(bucket_name, key_name)
+assert resp.status_code == 204
+```
+
+## Security and privacy
+This project takes security seriously.
+For vulnerability reporting and supported versions, see [SECURITY.md](SECURITY.md)
+
+## License
+[Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0.html)

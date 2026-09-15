@@ -14,6 +14,18 @@ __pycache__/
 # Bundled third-party binary: exceeds GitHub's 100 MB file limit.
 # Re-bundle the LGPL ffmpeg build into dist/ when packaging.
 dist/BYTEPLUS/bin/win/ffmpeg.exe
+# macOS ffmpeg (evermeet static, ~80 MB): staged outside the repo, never committed.
+dist/BYTEPLUS/bin/mac/ffmpeg
+
+# tools/package.py output (zips + SHA256SUMS.txt)
+build/
+
+# Vendored TOS SDK must stay pure-Python (cross-platform): never commit
+# compiled extensions or bytecode produced by a local import.
+dist/BYTEPLUS/lib/**/*.so
+dist/BYTEPLUS/lib/**/*.pyd
+dist/BYTEPLUS/lib/**/*.dylib
+dist/BYTEPLUS/lib/**/__pycache__/
 
 # Editor / OS noise
 .vscode/

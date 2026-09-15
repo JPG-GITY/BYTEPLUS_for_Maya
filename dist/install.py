@@ -11,7 +11,7 @@ This installer will:
   - load BYTEPLUS now so you can use it immediately.
 
 Re-dragging the file upgrades an existing install in place.
-Works on Maya 2022-2027 (Windows / macOS).  Uninstall steps are in README.txt.
+Works on Maya 2025 or newer (Windows / macOS).  Uninstall steps are in README.txt.
 """
 
 import os

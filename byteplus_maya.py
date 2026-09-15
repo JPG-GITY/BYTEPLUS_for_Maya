@@ -246,8 +246,8 @@ class CONFIG:
     # --- BytePlus TOS object storage (optional) -------------------------------
     # When configured, large refs are uploaded to TOS and passed as pre-signed
     # GET URLs instead of base64 data URIs -- avoids the 64 MB body / HTTP 413
-    # ceiling. Requires the official `tos` SDK (pip install tos into Maya's
-    # interpreter). If unset or the SDK is missing, falls back to base64.
+    # ceiling. Uses the official `tos` SDK: a user pip install wins, else the
+    # pure-Python copy bundled in <module>/lib. If unset, falls back to base64.
     USE_TOS = False
     # Credentials: prefer values entered in Settings, else the env vars below.
     TOS_AK = ""
@@ -302,7 +302,7 @@ class CONFIG:
     CALLBACK_URL = ""
 
     # --- App / preview --------------------------------------------------------
-    VERSION = "2.01 (Technology Preview)"
+    VERSION = "2.02 (Technology Preview)"
     BUG_EMAIL = "john.giancarlo@bytedance.com"          # temporary bug reports
 
     # --- Color management (Arnold/OCIO) ---------------------------------------
@@ -1393,15 +1393,111 @@ def _tos_creds() -> tuple:
             os.environ.get(CONFIG.TOS_TOKEN_ENV, "").strip())
 
 
-def _tos_available() -> bool:
-    """True if TOS can actually be used (SDK installed + AK/SK + bucket). Used to
-    warn the user up front when the motion playblast will be skipped."""
+# requests 2.34 / urllib3 2.7 in the bundled <module>/lib need Python 3.10+.
+_BUNDLED_TOS_MIN_PY = (3, 10)
+
+
+def _import_tos():
+    """Return the official `tos` SDK module. The user's own install wins (pip install
+    tos into Maya's Python); otherwise the pure-Python copy shipped in <module>/lib
+    (tos + requests, urllib3, idna, charset-normalizer, certifi, wrapt, Deprecated,
+    pytz, crcmod, six). That folder is APPENDED to sys.path -- never prepended -- so
+    packages the user or Maya already has keep priority."""
     try:
-        import tos  # noqa: F401
+        import tos
+        return tos
+    except Exception:
+        pass
+    if sys.version_info < _BUNDLED_TOS_MIN_PY:
+        raise ImportError("The bundled TOS SDK needs Python 3.10+ (Maya 2024 or newer); "
+                          "install it into Maya's Python instead: mayapy -m pip install tos")
+    here = os.path.dirname(os.path.abspath(__file__))
+    for lib in (os.path.normpath(os.path.join(here, "..", "lib")),
+                os.path.join(here, "lib")):
+        if os.path.isdir(os.path.join(lib, "tos")):
+            if lib not in sys.path:
+                sys.path.append(lib)
+            break
+    else:
+        raise ImportError("TOS SDK not found: not installed in Maya's Python and not "
+                          "bundled in the plugin's lib folder.")
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")               # tos/utils.py: invalid escape seq
+        import tos
+    return tos
+
+
+_TOS_CA_PATH = None
+
+
+def _tos_ca_bundle():
+    """macOS behind a TLS-inspecting VPN: the tos SDK verifies with certifi only, not
+    the keychain, so hand it certifi + the keychain CAs as one PEM file -- the same
+    trust _ssl_context() already gives every other call. Only certificates that
+    parse are kept (one odd keychain entry must not break every upload); the file is
+    named by its content hash and written once via os.replace, so concurrent
+    uploads never read a half-written file. None when there is nothing extra to
+    trust. Only a definitive answer is cached: a failed write is retried next call,
+    and a cached file that was since removed (temp cleaner) is rebuilt."""
+    global _TOS_CA_PATH
+    if _TOS_CA_PATH == "" or (_TOS_CA_PATH and os.path.isfile(_TOS_CA_PATH)):
+        return _TOS_CA_PATH or None
+    extra = _os_trust_ca_pem()
+    if not extra:
+        _TOS_CA_PATH = ""
+        return None
+    good = []
+    for block in re.findall(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----",
+                            extra, re.S):
+        try:
+            ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=block)
+            good.append(block)
+        except Exception:
+            pass
+    if not good:
+        _TOS_CA_PATH = ""
+        return None
+    try:
+        import certifi
+        with open(certifi.where(), encoding="utf-8") as f:
+            base = f.read()
+    except Exception:
+        base = ""
+    data = base.rstrip() + "\n" + "\n".join(good) + "\n"
+    digest = hashlib.sha1(data.encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(tempfile.gettempdir(), "byteplus_tos_ca_%s.pem" % digest)
+    tmp = None
+    try:
+        if not os.path.isfile(path):
+            fd, tmp = tempfile.mkstemp(prefix="byteplus_tos_ca_", suffix=".tmp",
+                                       dir=os.path.dirname(path))
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        _TOS_CA_PATH = path
+        return path
+    except OSError:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return None                              # not cached: retried on the next upload
+
+
+def _tos_available() -> bool:
+    """True if TOS can actually be used (AK/SK + bucket + the SDK loads). Used to
+    warn the user up front when the motion playblast will be skipped. Keys are
+    checked first so an unconfigured TOS never pays for importing the SDK."""
+    ak, sk, _tok = _tos_creds()
+    if not (ak and sk and CONFIG.TOS_BUCKET):
+        return False
+    try:
+        _import_tos()
     except Exception:
         return False
-    ak, sk, _tok = _tos_creds()
-    return bool(ak and sk and CONFIG.TOS_BUCKET)
+    return True
 
 
 def _tos_upload_presigned(path: str) -> str:
@@ -1409,13 +1505,16 @@ def _tos_upload_presigned(path: str) -> str:
     Uses the official `tos` SDK so signing/region handling is correct (a temporary
     STS session token, if set, rides as X-Tos-Security-Token). Raises if the SDK
     or config is missing -- the caller falls back to base64."""
-    import tos  # official BytePlus TOS SDK: pip install tos
+    tos = _import_tos()  # official BytePlus TOS SDK: user install, else bundled <module>/lib
     ak, sk, tok = _tos_creds()
     if not (ak and sk and CONFIG.TOS_BUCKET):
         raise RuntimeError("TOS not fully configured (AK/SK + bucket).")
 
-    client = tos.TosClientV2(ak, sk, CONFIG.TOS_ENDPOINT, CONFIG.TOS_REGION,
-                             security_token=(tok or None))
+    kw = {"security_token": (tok or None)}
+    ca = _tos_ca_bundle()
+    if ca:
+        kw["ca_crt"] = ca
+    client = tos.TosClientV2(ak, sk, CONFIG.TOS_ENDPOINT, CONFIG.TOS_REGION, **kw)
     key = "maya/{}/{}".format(int(time.time()), os.path.basename(path))
     client.put_object_from_file(CONFIG.TOS_BUCKET, key, path)
     signed = client.pre_signed_url(
@@ -1943,7 +2042,13 @@ def _asset_add_and_wait(group_id, src, name="", poll_timeout=900, poll_interval=
             continue
         status = (res.get("Status") or "").strip() or "Processing"
         final_url = res.get("URL") or final_url
-        err = res.get("Error") or res.get("ErrorMessage") or res.get("Message") or ""
+        err = (res.get("Error") or res.get("ErrorMessage") or res.get("Message")
+               or res.get("Reason") or "")
+        if isinstance(err, dict):
+            err = err.get("Message") or err.get("Code") or json.dumps(err)
+        if status == "Failed" and not err:                # field is undocumented: log it
+            sys.stderr.write("[BYTEPLUS] GetAsset Failed payload: {}\n".format(
+                json.dumps(res)[:800]))
         if status in ("Active", "Failed"):
             try:
                 cleanup()                            # terminal: the server is done with the URL
@@ -2010,45 +2115,97 @@ def _asset_store_thumb(uri_or_id) -> str:
 
 
 def _asset_store_group(group_id, name):
-    data = _asset_store_load()
-    g = data["groups"].setdefault(group_id, {"name": name, "assets": {}})
-    g["name"] = name or g.get("name") or group_id
-    _asset_store_save(data)
+    with _STORE_LOCK:                                 # load+save atomic (RLock)
+        data = _asset_store_load()
+        g = data["groups"].setdefault(group_id, {"name": name, "assets": {}})
+        g["name"] = name or g.get("name") or group_id
+        _asset_store_save(data)
 
 
 def _asset_store_asset(group_id, asset_id, name="", thumb="", status="Processing"):
-    data = _asset_store_load()
-    g = data["groups"].setdefault(group_id, {"name": group_id, "assets": {}})
-    a = g.setdefault("assets", {}).setdefault(asset_id, {})
-    a["name"] = name or a.get("name") or ""
-    if thumb:
-        a["thumb"] = thumb
-    a["status"] = status
-    _asset_store_save(data)
+    with _STORE_LOCK:
+        data = _asset_store_load()
+        g = data["groups"].setdefault(group_id, {"name": group_id, "assets": {}})
+        a = g.setdefault("assets", {}).setdefault(asset_id, {})
+        a["name"] = name or a.get("name") or ""
+        if thumb:
+            a["thumb"] = thumb
+        a["status"] = status
+        _asset_store_save(data)
 
 
-def _asset_store_forget(group_id, asset_id=None):
-    data = _asset_store_load()
-    if asset_id is None:
-        data["groups"].pop(group_id, None)
-    else:
-        g = data["groups"].get(group_id)
-        if g:
-            g.get("assets", {}).pop(asset_id, None)
-    _asset_store_save(data)
+def _asset_store_forget(group_id, asset_id=None, tombstone=False):
+    """Drop a group (asset_id None) or one asset from the local store. tombstone=True
+    (a real server-side delete) also remembers the ids as deleted, so saved permanent
+    links (<image>.asset, <video>.lastframe.json) pointing at them are ignored."""
+    with _STORE_LOCK:
+        data = _asset_store_load()
+        grp = data["groups"].get(group_id) or {}
+        ids = list((grp.get("assets") or {}).keys()) if asset_id is None else [asset_id]
+        if asset_id is None:
+            data["groups"].pop(group_id, None)
+        elif grp:
+            grp.get("assets", {}).pop(asset_id, None)
+        if tombstone and ids:
+            data["deleted"] = sorted(set(data.get("deleted") or []) | set(ids))
+        _asset_store_save(data)
+
+
+def _asset_is_deleted(uri_or_id) -> bool:
+    aid = str(uri_or_id or "").replace("asset://", "", 1)
+    return bool(aid) and aid in (_asset_store_load().get("deleted") or [])
+
+
+def _asset_forget_dead(ids):
+    """The server says these assets no longer exist: drop them from every group and
+    tombstone them, in one load/save."""
+    ids = [str(i).replace("asset://", "", 1) for i in (ids or []) if i]
+    if not ids:
+        return
+    with _STORE_LOCK:
+        data = _asset_store_load()
+        for g in data["groups"].values():
+            for i in ids:
+                (g.get("assets") or {}).pop(i, None)
+        data["deleted"] = sorted(set(data.get("deleted") or []) | set(ids))
+        _asset_store_save(data)
+
+
+def _asset_undelete(ids):
+    """The server lists these ids, so they exist: drop any stale tombstone."""
+    ids = set(str(i).replace("asset://", "", 1) for i in (ids or []) if i)
+    if not ids:
+        return
+    with _STORE_LOCK:
+        data = _asset_store_load()
+        dead = set(data.get("deleted") or [])
+        if dead & ids:
+            data["deleted"] = sorted(dead - ids)
+            _asset_store_save(data)
+
+
+# Seedance's synchronous 400 for a deleted/unknown asset:// (measured 2026-09-11).
+_DEAD_ASSET_RE = re.compile(r"specified asset (asset-[A-Za-z0-9-]+) is not found")
+_DEAD_ASSET_MARK = "A trusted character asset no longer exists"
+_AUTO_TRUST_INFLIGHT = set()                      # .lastframe.json paths being registered
+
+
+def _dead_asset_ids(text):
+    return sorted(set(_DEAD_ASSET_RE.findall(str(text or ""))))
 
 
 def _asset_store_set_voice(group_id, voice):
     """Attach (voice=dict) or clear (voice=None) a character's voice. A voice dict:
     {path, speaker, source, name, uri}. `speaker` set -> reuse that voice id; else
     the clip at `path` is the reference audio to reuse (consistency)."""
-    data = _asset_store_load()
-    g = data["groups"].setdefault(group_id, {"name": group_id, "assets": {}})
-    if voice:
-        g["voice"] = voice
-    else:
-        g.pop("voice", None)
-    _asset_store_save(data)
+    with _STORE_LOCK:
+        data = _asset_store_load()
+        g = data["groups"].setdefault(group_id, {"name": group_id, "assets": {}})
+        if voice:
+            g["voice"] = voice
+        else:
+            g.pop("voice", None)
+        _asset_store_save(data)
 
 
 def _asset_group_voice(group_id):
@@ -2126,12 +2283,46 @@ def _auto_register_asset(src, name="", asset_type="Image"):
     return None
 
 
+_ASSET_IMG_FORMATS = {"jpeg", "jpg", "png", "webp", "bmp", "tif", "tiff", "gif",
+                      "heic", "heif"}
+
+
+def _asset_image_problem(path) -> str:
+    """'' if a local image fits the documented Asset Library limits, else the reason:
+    JPEG/PNG/WEBP/BMP/TIFF/GIF/HEIC/HEIF, each side 300-6000 px, aspect ratio
+    0.4-2.5, under 30 MB. MAIN THREAD (QImageReader). Without this a bad image makes
+    a server round trip and comes back as a vague 'Failed'."""
+    if not path or not os.path.isfile(path):
+        return "The image file was not found."
+    mb = os.path.getsize(path) / 1048576.0
+    if mb >= 30:
+        return "It is {:.1f} MB; the Asset Library accepts images under 30 MB.".format(mb)
+    r = QtGui.QImageReader(path)
+    fmt = bytes(r.format()).decode("ascii", "ignore").lower()
+    if not fmt and os.path.splitext(path)[1].lower() in (".heic", ".heif"):
+        return ""                                     # this Qt can't decode HEIF: server decides
+    if fmt not in _ASSET_IMG_FORMATS:
+        return ("Unsupported format ({}). Use JPEG, PNG, WEBP, BMP, TIFF, GIF, HEIC or "
+                "HEIF.".format(fmt or "unknown"))
+    size = r.size()
+    if not size.isValid():
+        return "The image could not be read."
+    w, h = size.width(), size.height()
+    if not (300 <= w <= 6000 and 300 <= h <= 6000):
+        return "It is {}x{} px; each side must be between 300 and 6000 px.".format(w, h)
+    ratio = w / float(h)
+    if not (0.4 <= ratio <= 2.5):
+        return ("Its aspect ratio is {:.2f}; it must be between 0.4 (tall) and 2.5 "
+                "(wide).".format(ratio))
+    return ""
+
+
 def _read_asset_sidecar(path):
     """The permanent asset://<id> registered for a local image (or None)."""
     try:
         with open(str(path) + ".asset") as f:
             u = f.read().strip()
-        return u if u.startswith("asset://") else None
+        return u if (u.startswith("asset://") and not _asset_is_deleted(u)) else None
     except OSError:
         return None
 
@@ -3286,6 +3477,48 @@ def _playblast_formats() -> list:
     return [("qt", "H.264", ".mov"), ("webm", "VP9", ".webm"), ("avi", None, ".avi")]
 
 
+_FFMPEG_RUNS = {}
+
+
+def _bundled_ffmpeg_runs(path):
+    """A bundled binary must actually start. The macOS build is x86_64, so on Apple
+    Silicon without Rosetta it cannot run; a downloaded zip may also carry the
+    quarantine flag or lose the exec bit. Then fall back to ffmpeg on PATH (e.g.
+    Homebrew). Windows builds are native. Checked once per session."""
+    if path in _FFMPEG_RUNS:
+        return _FFMPEG_RUNS[path]
+    ok = True
+    if sys.platform == "darwin":
+        import subprocess
+
+        def _try():
+            try:
+                r = subprocess.run([path, "-hide_banner", "-version"],
+                                   capture_output=True, timeout=8)
+                return r.returncode == 0
+            except Exception:
+                return False
+        try:
+            if not os.access(path, os.X_OK):
+                os.chmod(path, 0o755)
+        except OSError:
+            pass
+        ok = _try()
+        if not ok:                                   # our own shipped binary: clear the
+            try:                                     # download quarantine once and retry
+                subprocess.run(["/usr/bin/xattr", "-d", "com.apple.quarantine", path],
+                               capture_output=True, timeout=10)
+            except Exception:
+                pass
+            ok = _try()
+        if not ok:
+            sys.stderr.write("[BYTEPLUS] bundled ffmpeg can't run on this Mac ({}); "
+                             "using ffmpeg from PATH if available (e.g. brew install "
+                             "ffmpeg).\n".format(path))
+    _FFMPEG_RUNS[path] = ok
+    return ok
+
+
 def _ffmpeg_exe():
     """Locate an ffmpeg executable (BYTEPLUS_FFMPEG env, PATH, common Windows
     install dirs). Returns the path/name to run, or None if not found."""
@@ -3301,11 +3534,18 @@ def _ffmpeg_exe():
     for b in (os.path.join(here, "..", "bin", sub, exe),
               os.path.join(here, "bin", sub, exe)):
         b = os.path.normpath(b)
-        if os.path.exists(b):
+        if os.path.exists(b) and _bundled_ffmpeg_runs(b):
             return b
     found = shutil.which("ffmpeg")               # works after a PATH refresh
     if found:
         return found
+    if sys.platform == "darwin":
+        # Maya launched from the Dock/Finder gets a minimal PATH without Homebrew
+        # or MacPorts, so look where they install (arm64 and Intel prefixes).
+        for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg",
+                  "/opt/local/bin/ffmpeg"):
+            if os.path.exists(p):
+                return p
     if sys.platform.startswith("win"):
         guesses = [r"C:\ffmpeg\bin\ffmpeg.exe",
                    os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links\ffmpeg.exe"),
@@ -4777,8 +5017,9 @@ class _RefImagesWidget(QtWidgets.QWidget):
         or base64'd downstream.)"""
         out = []
         for r in self._refs:
-            if r.get("asset"):
-                out.append(r["asset"])
+            perm = r.get("asset") or _read_asset_sidecar(r.get("path") or "")
+            if perm:
+                out.append(perm)
             elif r.get("url") and _url_is_fresh(r["url"]):
                 out.append(r["url"])
             elif r.get("path"):
@@ -5207,17 +5448,22 @@ class VideoGallery(QtWidgets.QDialog):
         if not self._current:
             return
         vid = self._current["video"]
-        first_src, trusted = None, False
+        first_src, trusted, from_deleted = None, False, False
         sc = vid + ".lastframe.json"
         if os.path.exists(sc):
             try:
                 with open(sc) as f:
                     d = json.load(f)
                 u = d.get("url")
-                if u and u.startswith("asset://"):
+                if u and u.startswith("asset://") and not _asset_is_deleted(u):
                     first_src, trusted = u, True             # PERMANENT, never expires
-                elif u and int(time.time()) - int(d.get("ts", 0)) < 86400:
+                elif (u and u.startswith("http")
+                      and int(time.time()) - int(d.get("ts", 0)) < 86400):
                     first_src, trusted = u, True             # fresh 24h trusted url
+                elif (str(d.get("src_url") or "").startswith("http")
+                      and int(time.time()) - int(d.get("src_ts", 0)) < 86400):
+                    first_src, trusted = d["src_url"], True  # permanent link deleted: 24h url
+                    from_deleted = True                      # never re-register what was deleted
             except Exception:
                 pass
         if not first_src:
@@ -5384,22 +5630,44 @@ class VideoGallery(QtWidgets.QDialog):
         cmds.inViewMessage(amg="Extending clip…", pos="midCenter", fade=True)
         # Auto-permanence: upgrade the 24h last-frame to a PERMANENT asset:// in the
         # background so future extends (and after 24h) never expire. Fire-and-forget.
-        if (CONFIG.AUTO_TRUST_ASSETS and _asset_api_ready() and trusted
-                and isinstance(first_src, str) and first_src.startswith("http")):
+        # Only for people who use the Asset Library: explicit Asset Library keys, or
+        # the TOS-key fallback once they have a Trusted Character (a TOS setup made
+        # just for playblast hosting must not start registering assets), and never
+        # twice for the same clip while a registration is in flight.
+        _uses_tal = (bool((CONFIG.ASSET_AK or "").strip() and (CONFIG.ASSET_SK or "").strip())
+                     or (_asset_api_ready() and bool(_asset_store_load()["groups"])))
+        if (CONFIG.AUTO_TRUST_ASSETS and _uses_tal and trusted and not from_deleted
+                and isinstance(first_src, str) and first_src.startswith("http")
+                and sc not in _AUTO_TRUST_INFLIGHT):
+            _AUTO_TRUST_INFLIGHT.add(sc)
             uw = _Worker(lambda: _auto_register_asset(first_src, name="lastframe"),
                          parent=_main_window())
 
             def _upg(uri):
                 if uri:
                     try:
+                        prev = {}
+                        try:
+                            with open(sc) as f:
+                                prev = json.load(f) or {}
+                        except (OSError, ValueError):
+                            pass
+                        rec = {"url": uri, "ts": int(time.time())}
+                        if str(prev.get("url") or "").startswith("http"):  # keep the 24 h link as
+                            rec["src_url"] = prev["url"]                     # a fallback if the asset
+                            rec["src_ts"] = int(prev.get("ts") or 0)         # is ever deleted
+                        elif str(prev.get("src_url") or "").startswith("http"):
+                            rec["src_url"] = prev["src_url"]                 # carry it forward
+                            rec["src_ts"] = int(prev.get("src_ts") or 0)
                         with open(sc, "w") as f:
-                            json.dump({"url": uri, "ts": int(time.time())}, f)
+                            json.dump(rec, f)
                     except OSError:
                         pass
 
             uw.done.connect(_upg)
             uw.failed.connect(lambda tb: sys.stderr.write(
                 "[BYTEPLUS] auto-permanence failed: " + _asset_error_hint(tb) + "\n"))
+            uw.finished.connect(lambda _sc=sc: _AUTO_TRUST_INFLIGHT.discard(_sc))
             uw.start()
             self._uw = uw
 
@@ -5761,7 +6029,7 @@ def _should_retry_failure(msg: str, trusted_input: bool) -> bool:
     # NOTE: do NOT hard-block on "InputImage" -- the FACE error code is
     # "InputImageSensitiveContentDetected.PrivacyInformation", which must fall
     # through to the face check below.
-    if any(s in msg for s in ("InvalidParameter", "not valid")):
+    if any(s in msg for s in ("InvalidParameter", "not valid", _DEAD_ASSET_MARK)):
         return False
     # Face / privacy moderation is DETERMINISTIC within a session: if the
     # trusted-outputs exemption is honored the first submit passes; if it isn't,
@@ -6170,13 +6438,24 @@ def _seedance_generate(prompt: str, image_sources: list, movie: str | None,
                 task_id = _submit(_content("first_frame" if first_frame else None), audio)
             except RuntimeError as e:
                 if (first_frame and not last_frame and any(s in str(e) for s in
-                        ("first_frame", "InvalidParameter", "role"))):
+                        ("first_frame", "InvalidParameter", "role"))
+                        and not _dead_asset_ids(str(e))):
                     sys.stderr.write("[BYTEPLUS] 'first_frame' not accepted; retrying "
                                      "with reference_image.\n")
                     task_id = _submit(_content("reference_image"), audio)
                 else:
                     raise
         except RuntimeError as e:
+            # A deleted asset:// can never succeed: forget it and say so (no retry).
+            _dead = _dead_asset_ids(str(e))
+            if _dead:
+                _asset_forget_dead(_dead)
+                raise RuntimeError(
+                    _DEAD_ASSET_MARK + ": {} was deleted from the Asset Library, so it "
+                    "has been forgotten here and won't be sent again. Try again: the "
+                    "original image or clip is used instead where possible (for a face, "
+                    "use 🎭 Make permanent again)."
+                    .format(", ".join("asset://" + a for a in _dead)))
             # Name the rejected asset while we still know what went in which slot.
             if _is_output_policy_error(str(e)):
                 raise RuntimeError(_explain_output_policy(str(e)))
@@ -6955,10 +7234,15 @@ class AnimateDialog(QtWidgets.QDialog):
         if not uri:
             return
         self._trusted_uri = uri
+        self._image_src = uri            # Analyze / Compose now describe THIS character
         self.b_trusted.setText("🎭 Trusted ✓")
         self.lbl.setText("Main image = TRUSTED character  ({})  — permanent, "
                          "animates without face rejection.".format(uri))
-        cmds.inViewMessage(amg="Using <hl>trusted character</hl> as the main image.",
+        if self.prompt.toPlainText().strip():
+            self.b_auto.setText("✨ Re-analyze")
+        label = self.b_auto.text() if self.b_auto.isEnabled() else "✨ Analyze"
+        cmds.inViewMessage(amg="Using <hl>trusted character</hl> as the main image — "
+                               "press {} to describe it.".format(label),
                            pos="midCenter", fade=True)
 
     def image_refs(self):
@@ -7167,6 +7451,7 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
     trusted_uri = d.trusted_uri()
     if trusted_uri:
         image_src = trusted_uri
+        poster_path = _asset_store_thumb(trusted_uri) or poster_path
     use_anim = d.wants_anim()
     audio = d.wants_audio()
     img_refs = d.image_refs()
@@ -7188,7 +7473,8 @@ def animate_with_seedance(image_src: str, poster_path=None, dream_items=None,
     extra_imgs = []
     for r in img_refs:
         u = r.get("url")
-        s = u if (u and _url_is_fresh(u)) else r.get("path")
+        s = (_read_asset_sidecar(r.get("path") or "")      # made permanent -> asset://
+             or (u if (u and _url_is_fresh(u)) else r.get("path")))
         if s:
             extra_imgs.append(s)
     extra_imgs = extra_imgs[:8]
@@ -9089,6 +9375,11 @@ class DreamGallery(QtWidgets.QDialog):
         if not src:
             _error("This image has no fresh URL or local file to register.")
             return
+        if path and os.path.isfile(path):
+            _why = _asset_image_problem(path)
+            if _why:
+                _error("This image can't be made permanent:\n\n" + _why)
+                return
         # --- which character? (existing from this install, or a new one) ---------
         store = _asset_store_load()["groups"]
         auto_name = _auto_trust_group_name()
@@ -9144,7 +9435,7 @@ class DreamGallery(QtWidgets.QDialog):
             elif st == "Failed":
                 _error("❌ '{}' rejected this image: {}\n\nThe asset library wants a valid "
                        "virtual-human portrait; real human faces are never allowed."
-                       .format(res["gname"], res.get("error") or "moderation failed"))
+                       .format(res["gname"], res.get("error") or "no reason given"))
             else:
                 _msgbox(QtWidgets.QMessageBox.Information, "Still processing",
                         "⏳ Added to '{}' but still processing ({}).\n\nCheck ↻ Status in "
@@ -9651,7 +9942,7 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
             return
         self._set_status("Deleting…")
         def _done(_r):
-            _asset_store_forget(gid)
+            _asset_store_forget(gid, tombstone=True)
             if gid == (CONFIG.AUTO_TRUST_GROUP_ID or "").strip():
                 CONFIG.AUTO_TRUST_GROUP_ID = ""       # never reuse a deleted group
                 _save_prefs()
@@ -9681,6 +9972,7 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
         store = _asset_store_load()["groups"].get(gid, {}).get("assets", {})
         badge = {"Active": "✅", "Processing": "⏳", "Failed": "❌"}
         active = 0
+        _asset_undelete([it.get("Id") or it.get("AssetId") for it in (items or [])])
         for it in (items or []):
             aid = it.get("Id") or it.get("AssetId") or ""
             status = (it.get("Status") or "").strip() or "Processing"
@@ -9707,6 +9999,13 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
         picked = _pick_gallery_image(items, self, warn_trust=False)
         if not picked:
             return
+        prev = _read_asset_sidecar(picked.get("path") or "")
+        if prev and _msgbox(QtWidgets.QMessageBox.Question, "Already permanent",
+                            "This image is already a permanent trusted asset ({}).\n\n"
+                            "Register it again for this character?".format(prev),
+                            QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel
+                            ) != QtWidgets.QMessageBox.Ok:
+            return
         url = picked.get("url")
         src = url if (url and _url_is_fresh(url)) else picked.get("path")
         self._start_add(src, picked.get("path") or "")
@@ -9716,7 +10015,7 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
             return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Add image to this character", "",
-            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.gif)")
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff *.gif *.heic *.heif)")
         if path:
             self._start_add(path, path)
 
@@ -9724,6 +10023,12 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
         gid = self._group_id
         if not src:
             _error("That image has no fresh URL and no local file to upload.")
+            return
+        _chk = thumb if (thumb and os.path.isfile(str(thumb))) else (
+            "" if str(src).startswith("http") else src)
+        _why = _asset_image_problem(_chk) if _chk else ""
+        if _why:
+            _error("This image can't be added to the Asset Library:\n\n" + _why)
             return
         self._set_status("Uploading & registering (this can take a minute)…")
         name = os.path.basename(str(thumb) or str(src))[:40]
@@ -9740,8 +10045,9 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
             if s == "Active":
                 self._set_status("✅ '{}' is trusted and ready to animate.".format(name))
             elif s == "Failed":
-                self._set_status("❌ '{}' failed moderation: {}".format(
-                    name, res.get("error") or "rejected"))
+                self._set_status("❌ '{}' was rejected by the Asset Library: {}".format(
+                    name, res.get("error") or "no reason given — use an AI-generated "
+                    "(not real) person that fits the image limits"))
             else:
                 self._set_status("⏳ '{}' still processing — press ↻ Status in a "
                                  "moment.".format(name))
@@ -9760,7 +10066,7 @@ class TrustedCharacterDialog(QtWidgets.QDialog):
             return
         self._set_status("Deleting…")
         self._run(lambda: (_asset_delete(aid), aid)[1],
-                  lambda _r: (_asset_store_forget(gid, aid), self._refresh_assets()))
+                  lambda _r: (_asset_store_forget(gid, aid, tombstone=True), self._refresh_assets()))
 
     def _copy_uri(self):
         aid = self._current_asset()
@@ -9944,6 +10250,8 @@ def open_trusted_characters():
     if g is None:
         g = TrustedCharacterDialog()
         open_trusted_characters._inst = g
+    elif _asset_api_ready() and not g.groups.count():
+        g._refresh_groups()                           # keys were added after first open
     g.show()
     g.raise_()
     g.activateWindow()
@@ -11292,7 +11600,13 @@ class VideoGenDialog(QtWidgets.QDialog):
         w.done.connect(done); w.failed.connect(fail); w.start()
         self._enh_worker = w
 
-    def _resolve(self, ref):
+    def _resolve(self, ref, allow_asset=False):
+        # allow_asset: REFERENCE images only. asset:// in the first/last-frame roles
+        # is not measured, so frames keep the fresh URL / local file.
+        if allow_asset:
+            perm = _read_asset_sidecar(ref.get("path") or "")
+            if perm:
+                return perm
         u = ref.get("url")
         return u if (u and _url_is_fresh(u)) else ref.get("path")
 
@@ -11315,7 +11629,7 @@ class VideoGenDialog(QtWidgets.QDialog):
             first = self._resolve(self._first); last = self._resolve(self._last)
             poster = self._first.get("path")
         elif m == "mm":
-            image_sources = [self._resolve(r) for r in self._img_refs][:9]
+            image_sources = [self._resolve(r, allow_asset=True) for r in self._img_refs][:9]
             image_sources = [s for s in image_sources if s]
             video_srcs = [r["path"] for r in self._vid_refs if r.get("path")][:3]
             _amax = _dialogue_audio_limits(self._model_id())[0]
@@ -12865,8 +13179,8 @@ class SettingsDialog(QtWidgets.QDialog):
         self.region = QtWidgets.QLineEdit(CONFIG.TOS_REGION)
         form.addRow("TOS region", self.region)
         hint = QtWidgets.QLabel(
-            "Keys saved with 'Remember' (above), in plaintext. Needs the `tos` "
-            "SDK (pip install tos). Leave keys blank to use ${} / ${} env vars."
+            "Keys saved with 'Remember' (above), in plaintext. The `tos` SDK is "
+            "bundled. Leave keys blank to use ${} / ${} env vars."
             .format(CONFIG.TOS_AK_ENV, CONFIG.TOS_SK_ENV))
         hint.setWordWrap(True); hint.setStyleSheet("color:#888;")
         form.addRow("", hint)
@@ -12942,12 +13256,14 @@ class SettingsDialog(QtWidgets.QDialog):
         ashint.setWordWrap(True); ashint.setStyleSheet("color:#888;")
         form.addRow("", ashint)
         self.auto_trust = QtWidgets.QCheckBox(
-            "Auto-make faces I use permanent (Extend upgrades the last frame → asset://)")
+            "Auto-make Extend last frames permanent (asset://) — once you use Trusted Characters")
         self.auto_trust.setChecked(CONFIG.AUTO_TRUST_ASSETS)
-        self.auto_trust.setToolTip("With Advanced Creation Rights, register faces you "
-                                   "Extend as permanent asset:// (no 24h expiry). "
-                                   "On-demand only, to respect your capacity quota. The "
-                                   "🎭 Make permanent button always works regardless.")
+        self.auto_trust.setToolTip("With Advanced Creation Rights, register the last frame "
+                                   "of clips you Extend as a permanent asset:// (no 24h "
+                                   "expiry). Runs only when Asset Library keys are set, or "
+                                   "when you reuse the TOS keys and already have a Trusted "
+                                   "Character; never twice for the same clip. The 🎭 Make "
+                                   "permanent button always works regardless.")
         form.addRow("", self.auto_trust)
 
         form = _tab("Analytics && Webhook")
@@ -13105,7 +13421,7 @@ def open_settings():
 class MotionHostWizard(QtWidgets.QDialog):
     """Guided setup for the playblast motion-video host. Lets the client pick a
     backend (Cloudflare R2 - no install, recommended; or BytePlus TOS - same
-    vendor, needs the 'tos' package), paste keys with step-by-step help, TEST the
+    vendor, its Python SDK is bundled), paste keys with step-by-step help, TEST the
     connection (upload -> fetch -> delete), and Save & enable it."""
 
     def __init__(self, parent=None):
@@ -13127,7 +13443,7 @@ class MotionHostWizard(QtWidgets.QDialog):
         row.addWidget(QtWidgets.QLabel("Host:"))
         self.kind = QtWidgets.QComboBox()
         self.kind.addItem("Cloudflare R2  (recommended - nothing to install)", "r2")
-        self.kind.addItem("BytePlus TOS  (same vendor - needs the 'tos' package)", "tos")
+        self.kind.addItem("BytePlus TOS  (same vendor - SDK bundled)", "tos")
         row.addWidget(self.kind, 1)
         v.addLayout(row)
 
@@ -13198,8 +13514,7 @@ class MotionHostWizard(QtWidgets.QDialog):
             "1. console.byteplus.com &rarr; TOS &rarr; create a bucket.<br>"
             "2. Create an Access Key / Secret Key (IAM). Temporary STS keys "
             "(AKTP...) also need their session token and expire in ~12 h.<br>"
-            "<b>Requires the 'tos' package</b> in Maya's Python. In a terminal:<br>"
-            "<tt>\"&lt;Maya&gt;\\bin\\mayapy.exe\" -m pip install tos</tt><br>"
+            "The TOS Python SDK is bundled with the plugin - nothing to install.<br>"
             "If unsure, use R2 instead - it needs nothing.")
         steps.setWordWrap(True)
         steps.setStyleSheet("color:#bbb;")
@@ -13254,11 +13569,12 @@ class MotionHostWizard(QtWidgets.QDialog):
             return
         if kind == "tos":
             try:
-                import tos  # noqa: F401
-            except Exception:
-                self.status.setText("<span style='color:#e66'>The 'tos' package "
-                    "isn't installed (see the steps above), so TOS can't be "
-                    "tested. Use R2, or install the package.</span>")
+                _import_tos()
+            except Exception as e:
+                sys.stderr.write("[BYTEPLUS] TOS SDK failed to load: {}\n".format(e))
+                self.status.setText("<span style='color:#e66'>The TOS SDK could not "
+                    "be loaded (details in the Script Editor), so TOS can't be "
+                    "tested. Use R2 instead.</span>")
                 return
             if not (CONFIG.TOS_AK and CONFIG.TOS_SK and CONFIG.TOS_BUCKET):
                 self.status.setText("<span style='color:#e66'>Fill in Access Key, "
@@ -14234,8 +14550,9 @@ class Seed3DDialog(QtWidgets.QDialog):
         v.addLayout(form)
 
         hint = QtWidgets.QLabel(
-            "If generation fails with 'NotFound', set your real 3D model ID in "
-            "BYTEPLUS > Settings > 3D model (the shipped default is a placeholder).")
+            "If generation fails with 'NotFound', the 3D model may not be enabled "
+            "for your account: compare BYTEPLUS > Settings > 3D model ({}) with your "
+            "ModelArk console.".format(CONFIG.THREE_D_MODEL))
         hint.setWordWrap(True); hint.setStyleSheet("color:#888;")
         v.addWidget(hint)
 
